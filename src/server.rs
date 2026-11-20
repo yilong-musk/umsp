@@ -1685,14 +1685,18 @@ fn prepare_attempt(
     if target.upstream_protocol == client_protocol {
         return Ok(attempt_payload(base, target, client_protocol, client_name));
     }
-    let translated =
-        crate::translate::translate_request(base, client_protocol, &target.upstream_protocol)
-            .map_err(|err| {
-                format!(
-                    "cannot translate {client_protocol} request to {}: {err}",
-                    target.upstream_protocol
-                )
-            })?;
+    let translated = crate::translate::translate_request_with_budget(
+        base,
+        client_protocol,
+        &target.upstream_protocol,
+        Some(target.model.max_completion_tokens),
+    )
+    .map_err(|err| {
+        format!(
+            "cannot translate {client_protocol} request to {}: {err}",
+            target.upstream_protocol
+        )
+    })?;
     let mut notes = vec![format!(
         "translated:{client_protocol}->{}",
         target.upstream_protocol
@@ -2053,6 +2057,14 @@ fn upstream_failure_response(
     if (400..500).contains(&status) && !matches!(status, 401..=403 | 429) {
         if rewrite_error {
             let message = crate::translate::error_message(body)
+                .map(|message| {
+                    String::from_utf8_lossy(&scrub_upstream_identifiers(
+                        message.as_bytes(),
+                        model_id,
+                        target,
+                    ))
+                    .into_owned()
+                })
                 .unwrap_or_else(|| "the upstream service rejected the request".to_string());
             return protocol_gateway_error(
                 protocol,
@@ -3224,7 +3236,7 @@ async fn proxy_stream(
 /// - `[DONE]` is passed through untouched and never synthesized twice.
 enum PumpObserver {
     Native(stream::Observer),
-    Bridge(crate::translate::StreamBridge),
+    Bridge(Box<crate::translate::StreamBridge>),
 }
 
 impl PumpObserver {
@@ -3263,7 +3275,7 @@ impl PumpObserver {
         }
     }
 
-    fn error_event(&self, message: &str) -> Vec<u8> {
+    fn error_event(&mut self, message: &str) -> Vec<u8> {
         match self {
             Self::Native(observer) => observer.error_event(message),
             Self::Bridge(bridge) => bridge.error_event(message),
@@ -3290,7 +3302,7 @@ async fn pump_stream(
 
     let mut upstream = resp.bytes_stream();
     let mut observer = match bridge {
-        Some(bridge) => PumpObserver::Bridge(bridge),
+        Some(bridge) => PumpObserver::Bridge(Box::new(bridge)),
         None => PumpObserver::Native(protocol.observer()),
     };
     let keepalive_frame = observer.keepalive();

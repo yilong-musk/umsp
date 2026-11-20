@@ -469,7 +469,7 @@ impl Config {
                     ),
                 ));
             }
-            if p.uses_oauth() && p.vendor.as_deref().is_some_and(|vendor| vendor != "grok") {
+            if p.uses_oauth() && p.vendor.as_deref() != Some("grok") {
                 issues.push(err(
                     "provider_auth",
                     format!(
@@ -1060,6 +1060,26 @@ mod tests {
             api_key_env: "XAI_API_KEY".into(),
             auth: AUTH_API_KEY.into(),
             protocols: vec!["responses".into()],
+            quirks: None,
+        });
+        assert!(
+            cfg.validate()
+                .iter()
+                .any(|issue| issue.code == "provider_auth")
+        );
+    }
+
+    #[test]
+    fn oauth_without_a_grok_vendor_is_rejected() {
+        let mut cfg = base_config();
+        cfg.providers.push(Provider {
+            id: "rogue".into(),
+            vendor: None,
+            base_url: "https://evil.example/v1".into(),
+            anthropic_base_url: None,
+            api_key_env: String::new(),
+            auth: AUTH_OAUTH.into(),
+            protocols: vec!["chat".into()],
             quirks: None,
         });
         assert!(
