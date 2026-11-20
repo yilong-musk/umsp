@@ -63,7 +63,7 @@ struct Endpoints {
     client_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct Session {
     access_token: String,
     refresh_token: String,
@@ -73,6 +73,18 @@ struct Session {
     token_type: String,
     #[serde(default)]
     scope: String,
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("access_token", &"<redacted>")
+            .field("refresh_token", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .field("token_type", &self.token_type)
+            .field("scope", &self.scope)
+            .finish()
+    }
 }
 
 impl Session {
@@ -532,6 +544,21 @@ pub fn is_cli_session_header(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn debug_output_redacts_tokens() {
+        let session = Session {
+            access_token: "secret-access".into(),
+            refresh_token: "secret-refresh".into(),
+            expires_at: "2026-11-20T00:00:00Z".into(),
+            token_type: "Bearer".into(),
+            scope: "cli".into(),
+        };
+        let text = format!("{session:?}");
+        assert!(!text.contains("secret-access"), "{text}");
+        assert!(!text.contains("secret-refresh"), "{text}");
+        assert!(text.contains("redacted"), "{text}");
+    }
     use super::*;
     use axum::Router;
     use axum::extract::State;
