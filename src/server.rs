@@ -1685,14 +1685,18 @@ fn prepare_attempt(
     if target.upstream_protocol == client_protocol {
         return Ok(attempt_payload(base, target, client_protocol, client_name));
     }
-    let translated =
-        crate::translate::translate_request(base, client_protocol, &target.upstream_protocol)
-            .map_err(|err| {
-                format!(
-                    "cannot translate {client_protocol} request to {}: {err}",
-                    target.upstream_protocol
-                )
-            })?;
+    let translated = crate::translate::translate_request_with_budget(
+        base,
+        client_protocol,
+        &target.upstream_protocol,
+        Some(target.model.max_completion_tokens),
+    )
+    .map_err(|err| {
+        format!(
+            "cannot translate {client_protocol} request to {}: {err}",
+            target.upstream_protocol
+        )
+    })?;
     let mut notes = vec![format!(
         "translated:{client_protocol}->{}",
         target.upstream_protocol
