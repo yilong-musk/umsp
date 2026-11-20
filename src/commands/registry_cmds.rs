@@ -145,7 +145,14 @@ pub fn run_provider(path: &Path, cmd: ProviderCmd, json: bool, no_reload: bool) 
             }
             doc.save()?;
             after_edit(path, no_reload)?;
-            let _ = crate::sessions::remove_session(&crate::config::sessions_dir(path), &id);
+            if let Err(err) =
+                crate::sessions::remove_session(&crate::config::sessions_dir(path), &id)
+            {
+                eprintln!(
+                    "warning: provider '{id}' was removed but its session file could not be deleted: {}",
+                    err.message
+                );
+            }
             crate::commands::emit(json, json!({"removed": id}), || {
                 format!("removed provider {id}")
             })

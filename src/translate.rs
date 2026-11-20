@@ -388,6 +388,9 @@ fn emit_request(canon: &CanonRequest, to: Proto, notes: &mut Vec<String>) -> Val
 }
 
 fn emit_chat_request(canon: &CanonRequest, obj: &mut Map<String, Value>) {
+    if canon.stream == Some(true) {
+        obj.insert("stream_options".into(), json!({"include_usage": true}));
+    }
     if let Some(max) = canon.max_tokens {
         obj.insert("max_tokens".into(), json!(max));
     }
@@ -689,23 +692,30 @@ fn emit_response(canon: &CanonResponse, to: Proto, model_id: &str) -> Value {
                     "type": "message",
                     "id": format!("msg_{}", canon.id),
                     "role": "assistant",
-                    "content": [{"type": "output_text", "text": canon.text}],
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": canon.text, "annotations": []}],
                 }));
             }
             for call in &canon.calls {
                 output.push(json!({
                     "type": "function_call",
+                    "id": format!("fc_{}", call.id),
                     "call_id": call.id,
                     "name": call.name,
                     "arguments": call.arguments,
+                    "status": "completed",
                 }));
             }
             json!({
                 "id": if canon.id.starts_with("resp_") { canon.id.clone() } else { format!("resp_{}", canon.id) },
                 "object": "response",
+                "created_at": chrono::Utc::now().timestamp(),
                 "status": if canon.finish == "length" { "incomplete" } else { "completed" },
                 "model": model_id,
                 "output": output,
+                "parallel_tool_calls": false,
+                "tool_choice": "auto",
+                "tools": [],
                 "usage": responses_usage(canon.usage),
             })
         }
@@ -756,18 +766,33 @@ pub struct StreamBridge {
     response_id: String,
     created: i64,
     started: bool,
+    seq: u64,
     text_open: bool,
-    saw_text_delta: bool,
-    tool_seq: u32,
-    tools_seen: u32,
+    text_buf: String,
+    text_item_id: String,
     tool_open: bool,
     tool_id: String,
     tool_name: String,
-    args_emitted: usize,
+    tool_item_id: String,
+    args_buf: String,
+    tool_seq: u32,
+    tools_seen: u32,
     block_index: u32,
     output_index: u32,
+    item_seq: u32,
+    output_items: Vec<Value>,
     finish: Option<&'static str>,
     terminal_sent: bool,
+    /// Chat upstreams interleave parallel tool calls by `index`; buffer them and
+    /// flush at the terminal so Messages/Responses blocks stay contiguous.
+    pending_tools: std::collections::BTreeMap<u64, PendingTool>,
+}
+
+#[derive(Default)]
+struct PendingTool {
+    id: String,
+    name: String,
+    arguments: String,
 }
 
 impl StreamBridge {
@@ -789,23 +814,29 @@ impl StreamBridge {
             response_id: "umsp".into(),
             created: chrono::Utc::now().timestamp(),
             started: false,
+            seq: 0,
             text_open: false,
-            saw_text_delta: false,
-            tool_seq: 0,
-            tools_seen: 0,
+            text_buf: String::new(),
+            text_item_id: String::new(),
             tool_open: false,
             tool_id: String::new(),
             tool_name: String::new(),
-            args_emitted: 0,
+            tool_item_id: String::new(),
+            args_buf: String::new(),
+            tool_seq: 0,
+            tools_seen: 0,
             block_index: 0,
             output_index: 0,
+            item_seq: 0,
+            output_items: Vec::new(),
             finish: None,
             terminal_sent: false,
+            pending_tools: std::collections::BTreeMap::new(),
         })
     }
 
-    /// Feed one upstream chunk. Returns `true` the first time client bytes are
-    /// produced, which the pump records as time to first byte.
+    /// Feed one upstream chunk. Returns `true` the first time content reaches
+    /// the client, which the pump records as time to first byte.
     pub fn push(&mut self, chunk: &[u8], out: &mut Vec<u8>) -> bool {
         if self.done {
             return false;
@@ -827,15 +858,25 @@ impl StreamBridge {
         produced && self.saw_output
     }
 
-    /// Parse a trailing event that arrived without a blank line.
+    /// Parse a trailing event that arrived without a blank line, then give
+    /// Chat/Responses clients a terminal event when the upstream closed cleanly.
+    /// Messages never gets a synthesized `message_stop` (the pump sends an
+    /// error event instead).
     pub fn finish(&mut self, out: &mut Vec<u8>) {
-        if self.done || self.carry.iter().all(|byte| byte.is_ascii_whitespace()) {
+        if self.done {
             return;
         }
-        let event = std::mem::take(&mut self.carry);
-        let mut piece = String::new();
-        self.handle_event(&event, &mut piece);
-        out.extend(piece.into_bytes());
+        if !self.carry.iter().all(|byte| byte.is_ascii_whitespace()) {
+            let event = std::mem::take(&mut self.carry);
+            let mut piece = String::new();
+            self.handle_event(&event, &mut piece);
+            out.extend(piece.into_bytes());
+        }
+        if !self.done && self.to != Proto::Messages {
+            let mut piece = String::new();
+            self.emit_terminal(&mut piece);
+            out.extend(piece.into_bytes());
+        }
     }
 
     pub fn done(&self) -> bool {
@@ -854,10 +895,21 @@ impl StreamBridge {
         }
     }
 
-    pub fn error_event(&self, message: &str) -> Vec<u8> {
+    pub fn error_event(&mut self, message: &str) -> Vec<u8> {
+        self.terminal_sent = true;
+        self.done = true;
         match self.to {
             Proto::Messages => stream::messages_error_event(message),
-            Proto::Responses => stream::responses_error_event(message),
+            Proto::Responses => self
+                .responses_event(
+                    "error",
+                    &json!({
+                        "type": "error",
+                        "message": message,
+                        "code": "upstream_stream_error",
+                    }),
+                )
+                .into_bytes(),
             Proto::Chat => stream::error_event(message),
         }
     }
@@ -897,8 +949,11 @@ impl StreamBridge {
                     .and_then(|usage| Usage::from_messages(&json!({"usage": usage})))
             }),
         };
-        if usage.is_some() {
-            self.usage = usage;
+        if let Some(new) = usage {
+            self.usage = Some(match self.usage {
+                Some(old) => merge_usage(old, new),
+                None => new,
+            });
         }
         if self.from == Proto::Messages {
             if let Some(output) = value
@@ -927,6 +982,15 @@ impl StreamBridge {
     }
 
     fn on_chat(&mut self, value: &Value, out: &mut String) {
+        if let Some(message) = value
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str)
+        {
+            let bytes = self.error_event(message);
+            out.push_str(&String::from_utf8_lossy(&bytes));
+            return;
+        }
         let choice = value.pointer("/choices/0").and_then(Value::as_object);
         let Some(choice) = choice else {
             return;
@@ -946,40 +1010,60 @@ impl StreamBridge {
         }
         if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
             for call in calls {
-                self.on_chat_tool(call, out);
+                self.on_chat_tool(call);
             }
         }
     }
 
-    fn on_chat_tool(&mut self, call: &Value, out: &mut String) {
+    fn on_chat_tool(&mut self, call: &Value) {
         let Some(call) = call.as_object() else {
             return;
         };
-        let function = call.get("function").and_then(Value::as_object);
-        let name = function
+        let index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
+        let entry = self.pending_tools.entry(index).or_default();
+        if let Some(id) = call
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            entry.id = id.to_string();
+        }
+        if let Some(name) = call
+            .get("function")
+            .and_then(Value::as_object)
             .and_then(|function| function.get("name"))
             .and_then(Value::as_str)
-            .unwrap_or("");
-        let id = call.get("id").and_then(Value::as_str).unwrap_or("");
-        if !id.is_empty() || !name.is_empty() {
-            let id = if id.is_empty() {
-                format!("call_{}", self.tool_seq)
-            } else {
-                id.to_string()
-            };
-            let name = if name.is_empty() {
-                "function".to_string()
-            } else {
-                name.to_string()
-            };
-            self.begin_tool(&id, &name, out);
+            .filter(|name| !name.is_empty())
+        {
+            entry.name = name.to_string();
         }
-        if let Some(arguments) = function
+        if let Some(arguments) = call
+            .get("function")
+            .and_then(Value::as_object)
             .and_then(|function| function.get("arguments"))
             .and_then(Value::as_str)
-            .filter(|text| !text.is_empty())
+            .filter(|arguments| !arguments.is_empty())
         {
-            self.emit_args(arguments, out);
+            entry.arguments.push_str(arguments);
+        }
+    }
+
+    fn flush_pending_tools(&mut self, out: &mut String) {
+        let pending = std::mem::take(&mut self.pending_tools);
+        for (_, tool) in pending {
+            if tool.name.is_empty() {
+                continue;
+            }
+            let id = if tool.id.is_empty() {
+                format!("call_{}", self.tool_seq)
+            } else {
+                tool.id
+            };
+            self.begin_tool(&id, &tool.name, out);
+            if !tool.arguments.is_empty() {
+                self.emit_args(&tool.arguments, out);
+            }
+            self.close_tool_block(out);
         }
     }
 
@@ -987,12 +1071,11 @@ impl StreamBridge {
         match kind {
             "response.output_text.delta" => {
                 if let Some(delta) = value.get("delta").and_then(Value::as_str) {
-                    self.saw_text_delta = true;
                     self.emit_text(delta, out);
                 }
             }
             "response.output_text.done" => {
-                if !self.saw_text_delta {
+                if self.text_buf.is_empty() {
                     if let Some(text) = value.get("text").and_then(Value::as_str) {
                         self.emit_text(text, out);
                     }
@@ -1020,11 +1103,20 @@ impl StreamBridge {
                 }
             }
             "response.output_item.done" => self.on_responses_item_done(value, out),
-            "response.completed" | "response.incomplete" | "response.failed" => {
-                if kind == "response.incomplete" {
-                    self.finish = Some("length");
-                }
+            "response.completed" => self.emit_terminal(out),
+            "response.incomplete" => {
+                self.finish = Some("length");
                 self.emit_terminal(out);
+            }
+            "response.failed" | "response.error" | "error" => {
+                let message = value
+                    .pointer("/response/error/message")
+                    .or_else(|| value.pointer("/error/message"))
+                    .or_else(|| value.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("upstream response failed");
+                let bytes = self.error_event(message);
+                out.push_str(&String::from_utf8_lossy(&bytes));
             }
             _ => {}
         }
@@ -1035,7 +1127,7 @@ impl StreamBridge {
             return;
         };
         match item.get("type").and_then(Value::as_str) {
-            Some("message") if !self.saw_text_delta => {
+            Some("message") if self.text_buf.is_empty() => {
                 let text = text_of(item.get("content"));
                 if !text.is_empty() {
                     self.emit_text(&text, out);
@@ -1043,17 +1135,19 @@ impl StreamBridge {
             }
             Some("function_call") => {
                 let arguments = json_string(item.get("arguments"));
-                if self.tool_open {
-                    if arguments.len() > self.args_emitted {
-                        let rest = &arguments[self.args_emitted..];
-                        self.emit_args(rest, out);
+                let call_id = item
+                    .get("call_id")
+                    .or_else(|| item.get("id"))
+                    .and_then(Value::as_str);
+                if self.tool_open && call_id == Some(self.tool_id.as_str()) {
+                    if let Some(rest) = arguments.strip_prefix(&self.args_buf) {
+                        if !rest.is_empty() {
+                            self.emit_args(rest, out);
+                        }
                     }
                 } else if !arguments.is_empty() || item.get("name").is_some() {
                     self.begin_tool(
-                        item.get("call_id")
-                            .or_else(|| item.get("id"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("call_unknown"),
+                        call_id.unwrap_or("call_unknown"),
                         item.get("name")
                             .and_then(Value::as_str)
                             .unwrap_or("function"),
@@ -1096,7 +1190,6 @@ impl StreamBridge {
                 match delta.get("type").and_then(Value::as_str) {
                     Some("text_delta") => {
                         if let Some(text) = delta.get("text").and_then(Value::as_str) {
-                            self.saw_text_delta = true;
                             self.emit_text(text, out);
                         }
                     }
@@ -1114,6 +1207,14 @@ impl StreamBridge {
                 }
             }
             "message_stop" => self.emit_terminal(out),
+            "error" => {
+                let message = value
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("upstream stream error");
+                let bytes = self.error_event(message);
+                out.push_str(&String::from_utf8_lossy(&bytes));
+            }
             _ => {}
         }
     }
@@ -1163,6 +1264,11 @@ impl StreamBridge {
             }
             Proto::Responses => {
                 if !self.text_open {
+                    self.text_open = true;
+                    self.text_buf.clear();
+                    self.item_seq += 1;
+                    self.text_item_id = format!("msg_{}_{}", self.response_id, self.item_seq);
+                    let item_id = self.text_item_id.clone();
                     out.push_str(&self.responses_event(
                         "response.output_item.added",
                         &json!({
@@ -1170,22 +1276,36 @@ impl StreamBridge {
                             "output_index": self.output_index,
                             "item": {
                                 "type": "message",
-                                "id": format!("msg_{}", self.response_id),
+                                "id": item_id,
                                 "role": "assistant",
+                                "status": "in_progress",
                                 "content": [],
                             },
                         }),
                     ));
-                    self.text_open = true;
+                    out.push_str(&self.responses_event(
+                        "response.content_part.added",
+                        &json!({
+                            "type": "response.content_part.added",
+                            "item_id": self.text_item_id,
+                            "output_index": self.output_index,
+                            "content_index": 0,
+                            "part": {"type": "output_text", "text": "", "annotations": []},
+                        }),
+                    ));
                 }
                 out.push_str(&self.responses_event(
                     "response.output_text.delta",
                     &json!({
                         "type": "response.output_text.delta",
+                        "item_id": self.text_item_id,
                         "output_index": self.output_index,
+                        "content_index": 0,
                         "delta": text,
+                        "logprobs": [],
                     }),
                 ));
+                self.text_buf.push_str(text);
             }
         }
         self.saw_output = true;
@@ -1201,7 +1321,7 @@ impl StreamBridge {
         self.close_tool_block(out);
         self.tool_id = id.to_string();
         self.tool_name = name.to_string();
-        self.args_emitted = 0;
+        self.args_buf.clear();
         self.tool_open = true;
         self.tools_seen += 1;
         let index = self.tool_seq;
@@ -1253,6 +1373,8 @@ impl StreamBridge {
                 ));
             }
             Proto::Responses => {
+                self.item_seq += 1;
+                self.tool_item_id = format!("fc_{}_{}", self.response_id, self.item_seq);
                 out.push_str(&self.responses_event(
                     "response.output_item.added",
                     &json!({
@@ -1260,9 +1382,11 @@ impl StreamBridge {
                         "output_index": self.output_index,
                         "item": {
                             "type": "function_call",
+                            "id": self.tool_item_id,
                             "call_id": self.tool_id,
                             "name": self.tool_name,
                             "arguments": "",
+                            "status": "in_progress",
                         },
                     }),
                 ));
@@ -1275,7 +1399,7 @@ impl StreamBridge {
         if arguments.is_empty() || !self.tool_open || self.terminal_sent {
             return;
         }
-        self.args_emitted += arguments.len();
+        self.args_buf.push_str(arguments);
         match self.to {
             Proto::Chat => {
                 let index = self.tool_seq.saturating_sub(1);
@@ -1309,6 +1433,7 @@ impl StreamBridge {
                     "response.function_call_arguments.delta",
                     &json!({
                         "type": "response.function_call_arguments.delta",
+                        "item_id": self.tool_item_id,
                         "output_index": self.output_index,
                         "delta": arguments,
                     }),
@@ -1324,6 +1449,7 @@ impl StreamBridge {
         }
         self.started = true;
         if self.to == Proto::Messages {
+            let usage = messages_usage(self.usage);
             out.push_str(&messages_event(
                 "message_start",
                 &json!({
@@ -1336,23 +1462,15 @@ impl StreamBridge {
                         "content": [],
                         "stop_reason": null,
                         "stop_sequence": null,
-                        "usage": {"input_tokens": 0, "output_tokens": 0},
+                        "usage": usage,
                     },
                 }),
             ));
         } else if self.to == Proto::Responses {
+            let response = self.responses_envelope("in_progress", Vec::new(), None);
             out.push_str(&self.responses_event(
                 "response.created",
-                &json!({
-                    "type": "response.created",
-                    "response": {
-                        "id": format!("resp_{}", self.response_id),
-                        "object": "response",
-                        "status": "in_progress",
-                        "model": self.model_id,
-                        "output": [],
-                    },
-                }),
+                &json!({"type": "response.created", "response": response}),
             ));
         }
     }
@@ -1371,14 +1489,35 @@ impl StreamBridge {
                 self.block_index += 1;
             }
             Proto::Responses => {
+                let item_id = self.text_item_id.clone();
+                let text = std::mem::take(&mut self.text_buf);
+                out.push_str(&self.responses_event(
+                    "response.output_text.done",
+                    &json!({
+                        "type": "response.output_text.done",
+                        "item_id": item_id,
+                        "output_index": self.output_index,
+                        "content_index": 0,
+                        "text": text,
+                        "logprobs": [],
+                    }),
+                ));
+                let item = json!({
+                    "type": "message",
+                    "id": item_id,
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": text, "annotations": []}],
+                });
                 out.push_str(&self.responses_event(
                     "response.output_item.done",
                     &json!({
                         "type": "response.output_item.done",
                         "output_index": self.output_index,
-                        "item": {"type": "message", "role": "assistant", "content": []},
+                        "item": item,
                     }),
                 ));
+                self.output_items.push(item);
                 self.output_index += 1;
             }
             Proto::Chat => {}
@@ -1399,18 +1538,34 @@ impl StreamBridge {
                 self.block_index += 1;
             }
             Proto::Responses => {
+                let arguments = std::mem::take(&mut self.args_buf);
+                out.push_str(&self.responses_event(
+                    "response.function_call_arguments.done",
+                    &json!({
+                        "type": "response.function_call_arguments.done",
+                        "item_id": self.tool_item_id,
+                        "output_index": self.output_index,
+                        "name": self.tool_name,
+                        "arguments": arguments,
+                    }),
+                ));
+                let item = json!({
+                    "type": "function_call",
+                    "id": self.tool_item_id,
+                    "call_id": self.tool_id,
+                    "name": self.tool_name,
+                    "arguments": arguments,
+                    "status": "completed",
+                });
                 out.push_str(&self.responses_event(
                     "response.output_item.done",
                     &json!({
                         "type": "response.output_item.done",
                         "output_index": self.output_index,
-                        "item": {
-                            "type": "function_call",
-                            "call_id": self.tool_id,
-                            "name": self.tool_name,
-                        },
+                        "item": item,
                     }),
                 ));
+                self.output_items.push(item);
                 self.output_index += 1;
             }
             Proto::Chat => {}
@@ -1421,14 +1576,16 @@ impl StreamBridge {
         if self.terminal_sent {
             return;
         }
+        if self.from == Proto::Chat {
+            self.flush_pending_tools(out);
+        }
         self.ensure_started(out);
         self.close_text_block(out);
         self.close_tool_block(out);
-        let finish = self.finish.unwrap_or(if self.tools_seen > 0 {
-            "tool_calls"
-        } else {
-            "stop"
-        });
+        let has_tools = self.tools_seen > 0;
+        let finish = self
+            .finish
+            .unwrap_or(if has_tools { "tool_calls" } else { "stop" });
         match self.to {
             Proto::Chat => {
                 out.push_str(&chat_chunk(
@@ -1458,20 +1615,17 @@ impl StreamBridge {
                 ));
             }
             Proto::Responses => {
+                let status = if finish == "length" {
+                    "incomplete"
+                } else {
+                    "completed"
+                };
+                let response =
+                    self.responses_envelope(status, self.output_items.clone(), self.usage);
                 out.push_str(&self.responses_event(
                     "response.completed",
-                    &json!({
-                        "type": "response.completed",
-                        "response": {
-                            "id": format!("resp_{}", self.response_id),
-                            "object": "response",
-                            "status": if finish == "length" { "incomplete" } else { "completed" },
-                            "model": self.model_id,
-                            "usage": responses_usage(self.usage),
-                        },
-                    }),
+                    &json!({"type": "response.completed", "response": response}),
                 ));
-                out.push_str("data: [DONE]\n\n");
             }
         }
         self.terminal_sent = true;
@@ -1479,9 +1633,52 @@ impl StreamBridge {
         self.saw_output = true;
     }
 
-    fn responses_event(&self, event: &str, payload: &Value) -> String {
-        sse_event(event, payload, self.emit_event_lines)
+    fn responses_envelope(&self, status: &str, output: Vec<Value>, usage: Option<Usage>) -> Value {
+        json!({
+            "id": format!("resp_{}", self.response_id),
+            "object": "response",
+            "created_at": self.created,
+            "status": status,
+            "model": self.model_id,
+            "output": output,
+            "parallel_tool_calls": false,
+            "tool_choice": "auto",
+            "tools": [],
+            "usage": responses_usage(usage),
+        })
     }
+
+    fn responses_event(&mut self, event: &str, payload: &Value) -> String {
+        let mut payload = payload.clone();
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("sequence_number".into(), json!(self.seq));
+        }
+        self.seq += 1;
+        sse_event(event, &payload, self.emit_event_lines)
+    }
+}
+
+fn merge_usage(old: Usage, new: Usage) -> Usage {
+    let mut merged = Usage {
+        input_tokens: if new.input_tokens > 0 {
+            new.input_tokens
+        } else {
+            old.input_tokens
+        },
+        output_tokens: if new.output_tokens > 0 {
+            new.output_tokens
+        } else {
+            old.output_tokens
+        },
+        cached_tokens: new.cached_tokens.max(old.cached_tokens),
+        reasoning_tokens: new.reasoning_tokens.max(old.reasoning_tokens),
+        cache_creation_tokens: new.cache_creation_tokens.max(old.cache_creation_tokens),
+        total_tokens: new.total_tokens.max(old.total_tokens),
+    };
+    if merged.total_tokens == 0 {
+        merged.total_tokens = merged.input_tokens + merged.output_tokens;
+    }
+    merged
 }
 
 // ---------------------------------------------------------------------------
@@ -2343,5 +2540,171 @@ mod tests {
         assert!(text.contains("event: message_stop"), "{text}");
         assert!(!text.contains("[DONE]"));
         assert!(bridge.done());
+    }
+
+    #[test]
+    fn responses_envelope_carries_the_fields_sdk_clients_require() {
+        let upstream = json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "upstream-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hi"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+        });
+        let bytes = serde_json::to_vec(&upstream).unwrap();
+        let translated = translate_response(&bytes, "chat", "responses", "logical").unwrap();
+        let body: Value = serde_json::from_slice(&translated).unwrap();
+        for key in [
+            "id",
+            "object",
+            "created_at",
+            "status",
+            "model",
+            "output",
+            "parallel_tool_calls",
+            "tool_choice",
+            "tools",
+            "usage",
+        ] {
+            assert!(body.get(key).is_some(), "missing {key}: {body}");
+        }
+        assert_eq!(body["output"][0]["status"], "completed");
+        assert_eq!(body["output"][0]["content"][0]["annotations"], json!([]));
+    }
+
+    #[test]
+    fn chat_stream_translates_to_a_complete_responses_event_sequence() {
+        let raw = concat!(
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"f\",\"arguments\":\"{\\\"a\\\":\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"1}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let mut bridge = StreamBridge::new("chat", "responses", "logical", true).unwrap();
+        let mut out = Vec::new();
+        bridge.push(raw.as_bytes(), &mut out);
+        bridge.finish(&mut out);
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("data: [DONE]"), "{text}");
+        let events: Vec<Value> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        assert!(events.len() >= 7, "{text}");
+        for event in &events {
+            assert!(event.get("sequence_number").is_some(), "{event}");
+        }
+        let types: Vec<&str> = events
+            .iter()
+            .filter_map(|event| event["type"].as_str())
+            .collect();
+        assert!(
+            types.contains(&"response.content_part.added"),
+            "missing content_part.added: {text}"
+        );
+        assert!(
+            types.contains(&"response.output_text.done"),
+            "missing output_text.done: {text}"
+        );
+        let delta = events
+            .iter()
+            .find(|event| event["type"] == "response.output_text.delta")
+            .unwrap();
+        assert_eq!(delta["content_index"], 0);
+        assert_eq!(delta["logprobs"], json!([]));
+        assert!(delta["item_id"].as_str().unwrap().starts_with("msg_"));
+        let completed = events
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .unwrap();
+        let output = completed["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 2, "{completed}");
+        assert_eq!(output[0]["content"][0]["text"], "hi");
+        assert_eq!(output[1]["arguments"], "{\"a\":1}");
+    }
+
+    #[test]
+    fn responses_item_done_arguments_that_do_not_match_deltas_do_not_panic() {
+        let raw = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"f\"}}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"€€\"}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"a\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"f\",\"arguments\":\"{\\\"x\\\":\\\"€€\\\"}\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n"
+        );
+        let mut bridge = StreamBridge::new("responses", "chat", "logical", false).unwrap();
+        let mut out = Vec::new();
+        bridge.push(raw.as_bytes(), &mut out);
+        bridge.finish(&mut out);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("€€"), "{text}");
+        assert!(text.contains("\"arguments\":\"a\""), "{text}");
+        assert!(bridge.done());
+    }
+
+    #[test]
+    fn messages_usage_keeps_input_tokens_across_message_delta() {
+        let raw = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        );
+        let mut bridge = StreamBridge::new("messages", "chat", "logical", false).unwrap();
+        let mut out = Vec::new();
+        bridge.push(raw.as_bytes(), &mut out);
+        let usage = bridge.usage().unwrap();
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 5);
+    }
+
+    #[test]
+    fn response_failed_becomes_an_error_instead_of_a_completed_terminal() {
+        let raw = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_1\",\"error\":{\"message\":\"boom\"}}}\n\n"
+        );
+        let mut bridge = StreamBridge::new("responses", "chat", "logical", false).unwrap();
+        let mut out = Vec::new();
+        bridge.push(raw.as_bytes(), &mut out);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("boom"), "{text}");
+        assert!(!text.contains("\"finish_reason\":\"stop\""), "{text}");
+        assert!(bridge.done());
+    }
+
+    #[test]
+    fn a_clean_eof_without_a_terminal_event_still_terminates_chat_streams() {
+        let raw = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n";
+        let mut bridge = StreamBridge::new("responses", "chat", "logical", false).unwrap();
+        let mut out = Vec::new();
+        bridge.push(raw.as_bytes(), &mut out);
+        bridge.finish(&mut out);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\"finish_reason\":\"stop\""), "{text}");
+        assert!(text.contains("data: [DONE]"), "{text}");
+    }
+
+    #[test]
+    fn parallel_chat_tool_calls_stay_separate_when_translated() {
+        let raw = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"fa\",\"arguments\":\"{\\\"a\\\":\"}},{\"index\":1,\"id\":\"call_b\",\"function\":{\"name\":\"fb\",\"arguments\":\"{\\\"b\\\":\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"arguments\":\"2}\"}},{\"index\":0,\"function\":{\"arguments\":\"1}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let mut bridge = StreamBridge::new("chat", "messages", "logical", true).unwrap();
+        let mut out = Vec::new();
+        bridge.push(raw.as_bytes(), &mut out);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\"id\":\"call_a\""), "{text}");
+        assert!(text.contains("\"id\":\"call_b\""), "{text}");
+        assert!(text.contains("{\\\"a\\\":1}"), "{text}");
+        assert!(text.contains("{\\\"b\\\":2}"), "{text}");
+        assert_eq!(bridge.usage(), None);
     }
 }
