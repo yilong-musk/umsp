@@ -38,13 +38,20 @@ pub fn run_provider(path: &Path, cmd: ProviderCmd, json: bool, no_reload: bool) 
                         .as_ref()
                         .and_then(|h| h.get("providers"))
                         .and_then(|providers| providers.get(&p.id));
+                    let sessions = crate::config::sessions_dir(path);
+                    let key_present = if p.uses_oauth() {
+                        crate::sessions::session_ready(&sessions, &p.id)
+                    } else {
+                        env.has(&p.api_key_env)
+                    };
                     let mut row = json!({
                         "id": p.id,
                         "vendor": p.vendor,
                         "base_url": p.base_url,
                         "anthropic_base_url": p.anthropic_base_url,
-                        "api_key_env": p.api_key_env,
-                        "key_present": env.has(&p.api_key_env),
+                        "auth": p.auth,
+                        "api_key_env": if p.uses_oauth() { Value::Null } else { json!(p.api_key_env) },
+                        "key_present": key_present,
                         "protocols": p.protocols,
                         "quirks": p.quirks,
                         "models": cfg.models.iter().filter(|m| m.backends.iter().any(|b| b.provider == p.id)).count(),
@@ -115,7 +122,11 @@ pub fn run_provider(path: &Path, cmd: ProviderCmd, json: bool, no_reload: bool) 
                         } else {
                             "MISSING"
                         },
-                        row["api_key_env"].as_str().unwrap_or("-"),
+                        if row["auth"] == "oauth" {
+                            "session"
+                        } else {
+                            row["api_key_env"].as_str().unwrap_or("-")
+                        },
                         circuit,
                         failures,
                         last,
@@ -134,6 +145,7 @@ pub fn run_provider(path: &Path, cmd: ProviderCmd, json: bool, no_reload: bool) 
             }
             doc.save()?;
             after_edit(path, no_reload)?;
+            let _ = crate::sessions::remove_session(&crate::config::sessions_dir(path), &id);
             crate::commands::emit(json, json!({"removed": id}), || {
                 format!("removed provider {id}")
             })
@@ -223,12 +235,21 @@ fn add_provider(path: &Path, args: ProviderAddArgs, json: bool, no_reload: bool)
     };
     let id = unique_provider_id(&existing, &requested);
     let renamed_from = (id != requested).then(|| requested.clone());
-    let api_key_env = args
-        .api_key_env
-        .clone()
-        .unwrap_or_else(|| env_name_for(&id));
+    let oauth = vendor.auth == crate::config::AUTH_OAUTH;
+    if oauth && args.api_key_env.is_some() {
+        return Err(UmspError::usage(
+            "oauth providers do not take --api-key-env; each account signs in with `umsp login <id>`",
+        ));
+    }
+    let api_key_env = if oauth {
+        String::new()
+    } else {
+        args.api_key_env
+            .clone()
+            .unwrap_or_else(|| env_name_for(&id))
+    };
 
-    let new_key = if args.no_key {
+    let new_key = if oauth || args.no_key {
         None
     } else {
         let secret =
@@ -252,7 +273,11 @@ fn add_provider(path: &Path, args: ProviderAddArgs, json: bool, no_reload: bool)
     if let Some(anthropic) = vendor.anthropic_base_url {
         table.insert("anthropic_base_url", config_edit::str_item(anthropic));
     }
-    table.insert("api_key_env", config_edit::str_item(&api_key_env));
+    if oauth {
+        table.insert("auth", config_edit::str_item(crate::config::AUTH_OAUTH));
+    } else {
+        table.insert("api_key_env", config_edit::str_item(&api_key_env));
+    }
     table.insert("protocols", config_edit::str_array_item(&protocols));
     if let Some(quirks) = vendor.quirks {
         table.insert("quirks", config_edit::str_item(quirks));
@@ -272,7 +297,8 @@ fn add_provider(path: &Path, args: ProviderAddArgs, json: bool, no_reload: bool)
             "vendor_name": vendor.name,
             "base_url": vendor.base_url,
             "anthropic_base_url": vendor.anthropic_base_url,
-            "api_key_env": api_key_env,
+            "auth": if oauth { crate::config::AUTH_OAUTH } else { crate::config::AUTH_API_KEY },
+            "api_key_env": if oauth { Value::Null } else { json!(api_key_env) },
             "protocols": protocols,
             "quirks": vendor.quirks,
             "key_stored": new_key.is_some(),
@@ -283,8 +309,13 @@ fn add_provider(path: &Path, args: ProviderAddArgs, json: bool, no_reload: bool)
             Some(old) => format!(" (id '{old}' was taken; each provider is independent)"),
             None => String::new(),
         };
+        let login = if oauth {
+            format!(". Sign in this account with `umsp login {id}`")
+        } else {
+            String::new()
+        };
         format!(
-            "added provider {id} from vendor {} ({}){renamed}",
+            "added provider {id} from vendor {} ({}){renamed}{login}",
             vendor.id, vendor.base_url
         )
     })
@@ -313,6 +344,7 @@ pub fn run_vendor(path: &Path, cmd: VendorCmd, json: bool) -> Result<i32> {
                         "anthropic_base_url": vendor.anthropic_base_url,
                         "protocols": vendor.protocols,
                         "quirks": vendor.quirks,
+                        "auth": vendor.auth,
                         "docs_url": vendor.docs_url,
                         "configured": configured,
                     })
@@ -399,7 +431,13 @@ fn provider_test(path: &Path, args: ProviderTestArgs, json: bool) -> Result<i32>
             args.id
         )));
     }
-    let report = crate::commands::run_cmds::probe_blocking(&cfg, &args.id, &args.protocol, None)?;
+    let report = crate::commands::run_cmds::probe_blocking(
+        &cfg,
+        &crate::config::sessions_dir(path),
+        &args.id,
+        &args.protocol,
+        None,
+    )?;
     let value = json!({
         "provider": report.provider,
         "model": report.model,

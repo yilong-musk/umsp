@@ -55,6 +55,20 @@ umsp env set OTHER_KEY --stdin
 umsp env unset OTHER_KEY
 ```
 
+## Grok subscription accounts
+
+A Grok provider does not use `api_key_env`. `auth = "oauth"` means one subscription session, stored at `{config_dir}/sessions/<provider-id>.json` (mode 0600). Adding the vendor again allocates `grok-2`, `grok-3`, and each id has its own file, its own circuit, and its own place in a model's `backends` list. Refreshing one account cannot rotate another account's token.
+
+```bash
+umsp provider add --vendor grok
+umsp login grok
+umsp provider add --vendor grok
+umsp login grok-2
+umsp model add --id grok-4.7 --backend grok:grok-4.7 --backend grok-2:grok-4.7
+```
+
+The data plane speaks Responses only for this vendor and adds the Grok CLI proxy headers (`X-XAI-Token-Auth: xai-grok-cli`, `x-grok-model-override`) on the way up. API-key providers are unchanged.
+
 - **Vendors are built in**: only ids listed by `umsp vendor list` can be added; endpoint, protocols, and quirks are determined by `src/vendors.rs`, and `provider add` does not accept a custom base_url; an unknown vendor fails outright (exit code 2). Adding a vendor = adding one record in `src/vendors.rs` (and keeping the references valid in the `config.rs` validation).
 - **A provider is an independent instance**: every `provider add --vendor X` allocates a unique id (`X`, `X-2`, `X-3`…). The same vendor / same key can be added multiple times; each entry has its own id, circuit state, and metric labels, and none overwrites another. Without `--api-key-env` it defaults to `<ID>_API_KEY`; `--id` is only a readability hint.
 - `provider list` also probes the local `/healthz` once and shows each provider's `circuit` / `failures` / `last_status`; when the gateway is not running it notes `gateway: not running`, the circuit column shows `-`, and the command itself does not fail.

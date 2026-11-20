@@ -18,6 +18,9 @@ pub struct Vendor {
     pub protocols: &'static [&'static str],
     /// Request/response quirks preset (`opendesign`, `deepseek`, …).
     pub quirks: Option<&'static str>,
+    /// `api_key` reads `api_key_env`. `oauth` is a per-provider Grok subscription
+    /// session (`umsp login <id>`), independent of every other provider.
+    pub auth: &'static str,
     /// Official documentation, when known.
     pub docs_url: Option<&'static str>,
 }
@@ -30,6 +33,7 @@ pub const VENDORS: &[Vendor] = &[
         anthropic_base_url: None,
         protocols: &["chat", "responses", "messages"],
         quirks: Some("opendesign"),
+        auth: "api_key",
         docs_url: None,
     },
     Vendor {
@@ -39,7 +43,18 @@ pub const VENDORS: &[Vendor] = &[
         anthropic_base_url: Some("https://api.deepseek.com/anthropic"),
         protocols: &["chat", "responses", "messages"],
         quirks: Some("deepseek"),
+        auth: "api_key",
         docs_url: Some("https://api-docs.deepseek.com"),
+    },
+    Vendor {
+        id: "grok",
+        name: "Grok",
+        base_url: "https://cli-chat-proxy.grok.com/v1",
+        anthropic_base_url: None,
+        protocols: &["responses"],
+        quirks: None,
+        auth: "oauth",
+        docs_url: None,
     },
 ];
 
@@ -74,6 +89,7 @@ mod tests {
             if let Some(quirks) = vendor.quirks {
                 assert!(["opendesign", "deepseek"].contains(&quirks));
             }
+            assert!(["api_key", "oauth"].contains(&vendor.auth));
         }
     }
 }

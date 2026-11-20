@@ -88,6 +88,10 @@ pub enum Command {
     Probe(ProbeArgs),
     /// One Chat Completions call through the configured upstream
     Call(CallArgs),
+    /// Sign one Grok subscription provider in (device code). Each provider id is its own account.
+    Login(LoginArgs),
+    /// Delete one provider's stored subscription session
+    Logout(LogoutArgs),
     /// Read the JSONL request ledger
     Logs {
         #[command(subcommand)]
@@ -100,6 +104,21 @@ pub enum Command {
         /// Shell to generate for
         shell: Shell,
     },
+}
+
+#[derive(Debug, clap::Args)]
+pub struct LoginArgs {
+    /// Provider id of an oauth instance (`umsp provider list`)
+    pub provider: String,
+    /// Do not try to open a browser; print the URL and code only
+    #[arg(long)]
+    pub no_browser: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct LogoutArgs {
+    /// Provider id whose session file should be removed
+    pub provider: String,
 }
 
 #[derive(Debug, clap::Args)]
@@ -195,7 +214,7 @@ pub struct ProviderAddArgs {
 #[derive(Debug, clap::Args)]
 pub struct ProviderTestArgs {
     pub id: String,
-    /// chat (M0 only)
+    /// chat or responses
     #[arg(long, default_value = "chat")]
     pub protocol: String,
 }
@@ -544,6 +563,8 @@ mod tests {
             "probe",
             "call",
             "logs",
+            "login",
+            "logout",
             "version",
             "completion",
             "help",

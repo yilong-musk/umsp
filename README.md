@@ -111,8 +111,10 @@ config path globally.
 | `umsp config path\|show [--redact]\|validate` | Inspect/validate configuration |
 | `umsp check [--json]` | Validate config + keys + state directory; exit code 10 on failure |
 | `umsp doctor [--online] [--json]` | More detailed diagnostics; `--online` actually probes upstreams |
-| `umsp vendor list` | List built-in vendors (id, endpoint, protocols, quirks, number of configured instances) |
-| `umsp provider list\|add\|remove\|test` | Manage upstream providers; `add --vendor ID` needs only the vendor id + key, with endpoint/protocol from the built-in catalog, and assigns a unique id each time; `list` merges circuit-breaker/recent status from `/healthz` |
+| `umsp vendor list` | List built-in vendors (id, endpoint, protocols, quirks, auth, number of configured instances) |
+| `umsp provider list\|add\|remove\|test` | Manage upstream providers; `add --vendor ID` needs only the vendor id + key (or, for `grok`, no key), with endpoint/protocol from the built-in catalog, and assigns a unique id each time; `list` merges circuit-breaker/recent status from `/healthz` |
+| `umsp login <provider>` | Device-code sign-in for one Grok subscription provider. Each id has its own session file |
+| `umsp logout <provider>` | Delete that provider's session file |
 | `umsp env list\|set\|unset` | Manage upstream keys in the env file (masked display only; `set` hides input on a TTY) |
 | `umsp model list [--aliases]\|add\|remove` | Manage the local model registry (logical id + aliases) |
 | `umsp model backend add\|remove` | Attach/detach a backend for an existing model (`--first` inserts at the front, i.e. highest priority) |
@@ -139,6 +141,14 @@ printf '%s\n' "$K" | umsp provider add --vendor deepseek
 # The same vendor can be added repeatedly: each add gets its own id (deepseek, deepseek-2…),
 # endpoints come from the catalog, and instances neither overwrite nor merge with each other
 umsp provider add --vendor deepseek --no-key
+
+# Grok subscription accounts are the same shape: one provider id, one session.
+# `grok` and `grok-2` do not share a refresh token. Sign in each id on its own.
+umsp provider add --vendor grok
+umsp login grok
+umsp provider add --vendor grok
+umsp login grok-2
+umsp model add --id grok-4.7 --backend grok:grok-4.7 --backend grok-2:grok-4.7
 
 # Attach another backend to an existing model (insert at the front = highest priority)
 umsp model backend add claude-haiku-5.5 \
@@ -529,8 +539,10 @@ api_key_env = "DEEPSEEK_API_KEY"
 protocols = ["chat", "responses", "messages"]
 quirks = "deepseek"                # also determines the count_tokens proxy
 
-# The vendor catalog lives in code (src/vendors.rs): open-design, deepseek.
+# The vendor catalog lives in code (src/vendors.rs): open-design, deepseek, grok.
 # Adding a vendor requires changing that one place and rebuilding; an unknown vendor in the config fails validation.
+# `auth = "oauth"` (grok) stores one session per provider id under sessions/<id>.json.
+# `auth = "api_key"` (the default) still reads api_key_env from the env file.
 
 [[models]]
 id = "deepseek-v4.1-flash"          # logical model: callers only know this id

@@ -17,6 +17,7 @@ pub mod metrics;
 pub mod quirks;
 pub mod registry;
 pub mod server;
+pub mod sessions;
 pub mod stream;
 pub mod upstream;
 pub mod usage;

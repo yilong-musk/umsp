@@ -33,6 +33,16 @@ api_key_env = "DEEPSEEK_API_KEY"
 protocols = ["chat", "responses", "messages"]
 quirks = "deepseek"
 
+# Grok subscription. Each `umsp provider add --vendor grok` is its own account
+# (grok, grok-2, …) with its own session file. Sign in with `umsp login <id>`.
+# Protocols: responses only. Do not set api_key_env.
+# [[providers]]
+# id = "grok"
+# vendor = "grok"
+# auth = "oauth"
+# base_url = "https://cli-chat-proxy.grok.com/v1"
+# protocols = ["responses"]
+
 # A model is one logical entry for clients. `backends` lists the upstreams that
 # can serve it, in priority order: the first healthy one wins, and later ones
 # cover retryable failures (same protocol, one hop each, never a loop).

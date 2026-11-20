@@ -24,6 +24,7 @@ use crate::keys;
 use crate::metrics::Metrics;
 use crate::quirks;
 use crate::registry;
+use crate::sessions::{self, SessionError, SessionStore};
 use crate::stream;
 use crate::upstream::{self, forward_request_headers, relay_response_headers};
 use crate::usage::{LogStore, RequestRecord, Usage};
@@ -64,6 +65,7 @@ struct Inner {
     circuits: CircuitBreaker,
     logs: LogStore,
     metrics: Metrics,
+    sessions: SessionStore,
 }
 
 impl Clone for AppState {
@@ -76,7 +78,28 @@ impl Clone for AppState {
 
 impl AppState {
     pub fn new(cfg: Config, env: EnvFile) -> Result<Self> {
+        let dir = crate::config::sessions_dir(&crate::config::default_config_path());
+        Self::with_sessions(cfg, env, dir)
+    }
+
+    /// `sessions_dir` is `{config_dir}/sessions`. Each oauth provider reads only
+    /// its own `<id>.json` from that directory.
+    pub fn with_sessions(
+        cfg: Config,
+        env: EnvFile,
+        sessions_dir: std::path::PathBuf,
+    ) -> Result<Self> {
         let http = upstream::build_http_client(&cfg)?;
+        let sessions = SessionStore::new(sessions_dir, http.clone());
+        Self::with_store(cfg, env, http, sessions)
+    }
+
+    pub fn with_store(
+        cfg: Config,
+        env: EnvFile,
+        http: reqwest::Client,
+        sessions: SessionStore,
+    ) -> Result<Self> {
         let http_stream = upstream::build_stream_client()?;
         let logs = LogStore::new(&cfg.server.state_path());
         Ok(Self {
@@ -91,6 +114,7 @@ impl AppState {
                 circuits: CircuitBreaker::default(),
                 logs,
                 metrics: Metrics::new(),
+                sessions,
             }),
         })
     }
@@ -122,6 +146,21 @@ impl AppState {
 
     pub fn metrics(&self) -> &Metrics {
         &self.inner.metrics
+    }
+
+    pub fn sessions(&self) -> SessionStore {
+        self.inner.sessions.clone()
+    }
+
+    /// Upstream client bound to this process's HTTP pools and session store.
+    pub fn upstream(&self) -> Upstream {
+        Upstream::with_clients(
+            self.cfg(),
+            self.env().clone(),
+            self.http().clone(),
+            self.stream_http().clone(),
+            self.sessions(),
+        )
     }
 
     /// Single exit point for a finished request: one ledger row *and* one
@@ -212,7 +251,13 @@ pub struct ChatStream {
 
 #[derive(Debug)]
 pub enum ProxyError {
-    MissingKey { provider: String, env: String },
+    MissingKey {
+        provider: String,
+        env: String,
+    },
+    /// Subscription session missing or refresh rejected. Same client outcome as
+    /// an upstream 401: the circuit opens as `auth_failed`.
+    Auth(String),
     Timeout(String),
     Network(String),
 }
@@ -221,6 +266,7 @@ impl ProxyError {
     pub fn code(&self) -> &'static str {
         match self {
             ProxyError::MissingKey { .. } => "upstream_key_missing",
+            ProxyError::Auth(_) => "upstream_auth_failed",
             ProxyError::Timeout(_) => "upstream_timeout",
             ProxyError::Network(_) => "upstream_unreachable",
         }
@@ -234,17 +280,20 @@ pub struct Upstream {
     pub http: reqwest::Client,
     /// Timeout-free client for SSE (see `upstream::build_stream_client`).
     pub http_stream: reqwest::Client,
+    sessions: SessionStore,
 }
 
 impl Upstream {
-    pub fn new(cfg: Arc<Config>, env: EnvFile) -> Result<Self> {
+    pub fn new(cfg: Arc<Config>, env: EnvFile, sessions_dir: &std::path::Path) -> Result<Self> {
         let http = upstream::build_http_client(&cfg)?;
         let http_stream = upstream::build_stream_client()?;
+        let sessions = SessionStore::new(sessions_dir.to_path_buf(), http.clone());
         Ok(Self {
             cfg,
             env,
             http,
             http_stream,
+            sessions,
         })
     }
 
@@ -255,12 +304,14 @@ impl Upstream {
         env: EnvFile,
         http: reqwest::Client,
         http_stream: reqwest::Client,
+        sessions: SessionStore,
     ) -> Self {
         Self {
             cfg,
             env,
             http,
             http_stream,
+            sessions,
         }
     }
 
@@ -271,6 +322,113 @@ impl Upstream {
                 provider: provider.id.clone(),
                 env: provider.api_key_env.clone(),
             })
+    }
+
+    async fn bearer(&self, provider: &Provider) -> std::result::Result<String, ProxyError> {
+        if !provider.uses_oauth() {
+            return self.api_key(provider);
+        }
+        self.sessions
+            .access_token(&provider.id)
+            .await
+            .map_err(|err| match err {
+                SessionError::Missing { provider, .. } => ProxyError::MissingKey {
+                    provider,
+                    env: "oauth session".into(),
+                },
+                SessionError::Refresh { .. } => ProxyError::Auth(err.to_string()),
+            })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send(
+        &self,
+        http: &reqwest::Client,
+        url: &str,
+        provider: &Provider,
+        body: &Value,
+        payload: &[u8],
+        client_headers: &HeaderMap,
+        accept: &'static str,
+    ) -> std::result::Result<reqwest::Response, ProxyError> {
+        let token = self.bearer(provider).await?;
+        let response = self
+            .send_with_token(
+                http,
+                url,
+                provider,
+                body,
+                payload,
+                client_headers,
+                accept,
+                &token,
+            )
+            .await?;
+        if response.status().as_u16() == 401 && provider.uses_oauth() {
+            match self.sessions.refresh_rejected(&provider.id, &token).await {
+                Ok(fresh) => {
+                    let _ = response.bytes().await;
+                    return self
+                        .send_with_token(
+                            http,
+                            url,
+                            provider,
+                            body,
+                            payload,
+                            client_headers,
+                            accept,
+                            &fresh,
+                        )
+                        .await;
+                }
+                Err(_) => return Ok(response),
+            }
+        }
+        Ok(response)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_with_token(
+        &self,
+        http: &reqwest::Client,
+        url: &str,
+        provider: &Provider,
+        body: &Value,
+        payload: &[u8],
+        client_headers: &HeaderMap,
+        accept: &'static str,
+        token: &str,
+    ) -> std::result::Result<reqwest::Response, ProxyError> {
+        let mut req = http
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::ACCEPT, accept)
+            .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
+        if provider.uses_oauth() {
+            req = req.header("X-XAI-Token-Auth", sessions::CLI_TOKEN_AUTH);
+            if let Some(model) = body.get("model").and_then(Value::as_str) {
+                let value = reqwest::header::HeaderValue::from_str(model).map_err(|_| {
+                    ProxyError::Network(format!(
+                        "upstream model id for provider '{}' is not a valid header value",
+                        provider.id
+                    ))
+                })?;
+                req = req.header("x-grok-model-override", value);
+            }
+        }
+        for (name, value) in forward_request_headers(client_headers) {
+            if provider.uses_oauth() && sessions::is_cli_session_header(name.as_str()) {
+                continue;
+            }
+            req = req.header(name, value);
+        }
+        req.body(payload.to_vec()).send().await.map_err(|e| {
+            if e.is_timeout() {
+                ProxyError::Timeout(format!("upstream request to {url} timed out: {e}"))
+            } else {
+                ProxyError::Network(format!("upstream request to {url} failed: {e}"))
+            }
+        })
     }
 
     /// Forward a non-streaming Chat Completions request. The body must already
@@ -360,29 +518,20 @@ impl Upstream {
                     provider.id
                 ))
             })?;
-        let key = self.api_key(provider)?;
         let started = Instant::now();
         let payload = serde_json::to_vec(body)
             .map_err(|e| ProxyError::Network(format!("cannot serialize request: {e}")))?;
-
-        let mut req = self
-            .http
-            .post(&url)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(reqwest::header::ACCEPT, "application/json")
-            .header(reqwest::header::AUTHORIZATION, format!("Bearer {key}"))
-            .body(payload);
-        for (name, value) in forward_request_headers(client_headers) {
-            req = req.header(name, value);
-        }
-
-        let resp = req.send().await.map_err(|e| {
-            if e.is_timeout() {
-                ProxyError::Timeout(format!("upstream request to {url} timed out: {e}"))
-            } else {
-                ProxyError::Network(format!("upstream request to {url} failed: {e}"))
-            }
-        })?;
+        let resp = self
+            .send(
+                &self.http.clone(),
+                &url,
+                provider,
+                body,
+                &payload,
+                client_headers,
+                "application/json",
+            )
+            .await?;
 
         let status = resp.status().as_u16();
         let mut headers = relay_response_headers(resp.headers());
@@ -516,38 +665,30 @@ impl Upstream {
                     provider.id
                 ))
             })?;
-        let key = self.api_key(provider)?;
         let payload = serde_json::to_vec(body)
             .map_err(|e| ProxyError::Network(format!("cannot serialize request: {e}")))?;
-
-        let mut req = self
-            .http_stream
-            .post(&url)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(reqwest::header::ACCEPT, "text/event-stream")
-            .header(reqwest::header::AUTHORIZATION, format!("Bearer {key}"))
-            .body(payload);
-        for (name, value) in forward_request_headers(client_headers) {
-            req = req.header(name, value);
-        }
-
-        let resp = match tokio::time::timeout(header_timeout, req.send()).await {
+        let http_stream = self.http_stream.clone();
+        let resp = match tokio::time::timeout(
+            header_timeout,
+            self.send(
+                &http_stream,
+                &url,
+                provider,
+                body,
+                &payload,
+                client_headers,
+                "text/event-stream",
+            ),
+        )
+        .await
+        {
             Err(_) => {
                 return Err(ProxyError::Timeout(format!(
                     "upstream {url} sent no response headers within {}s",
                     header_timeout.as_secs()
                 )));
             }
-            Ok(Err(e)) if e.is_timeout() => {
-                return Err(ProxyError::Timeout(format!(
-                    "upstream request to {url} timed out: {e}"
-                )));
-            }
-            Ok(Err(e)) => {
-                return Err(ProxyError::Network(format!(
-                    "upstream request to {url} failed: {e}"
-                )));
-            }
+            Ok(Err(err)) => return Err(err),
             Ok(Ok(resp)) => resp,
         };
 
@@ -952,23 +1093,31 @@ async fn probe_provider(state: &AppState, cfg: &Config, provider: &Provider) -> 
         state.probe_store(&provider.id, value.clone());
         return value;
     };
-    if !provider.supports("chat") {
-        let value = json!({"status": "unknown", "error": "provider does not support chat probes"});
+    let up = state.upstream();
+    let started = Instant::now();
+    let outcome = if provider.supports("chat") {
+        let body = json!({
+            "model": upstream,
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 1,
+            "reasoning_effort": "none",
+            "stream": false
+        });
+        up.chat(provider, &upstream, &body, &HeaderMap::new()).await
+    } else if provider.supports("responses") {
+        let body = json!({
+            "model": upstream,
+            "input": "ping",
+            "max_output_tokens": 16,
+            "stream": false
+        });
+        up.responses(provider, &body, &HeaderMap::new()).await
+    } else {
+        let value = json!({"status": "unknown", "error": "provider has no probeable protocol"});
         state.probe_store(&provider.id, value.clone());
         return value;
-    }
-    let body = json!({
-        "model": upstream,
-        "messages": [{"role": "user", "content": "ping"}],
-        "max_tokens": 1,
-        "reasoning_effort": "none",
-        "stream": false
-    });
-    let Ok(up) = Upstream::new(Arc::new(cfg.clone()), state.env().clone()) else {
-        return json!({"status": "error", "error": "cannot build upstream client"});
     };
-    let started = Instant::now();
-    let mut value = match up.chat(provider, &upstream, &body, &HeaderMap::new()).await {
+    let mut value = match outcome {
         Ok(outcome) => {
             state.note_health(&provider.id, outcome.status, outcome.duration_ms, None);
             if outcome.status < 400 {
@@ -1613,6 +1762,21 @@ fn note_circuit_result(state: &AppState, target: &AttemptTarget, status: u16, pr
 /// Connection error / timeout: a retryable failure that counts toward the
 /// circuit (spec 3.4).
 fn note_circuit_error(state: &AppState, target: &AttemptTarget, err: &ProxyError) {
+    if matches!(err, ProxyError::Auth(_)) {
+        let cooldown = state.circuits().config().auth_cooldown;
+        if state
+            .circuits()
+            .force_open(&target.provider.id, "auth_failed", cooldown)
+        {
+            plog_health(
+                "circuit_open",
+                &target.provider.id,
+                &target.upstream,
+                "auth_failed",
+            );
+        }
+        return;
+    }
     if state
         .circuits()
         .record_failure(&target.provider.id, err.code())
@@ -1866,6 +2030,7 @@ async fn proxy_non_stream(
         state.env().clone(),
         state.http().clone(),
         state.stream_http().clone(),
+        state.sessions(),
     );
     let protocol = call.protocol();
     let count_tokens = matches!(call, NonStreamCall::MessagesCountTokens);
@@ -2059,6 +2224,11 @@ async fn proxy_non_stream(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "upstream_key_missing",
                     "the gateway is missing credentials for an upstream service".to_string(),
+                ),
+                ProxyError::Auth(_) => (
+                    StatusCode::BAD_GATEWAY,
+                    "upstream_auth_failed",
+                    "the gateway could not authenticate with the upstream service".to_string(),
                 ),
                 ProxyError::Timeout(_) => (
                     StatusCode::GATEWAY_TIMEOUT,
@@ -2488,6 +2658,7 @@ async fn proxy_stream(
         state.env().clone(),
         state.http().clone(),
         state.stream_http().clone(),
+        state.sessions(),
     );
     let header_timeout = Duration::from_secs(cfg.server.stream_header_timeout_s.max(1));
     let protocol_name = protocol.name();
@@ -2651,6 +2822,11 @@ async fn proxy_stream(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "upstream_key_missing",
                     "the gateway is missing credentials for an upstream service".to_string(),
+                ),
+                ProxyError::Auth(_) => (
+                    StatusCode::BAD_GATEWAY,
+                    "upstream_auth_failed",
+                    "the gateway could not authenticate with the upstream service".to_string(),
                 ),
                 ProxyError::Timeout(_) => (
                     StatusCode::GATEWAY_TIMEOUT,
@@ -3185,23 +3361,36 @@ async fn health_loop(state: AppState) {
                 provider: provider.clone(),
                 upstream: upstream.clone(),
             };
-            let body = json!({
-                "model": target.upstream,
-                "messages": [{"role": "user", "content": "ping"}],
-                "max_tokens": 1,
-                "reasoning_effort": "none",
-                "stream": false
-            });
             let up = Upstream::with_clients(
                 cfg.clone(),
                 state.env().clone(),
                 state.http().clone(),
                 state.stream_http().clone(),
+                state.sessions(),
             );
-            match up
-                .chat(&target.provider, &target.upstream, &body, &HeaderMap::new())
-                .await
-            {
+            let outcome = if target.provider.supports("chat") {
+                let body = json!({
+                    "model": target.upstream,
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "max_tokens": 1,
+                    "reasoning_effort": "none",
+                    "stream": false
+                });
+                up.chat(&target.provider, &target.upstream, &body, &HeaderMap::new())
+                    .await
+            } else if target.provider.supports("responses") {
+                let body = json!({
+                    "model": target.upstream,
+                    "input": "ping",
+                    "max_output_tokens": 16,
+                    "stream": false
+                });
+                up.responses(&target.provider, &body, &HeaderMap::new())
+                    .await
+            } else {
+                continue;
+            };
+            match outcome {
                 Ok(outcome) => {
                     state.note_health(
                         &target.provider.id,
@@ -3245,7 +3434,7 @@ pub async fn serve(config_path: &std::path::Path, listen_override: Option<String
         .unwrap_or_else(|| cfg.server.listen.clone());
     let env_path = Config::resolve_env_path();
     let env = EnvFile::load(&env_path);
-    let state = AppState::new(cfg, env)?;
+    let state = AppState::with_sessions(cfg, env, crate::config::sessions_dir(config_path))?;
     let app = build_router(state.clone());
 
     let listener = tokio::net::TcpListener::bind(&listen)
@@ -3385,6 +3574,7 @@ impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
         let status = match &self {
             ProxyError::MissingKey { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            ProxyError::Auth(_) => StatusCode::BAD_GATEWAY,
             ProxyError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
             ProxyError::Network(_) => StatusCode::BAD_GATEWAY,
         };
@@ -3392,6 +3582,7 @@ impl IntoResponse for ProxyError {
             ProxyError::MissingKey { provider, env } => {
                 format!("upstream key for provider '{provider}' is missing; set {env}")
             }
+            ProxyError::Auth(msg) => msg.clone(),
             ProxyError::Timeout(msg) | ProxyError::Network(msg) => msg.clone(),
         };
         gateway_error(status, self.code(), &message, "-")

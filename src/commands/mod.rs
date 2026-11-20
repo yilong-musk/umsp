@@ -5,6 +5,7 @@ mod config_cmd;
 pub mod config_edit;
 pub mod env_cmd;
 mod init;
+mod login;
 mod logs;
 mod registry_cmds;
 mod run_cmds;
@@ -48,6 +49,8 @@ pub fn run(cli: Cli) -> Result<i32> {
         Command::Usage { cmd } => usage_cmd::run(&config_path, cmd, json),
         Command::Probe(args) => run_cmds::run_probe(&config_path, args, json),
         Command::Call(args) => run_cmds::run_call(&config_path, args, json),
+        Command::Login(args) => login::login(&config_path, args, json),
+        Command::Logout(args) => login::logout(&config_path, args, json),
         Command::Logs { cmd } => logs::run(&config_path, cmd, json),
         Command::Version => version::run(json),
         Command::Completion { shell } => {

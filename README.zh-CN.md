@@ -101,8 +101,10 @@ hermes chat -q "只回复：正常" \
 | `umsp config path\|show [--redact]\|validate` | 查看/校验配置 |
 | `umsp check [--json]` | 配置 + 密钥 + 状态目录校验，失败退出码 10 |
 | `umsp doctor [--online] [--json]` | 更细的诊断项；`--online` 会真探测上游 |
-| `umsp vendor list` | 列出内置厂商（id、端点、协议、quirks、已配置实例数） |
-| `umsp provider list\|add\|remove\|test` | 管理上游 provider；`add --vendor ID` 只需厂商 id + key，端点/协议来自内置目录，每次分配唯一 id；`list` 合并 `/healthz` 的熔断/最近状态 |
+| `umsp vendor list` | 列出内置厂商（id、端点、协议、quirks、auth、已配置实例数） |
+| `umsp provider list\|add\|remove\|test` | 管理上游 provider；`add --vendor ID` 只需厂商 id + key（`grok` 不用 key），端点/协议来自内置目录，每次分配唯一 id；`list` 合并 `/healthz` 的熔断/最近状态 |
+| `umsp login <provider>` | 给一个 Grok 订阅 provider 做 device-code 登录。每个 id 有自己的 session 文件 |
+| `umsp logout <provider>` | 删除该 provider 的 session 文件 |
 | `umsp env list\|set\|unset` | 管理 env 文件里的上游密钥（只显示掩码；`set` 在 TTY 上隐藏输入） |
 | `umsp model list [--aliases]\|add\|remove` | 管理本地模型注册表（逻辑 id + aliases） |
 | `umsp model backend add\|remove` | 给已有模型挂/摘后端（`--first` 插到最前，即最高优先级） |
@@ -129,6 +131,14 @@ printf '%s\n' "$K" | umsp provider add --vendor deepseek
 # 同一厂商可以重复添加：每次分配独立 id（deepseek、deepseek-2…），
 # 端点来自目录，互不覆盖、互不合并
 umsp provider add --vendor deepseek --no-key
+
+# Grok 订阅也是这个形状：一个 provider id 一份 session。
+# grok 和 grok-2 不共用 refresh token，要分别登录。
+umsp provider add --vendor grok
+umsp login grok
+umsp provider add --vendor grok
+umsp login grok-2
+umsp model add --id grok-4.7 --backend grok:grok-4.7 --backend grok-2:grok-4.7
 
 # 给已有模型补一个后端（插到最前 = 最高优先级）
 umsp model backend add claude-haiku-5.5 \
@@ -472,8 +482,10 @@ api_key_env = "DEEPSEEK_API_KEY"
 protocols = ["chat", "responses", "messages"]
 quirks = "deepseek"                # count_tokens 代理也由它决定
 
-# 厂商目录在代码里（src/vendors.rs）：open-design、deepseek。
+# 厂商目录在代码里（src/vendors.rs）：open-design、deepseek、grok。
 # 新增厂商需要改这一处并重新构建；配置里出现未知 vendor 会直接校验失败。
+# `auth = "oauth"`（grok）按 provider id 把 session 放在 sessions/<id>.json。
+# `auth = "api_key"`（默认）仍然从 env 文件读 api_key_env。
 
 [[models]]
 id = "deepseek-v4.1-flash"          # 逻辑模型：调用方只认这个 id

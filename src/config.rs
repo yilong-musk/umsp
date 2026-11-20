@@ -26,6 +26,18 @@ pub fn default_env_path() -> PathBuf {
     home_dir().join(".config/umsp/env")
 }
 
+/// Directory of per-provider OAuth sessions, next to the config file.
+///
+/// `{config_dir}/sessions/<provider-id>.json`. Each oauth provider has its own
+/// file, so two Grok subscriptions never share a refresh token.
+pub fn sessions_dir(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join("sessions")
+}
+
 pub fn default_state_dir() -> PathBuf {
     home_dir().join(".local/share/umsp")
 }
@@ -154,7 +166,12 @@ pub struct Provider {
     pub base_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anthropic_base_url: Option<String>,
+    /// Env variable holding the upstream key. Empty when `auth` is `oauth`.
+    #[serde(default)]
     pub api_key_env: String,
+    /// `api_key` (env file) or `oauth` (one Grok subscription session per provider).
+    #[serde(default = "default_auth")]
+    pub auth: String,
     #[serde(default = "default_all_protocols")]
     pub protocols: Vec<String>,
     #[serde(default)]
@@ -165,9 +182,21 @@ fn default_all_protocols() -> Vec<String> {
     PROTOCOLS.iter().map(|s| s.to_string()).collect()
 }
 
+fn default_auth() -> String {
+    "api_key".to_string()
+}
+
+pub const AUTH_API_KEY: &str = "api_key";
+pub const AUTH_OAUTH: &str = "oauth";
+
 impl Provider {
     pub fn supports(&self, protocol: &str) -> bool {
         self.protocols.iter().any(|p| p == protocol)
+    }
+
+    /// Grok subscription session, stored per provider id. Not an env API key.
+    pub fn uses_oauth(&self) -> bool {
+        self.auth == AUTH_OAUTH
     }
 
     /// Whether `POST /v1/messages/count_tokens` can be proxied to this provider.
@@ -422,7 +451,44 @@ impl Config {
                     ),
                 ));
             }
-            if p.api_key_env.trim().is_empty() {
+            if p.auth != AUTH_API_KEY && p.auth != AUTH_OAUTH {
+                issues.push(err(
+                    "provider_auth",
+                    format!(
+                        "provider '{}' auth must be \"{}\" or \"{}\"",
+                        p.id, AUTH_API_KEY, AUTH_OAUTH
+                    ),
+                ));
+            }
+            if p.vendor.as_deref() == Some("grok") && !p.uses_oauth() {
+                issues.push(err(
+                    "provider_auth",
+                    format!(
+                        "provider '{}' uses vendor grok and needs auth = \"oauth\"",
+                        p.id
+                    ),
+                ));
+            }
+            if p.uses_oauth() && p.vendor.as_deref().is_some_and(|vendor| vendor != "grok") {
+                issues.push(err(
+                    "provider_auth",
+                    format!(
+                        "provider '{}' auth = \"oauth\" is only valid for vendor grok",
+                        p.id
+                    ),
+                ));
+            }
+            if p.uses_oauth() {
+                if !p.api_key_env.trim().is_empty() {
+                    issues.push(warn(
+                        "provider_api_key_env",
+                        format!(
+                            "provider '{}' auth is oauth; api_key_env is ignored (run `umsp login {}`)",
+                            p.id, p.id
+                        ),
+                    ));
+                }
+            } else if p.api_key_env.trim().is_empty() {
                 issues.push(err(
                     "provider_api_key_env",
                     format!("provider '{}' needs api_key_env", p.id),
@@ -659,6 +725,16 @@ api_key_env = "DEEPSEEK_API_KEY"
 protocols = ["chat", "responses", "messages"]
 quirks = "deepseek"
 
+# Grok subscription. Each `umsp provider add --vendor grok` is its own account
+# (grok, grok-2, …) with its own session file. Sign in with `umsp login <id>`.
+# Protocols: responses only. Do not set api_key_env.
+# [[providers]]
+# id = "grok"
+# vendor = "grok"
+# auth = "oauth"
+# base_url = "https://cli-chat-proxy.grok.com/v1"
+# protocols = ["responses"]
+
 # A model is one logical entry for clients. `backends` lists the upstreams that
 # can serve it, in priority order: the first healthy one wins, and later ones
 # cover retryable failures (same protocol, one hop each, never a loop).
@@ -715,6 +791,7 @@ mod tests {
                 base_url: "https://example.test/v1".into(),
                 anthropic_base_url: None,
                 api_key_env: "OD_KEY".into(),
+                auth: AUTH_API_KEY.into(),
                 protocols: default_all_protocols(),
                 quirks: Some("opendesign".into()),
             }],
@@ -874,6 +951,7 @@ mod tests {
             base_url: "https://api.deepseek.com".into(),
             anthropic_base_url: Some("https://api.deepseek.com/anthropic".into()),
             api_key_env: "DS_KEY".into(),
+            auth: AUTH_API_KEY.into(),
             protocols: protocols.iter().map(|p| (*p).to_string()).collect(),
             quirks: Some("deepseek".into()),
         });
@@ -936,6 +1014,59 @@ mod tests {
             .filter(|i| i.level == "error")
             .collect();
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+    }
+
+    #[test]
+    fn oauth_provider_does_not_need_an_api_key() {
+        let mut cfg = base_config();
+        cfg.providers.push(Provider {
+            id: "grok".into(),
+            vendor: Some("grok".into()),
+            base_url: "https://cli-chat-proxy.grok.com/v1".into(),
+            anthropic_base_url: None,
+            api_key_env: String::new(),
+            auth: AUTH_OAUTH.into(),
+            protocols: vec!["responses".into()],
+            quirks: None,
+        });
+        cfg.providers.push(Provider {
+            id: "grok-2".into(),
+            vendor: Some("grok".into()),
+            base_url: "https://cli-chat-proxy.grok.com/v1".into(),
+            anthropic_base_url: None,
+            api_key_env: String::new(),
+            auth: AUTH_OAUTH.into(),
+            protocols: vec!["responses".into()],
+            quirks: None,
+        });
+        let errors: Vec<_> = cfg
+            .validate()
+            .into_iter()
+            .filter(|issue| issue.level == "error")
+            .collect();
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert!(cfg.providers[1].uses_oauth());
+        assert!(!cfg.providers[0].uses_oauth());
+    }
+
+    #[test]
+    fn grok_vendor_with_an_api_key_auth_is_rejected() {
+        let mut cfg = base_config();
+        cfg.providers.push(Provider {
+            id: "grok".into(),
+            vendor: Some("grok".into()),
+            base_url: "https://cli-chat-proxy.grok.com/v1".into(),
+            anthropic_base_url: None,
+            api_key_env: "XAI_API_KEY".into(),
+            auth: AUTH_API_KEY.into(),
+            protocols: vec!["responses".into()],
+            quirks: None,
+        });
+        assert!(
+            cfg.validate()
+                .iter()
+                .any(|issue| issue.code == "provider_auth")
+        );
     }
 
     #[test]

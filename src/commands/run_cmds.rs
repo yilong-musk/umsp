@@ -34,31 +34,39 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
 
 pub fn probe_blocking(
     cfg: &Config,
+    sessions_dir: &Path,
     provider_id: &str,
     protocol: &str,
     model_id: Option<&str>,
 ) -> Result<ProbeReport> {
     let rt = runtime()?;
-    rt.block_on(probe_async(cfg, provider_id, protocol, model_id))
+    rt.block_on(probe_async(
+        cfg,
+        sessions_dir,
+        provider_id,
+        protocol,
+        model_id,
+    ))
 }
 
 pub async fn probe_async(
     cfg: &Config,
+    sessions_dir: &Path,
     provider_id: &str,
     protocol: &str,
     model_id: Option<&str>,
 ) -> Result<ProbeReport> {
-    if protocol != "chat" {
+    if protocol != "chat" && protocol != "responses" {
         return Err(UmspError::usage(format!(
-            "protocol '{protocol}' probes are not implemented in M0 (chat only)"
+            "protocol '{protocol}' probes are not implemented (chat or responses)"
         )));
     }
     let provider = cfg
         .provider(provider_id)
         .ok_or_else(|| UmspError::not_found(format!("provider '{provider_id}' not found")))?;
-    if !provider.supports("chat") {
+    if !provider.supports(protocol) {
         return Err(UmspError::usage(format!(
-            "provider '{provider_id}' does not support the chat protocol"
+            "provider '{provider_id}' does not support the {protocol} protocol"
         )));
     }
     let model = match model_id {
@@ -93,16 +101,26 @@ pub async fn probe_async(
         })?;
 
     let env = EnvFile::load(&Config::resolve_env_path());
-    let up = Upstream::new(Arc::new(cfg.clone()), env)?;
-    let body = json!({
-        "model": upstream,
-        "messages": [{"role": "user", "content": "ping"}],
-        "max_tokens": 1,
-        "reasoning_effort": "none",
-        "stream": false
-    });
+    let up = Upstream::new(Arc::new(cfg.clone()), env, sessions_dir)?;
     let started = Instant::now();
-    let outcome = up.chat(provider, &upstream, &body, &HeaderMap::new()).await;
+    let outcome = if protocol == "responses" {
+        let body = json!({
+            "model": upstream,
+            "input": "ping",
+            "max_output_tokens": 16,
+            "stream": false
+        });
+        up.responses(provider, &body, &HeaderMap::new()).await
+    } else {
+        let body = json!({
+            "model": upstream,
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 1,
+            "reasoning_effort": "none",
+            "stream": false
+        });
+        up.chat(provider, &upstream, &body, &HeaderMap::new()).await
+    };
     let latency_ms = started.elapsed().as_millis() as u64;
 
     match outcome {
@@ -116,8 +134,9 @@ pub async fn probe_async(
             usage: outcome.usage,
         }),
         Err(ProxyError::MissingKey { provider, env }) => Err(UmspError::config(format!(
-            "provider '{provider}' is missing {env}; add it to ~/.config/umsp/env"
+            "provider '{provider}' is missing {env}; add it to ~/.config/umsp/env or run `umsp login {provider}`"
         ))),
+        Err(ProxyError::Auth(msg)) => Err(UmspError::upstream("upstream_auth_failed", msg)),
         Err(err) => Ok(ProbeReport {
             provider: provider.id.clone(),
             model: model.id.clone(),
@@ -140,7 +159,13 @@ pub fn run_probe(path: &Path, args: ProbeArgs, json: bool) -> Result<i32> {
         )));
     }
     let cfg = crate::commands::load_config(path)?;
-    let report = probe_blocking(&cfg, &args.provider, "chat", args.model.as_deref())?;
+    let report = probe_blocking(
+        &cfg,
+        &crate::config::sessions_dir(path),
+        &args.provider,
+        "chat",
+        args.model.as_deref(),
+    )?;
     let value = json!({
         "provider": report.provider,
         "model": report.model,
@@ -189,7 +214,11 @@ pub fn run_call(path: &Path, args: CallArgs, json: bool) -> Result<i32> {
     let cfg = crate::commands::load_config(path)?;
     let (model, provider, upstream) = resolve_target(&cfg, &args.model)?;
     let env = EnvFile::load(&Config::resolve_env_path());
-    let up = Upstream::new(Arc::new(cfg.clone()), env)?;
+    let up = Upstream::new(
+        Arc::new(cfg.clone()),
+        env,
+        &crate::config::sessions_dir(path),
+    )?;
     let body = json!({
         "model": upstream,
         "messages": [{"role": "user", "content": args.prompt}],
@@ -248,8 +277,9 @@ pub fn run_call(path: &Path, args: CallArgs, json: bool) -> Result<i32> {
             Ok(0)
         }
         Err(ProxyError::MissingKey { provider, env }) => Err(UmspError::config(format!(
-            "provider '{provider}' is missing {env}; add it to ~/.config/umsp/env"
+            "provider '{provider}' is missing {env}; add it to ~/.config/umsp/env or run `umsp login {provider}`"
         ))),
+        Err(ProxyError::Auth(msg)) => Err(UmspError::upstream("upstream_auth_failed", msg)),
         Err(ProxyError::Timeout(msg)) => Err(UmspError::network(msg)),
         Err(ProxyError::Network(msg)) => Err(UmspError::network(msg)),
     }

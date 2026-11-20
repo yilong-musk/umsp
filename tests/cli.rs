@@ -162,6 +162,55 @@ fn vendor_list_shows_the_catalogue() {
 }
 
 #[test]
+fn grok_accounts_are_independent_of_each_other_and_of_api_keys() {
+    let sb = Sandbox::new("grok-oauth");
+    let first = sb.ok(&["provider", "add", "--vendor", "grok"], None);
+    assert!(first.contains("umsp login grok"), "{first}");
+    assert!(!first.contains("grok-2"), "{first}");
+    let second = sb.ok(&["provider", "add", "--vendor", "grok"], None);
+    assert!(second.contains("grok-2"), "{second}");
+    assert!(second.contains("umsp login grok-2"), "{second}");
+    let cfg = sb.read_config();
+    let live_oauth = cfg
+        .lines()
+        .filter(|line| line.trim() == "auth = \"oauth\"")
+        .count();
+    assert_eq!(live_oauth, 2, "{cfg}");
+    assert!(
+        !cfg.contains("GROK_API_KEY") && !cfg.contains("GROK_2_API_KEY"),
+        "oauth providers must not invent an env key: {cfg}"
+    );
+    assert!(sb.read_env().trim().is_empty(), "env file must stay empty");
+
+    let check = sb.run(&["check", "--json"], None);
+    let text = String::from_utf8_lossy(&check.stdout);
+    assert!(text.contains("umsp login grok`"), "{text}");
+    assert!(text.contains("umsp login grok-2"), "{text}");
+
+    let sessions = sb.dir.join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(
+        sessions.join("grok.json"),
+        r#"{"access_token":"a","refresh_token":"r","expires_at":"2099-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+    let logged_out = sb.ok(&["logout", "grok"], None);
+    assert!(
+        logged_out.contains("signed out provider grok"),
+        "{logged_out}"
+    );
+    assert!(!sessions.join("grok.json").exists());
+    let missing = sb.run(&["logout", "grok-2"], None);
+    assert!(!missing.status.success());
+    let err = format!(
+        "{}{}",
+        String::from_utf8_lossy(&missing.stdout),
+        String::from_utf8_lossy(&missing.stderr)
+    );
+    assert!(err.contains("grok-2"), "{err}");
+}
+
+#[test]
 fn provider_add_needs_a_known_vendor() {
     let sb = Sandbox::new("unknown-vendor");
     let out = sb.run(
@@ -175,7 +224,7 @@ fn provider_add_needs_a_known_vendor() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(text.contains("unknown vendor 'openrouter'"), "{text}");
-    assert!(text.contains("open-design, deepseek"), "{text}");
+    assert!(text.contains("open-design, deepseek, grok"), "{text}");
     assert!(!sb.read_config().contains("openrouter"));
 }
 

@@ -5,9 +5,37 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use crate::cli::DoctorArgs;
-use crate::config::Config;
+use crate::config::{Config, Provider};
 use crate::envfile::{self, EnvFile};
 use crate::error::{EXIT_OTHER, Result, UmspError};
+use crate::sessions;
+
+fn missing_credential(
+    provider: &Provider,
+    env: &EnvFile,
+    sessions_dir: &Path,
+    env_path: &Path,
+) -> Option<String> {
+    if provider.uses_oauth() {
+        if sessions::session_ready(sessions_dir, &provider.id) {
+            None
+        } else {
+            Some(format!(
+                "provider '{}' has no oauth session; run `umsp login {}`",
+                provider.id, provider.id
+            ))
+        }
+    } else if env.has(&provider.api_key_env) {
+        None
+    } else {
+        Some(format!(
+            "provider '{}' needs {} (put it in {} or the process environment)",
+            provider.id,
+            provider.api_key_env,
+            env_path.display()
+        ))
+    }
+}
 
 pub fn run_check(path: &Path, json: bool) -> Result<i32> {
     let mut errors: Vec<Value> = Vec::new();
@@ -35,14 +63,12 @@ pub fn run_check(path: &Path, json: bool) -> Result<i32> {
     if let Some(cfg) = &cfg {
         let env_path = Config::resolve_env_path();
         let env = EnvFile::load(&env_path);
+        let sessions = crate::config::sessions_dir(path);
         for provider in &cfg.providers {
-            if !env.has(&provider.api_key_env) {
+            if let Some(message) = missing_credential(provider, &env, &sessions, &env_path) {
                 errors.push(json!({
-                    "code": "provider_key_missing",
-                    "message": format!(
-                        "provider '{}' needs {} (put it in {} or the process environment)",
-                        provider.id, provider.api_key_env, env_path.display()
-                    )
+                    "code": if provider.uses_oauth() { "provider_session_missing" } else { "provider_key_missing" },
+                    "message": message
                 }));
                 env_ok = false;
             }
@@ -304,17 +330,20 @@ pub fn run_doctor(path: &Path, args: DoctorArgs, json: bool) -> Result<i32> {
         if cfg.providers.is_empty() {
             rows.push(CheckRow::warn("providers", "none configured"));
         }
+        let sessions = crate::config::sessions_dir(path);
         for provider in &cfg.providers {
             let name = format!("provider_key:{}", provider.id);
-            if env.has(&provider.api_key_env) {
+            if let Some(message) = missing_credential(provider, &env, &sessions, &env_path) {
+                rows.push(CheckRow::fail(name, message));
+            } else if provider.uses_oauth() {
+                rows.push(CheckRow::ok(
+                    name,
+                    format!("oauth session for {}", provider.id),
+                ));
+            } else {
                 rows.push(CheckRow::ok(
                     name,
                     format!("{} is set", provider.api_key_env),
-                ));
-            } else {
-                rows.push(CheckRow::fail(
-                    name,
-                    format!("{} is not set", provider.api_key_env),
                 ));
             }
             let models = cfg
@@ -414,8 +443,20 @@ pub fn run_doctor(path: &Path, args: DoctorArgs, json: bool) -> Result<i32> {
             Some(cfg) if !cfg.providers.is_empty() => {
                 for provider in &cfg.providers {
                     let name = format!("online:{}", provider.id);
-                    match crate::commands::run_cmds::probe_blocking(cfg, &provider.id, "chat", None)
-                    {
+                    let protocol = if provider.supports("chat") {
+                        "chat"
+                    } else if provider.supports("responses") {
+                        "responses"
+                    } else {
+                        "messages"
+                    };
+                    match crate::commands::run_cmds::probe_blocking(
+                        cfg,
+                        &crate::config::sessions_dir(path),
+                        &provider.id,
+                        protocol,
+                        None,
+                    ) {
                         Ok(report) => {
                             if report.ok {
                                 rows.push(CheckRow::ok(

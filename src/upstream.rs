@@ -45,16 +45,28 @@ pub const SKIP_RESPONSE_HEADERS: &[&str] = &[
     "proxy-connection",
 ];
 
+/// Short-lived client for the OAuth token endpoint (device login and refresh).
+pub fn build_login_client() -> Result<reqwest::Client> {
+    let tls = tls_config()?;
+    finish_client(
+        reqwest::Client::builder()
+            .use_preconfigured_tls(tls)
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(60))
+            .redirect(Policy::none()),
+    )
+}
+
 pub fn build_http_client(cfg: &Config) -> Result<reqwest::Client> {
     let tls = tls_config()?;
-    reqwest::Client::builder()
-        .use_preconfigured_tls(tls)
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(cfg.server.request_timeout_s))
-        .redirect(Policy::none())
-        .pool_idle_timeout(std::time::Duration::from_secs(90))
-        .build()
-        .map_err(|e| UmspError::other("HTTP_CLIENT", format!("cannot build HTTP client: {e}")))
+    finish_client(
+        reqwest::Client::builder()
+            .use_preconfigured_tls(tls)
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(cfg.server.request_timeout_s))
+            .redirect(Policy::none())
+            .pool_idle_timeout(std::time::Duration::from_secs(90)),
+    )
 }
 
 /// Client for SSE requests. Deliberately has **no total timeout** — the
@@ -64,13 +76,66 @@ pub fn build_http_client(cfg: &Config) -> Result<reqwest::Client> {
 /// `tokio::time::timeout` around `send()` / the body stream only.
 pub fn build_stream_client() -> Result<reqwest::Client> {
     let tls = tls_config()?;
-    reqwest::Client::builder()
-        .use_preconfigured_tls(tls)
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .redirect(Policy::none())
-        .pool_idle_timeout(std::time::Duration::from_secs(90))
+    finish_client(
+        reqwest::Client::builder()
+            .use_preconfigured_tls(tls)
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .redirect(Policy::none())
+            .pool_idle_timeout(std::time::Duration::from_secs(90)),
+    )
+}
+
+fn finish_client(builder: reqwest::ClientBuilder) -> Result<reqwest::Client> {
+    with_env_proxy(builder)
         .build()
         .map_err(|e| UmspError::other("HTTP_CLIENT", format!("cannot build HTTP client: {e}")))
+}
+
+/// Honour `HTTP(S)_PROXY`, but never send loopback upstreams through it.
+/// Tests and `base_url = "http://127.0.0.1:..."` depend on that.
+fn with_env_proxy(mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    let https = env_proxy(&["HTTPS_PROXY", "https_proxy"]);
+    let http = env_proxy(&["HTTP_PROXY", "http_proxy"]);
+    let all = env_proxy(&["ALL_PROXY", "all_proxy"]);
+    let mut installed = false;
+    if let Some(url) = https {
+        if let Ok(proxy) = reqwest::Proxy::https(url) {
+            builder = builder.proxy(proxy.no_proxy(loopback_no_proxy()));
+            installed = true;
+        }
+    }
+    if let Some(url) = http {
+        if let Ok(proxy) = reqwest::Proxy::http(url) {
+            builder = builder.proxy(proxy.no_proxy(loopback_no_proxy()));
+            installed = true;
+        }
+    }
+    if !installed {
+        if let Some(url) = all {
+            if let Ok(proxy) = reqwest::Proxy::all(url) {
+                builder = builder.proxy(proxy.no_proxy(loopback_no_proxy()));
+            }
+        }
+    }
+    builder
+}
+
+fn env_proxy(names: &[&str]) -> Option<String> {
+    names
+        .iter()
+        .find_map(|name| std::env::var(name).ok())
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn loopback_no_proxy() -> Option<reqwest::NoProxy> {
+    let mut list = std::env::var("NO_PROXY")
+        .or_else(|_| std::env::var("no_proxy"))
+        .unwrap_or_default();
+    if !list.is_empty() && !list.trim_end().ends_with(',') {
+        list.push(',');
+    }
+    list.push_str("localhost,127.0.0.1,::1");
+    reqwest::NoProxy::from_string(&list)
 }
 
 fn tls_config() -> Result<rustls::ClientConfig> {
@@ -225,6 +290,7 @@ mod tests {
             base_url: "https://od.test/v1".into(),
             anthropic_base_url: None,
             api_key_env: "K".into(),
+            auth: "api_key".into(),
             protocols: vec!["chat".into(), "messages".into()],
             quirks: None,
         };

@@ -62,6 +62,7 @@ fn config(dir: &Path, upstream_url: String, max_body: usize) -> Config {
             base_url: upstream_url,
             anthropic_base_url: None,
             api_key_env: "TEST_OD_KEY".into(),
+            auth: "api_key".into(),
             protocols: PROTOCOLS.iter().map(|s| s.to_string()).collect(),
             quirks: Some("opendesign".into()),
         }],
@@ -523,6 +524,7 @@ fn add_deepseek(cfg: &mut Config, v1_url: &str) {
         base_url: root.clone(),
         anthropic_base_url: Some(format!("{root}/anthropic")),
         api_key_env: "TEST_DS_KEY".into(),
+        auth: "api_key".into(),
         protocols: PROTOCOLS.iter().map(|s| s.to_string()).collect(),
         quirks: Some("deepseek".into()),
     });
@@ -3001,6 +3003,7 @@ fn m4b_config(dir: &Path, od_base: String, ds_root: String, with_fallback: bool)
         base_url: ds_root.clone(),
         anthropic_base_url: Some(format!("{ds_root}/anthropic")),
         api_key_env: "TEST_DS_KEY".into(),
+        auth: "api_key".into(),
         protocols: PROTOCOLS.iter().map(|s| s.to_string()).collect(),
         quirks: Some("deepseek".into()),
     });
@@ -3682,4 +3685,129 @@ async fn metrics_record_stream_ttft_and_return_inflight_to_zero() {
         !text.contains("umsp_inflight_requests{"),
         "inflight gauge leaked: {text}"
     );
+}
+
+#[tokio::test]
+async fn oauth_accounts_send_independent_session_headers() {
+    let dir = temp_dir("oauth-headers");
+    let (upstream, rec) = start_upstream().await;
+    let mut cfg = config(&dir, upstream, 50 * 1024 * 1024);
+    let base = cfg.providers[0].base_url.clone();
+    for id in ["grok", "grok-2"] {
+        cfg.providers.push(Provider {
+            id: id.into(),
+            vendor: Some("grok".into()),
+            base_url: base.clone(),
+            anthropic_base_url: None,
+            api_key_env: String::new(),
+            auth: "oauth".into(),
+            protocols: vec!["responses".into()],
+            quirks: None,
+        });
+    }
+    cfg.models.push(Model {
+        id: "grok-a".into(),
+        backends: vec![Backend {
+            provider: "grok".into(),
+            upstream: "grok-4.7".into(),
+        }],
+        aliases: vec![],
+        context_length: 256_000,
+        max_completion_tokens: 0,
+        capabilities: vec!["text".into()],
+        display_name: None,
+        created: 1_789_026_056,
+        description: None,
+    });
+    cfg.models.push(Model {
+        id: "grok-b".into(),
+        backends: vec![Backend {
+            provider: "grok-2".into(),
+            upstream: "grok-4.7".into(),
+        }],
+        aliases: vec![],
+        context_length: 256_000,
+        max_completion_tokens: 0,
+        capabilities: vec!["text".into()],
+        display_name: None,
+        created: 1_789_026_056,
+        description: None,
+    });
+    let sessions = dir.join("sessions");
+    umsp::sessions::write_session(
+        &sessions,
+        "grok",
+        "token-account-a",
+        "refresh-a",
+        "2099-01-01T00:00:00Z",
+    )
+    .unwrap();
+    umsp::sessions::write_session(
+        &sessions,
+        "grok-2",
+        "token-account-b",
+        "refresh-b",
+        "2099-01-01T00:00:00Z",
+    )
+    .unwrap();
+    let state = AppState::with_sessions(cfg, env_file(&dir), sessions).unwrap();
+    let app = build_router(state);
+
+    let response = app.clone().oneshot(chat_request("normal")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .clone()
+        .oneshot(responses_named("grok-a"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app.oneshot(responses_named("grok-b")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = rec.headers.lock().unwrap().clone();
+    assert_eq!(seen.len(), 3);
+    let auth = |i: usize| {
+        seen[i]
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string()
+    };
+    let hdr = |i: usize, name: &str| {
+        seen[i]
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string()
+    };
+    assert_eq!(auth(0), "Bearer sk-test");
+    assert!(hdr(0, "x-xai-token-auth").is_empty());
+    assert_eq!(auth(1), "Bearer token-account-a");
+    assert_eq!(hdr(1, "x-xai-token-auth"), "xai-grok-cli");
+    assert_eq!(hdr(1, "x-grok-model-override"), "grok-4.7");
+    assert_eq!(auth(2), "Bearer token-account-b");
+    assert_eq!(hdr(2, "x-xai-token-auth"), "xai-grok-cli");
+    assert_eq!(hdr(2, "x-grok-model-override"), "grok-4.7");
+    assert!(
+        !std::fs::read_to_string(dir.join("sessions/grok.json"))
+            .unwrap()
+            .contains("token-account-b")
+    );
+}
+
+fn responses_named(model: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("authorization", format!("Bearer {TEST_KEY}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": model,
+                "input": "ping",
+                "stream": false
+            }))
+            .unwrap(),
+        ))
+        .unwrap()
 }
