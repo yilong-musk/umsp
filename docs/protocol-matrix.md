@@ -17,6 +17,28 @@ All three entry points share the same model registry and the same set of client 
 | M3 status | same as above (unchanged) | same as above (unchanged) | non-streaming ✅ / streaming ✅ (OD) |
 | M4a status | OD + **DS ✅** (DS request quirks: `reasoning_content` filled in, `reasoning_details` dropped, `user_id` injected) | OD + **DS ✅** (DS provides its own `event:` lines, no duplicates inserted; usage taken from `response.completed.response.usage`) | OD + **DS ✅** (`{ds_anthropic}/v1/messages`; `count_tokens` DS 200 / OD 501) |
 
+## Translation fidelity
+
+A translated request keeps the semantic core (text, images, tool calls, usage) and records every
+lossy decision in the request's ledger `quirks` list.
+
+- Sampling: `temperature` and `top_p` are clamped to `0..1` for Messages targets
+  (`clamped_temperature`, `clamped_top_p`).
+- Output budget: a Messages target without `max_tokens` uses the logical model's
+  `max_completion_tokens` (`defaulted_max_tokens`); the 8192 fallback only applies when the model
+  limit is unknown.
+- Tools: only client function tools are translated. Chat built-ins, Anthropic server tools and
+  Responses custom tools are dropped (`dropped_server_tool:<name>`); a named `tool_choice` that
+  points at a dropped tool is dropped too.
+- Structured output: Chat `response_format` and Responses `text.format` map to each other for
+  `json_object` and `json_schema`; Messages has no equivalent and records
+  `dropped_response_format`.
+- Content: assistant images are dropped (`dropped_assistant_image`); a Messages `tool_result` with
+  `is_error` becomes an `error:` prefix and omitted images are announced in the text.
+- Finish reasons: `content_filter` / `refusal` survive translation; Responses returns
+  `status: incomplete` with `incomplete_details.reason`.
+
+
 ## DeepSeek (M4a) highlights
 
 - Paths: Chat `{ds}/chat/completions`, Responses `{ds}/responses`,
