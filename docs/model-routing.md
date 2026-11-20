@@ -80,11 +80,11 @@ The data plane speaks Responses only for this vendor and adds the Grok CLI proxy
 ## Resolution and routing
 
 1. The request's `model` is first matched exactly against `id`, then against aliases; neither → 404 `model_not_found`.
-2. Candidate backends = entries in `backends` that satisfy "provider exists + supports this protocol (count_tokens additionally requires that it can proxy it)", preserving configuration order.
+2. Candidate backends = entries in `backends` whose provider exists and speaks at least one protocol, preserving configuration order. The attempt uses the client protocol when the provider lists it, and otherwise translates into the first protocol in that provider's list. `count_tokens` still requires a Messages backend that can proxy it.
 3. Try in order; only retryable failures (connection errors, timeouts, 429, 5xx, 402) move on to the next one, while 400/401/403/404/422 return immediately.
 4. Each backend is tried at most once; the list is linear, so no loop exists.
 5. Switching happens only before any byte has been sent to the client; once SSE has returned 200 there is no further switching.
-6. All backends unavailable (for example all circuit-broken) → 503 `temporarily_unavailable`; the model exists but no backend supports the protocol → 400 `no_backend_for_protocol`.
+6. All backends unavailable (for example all circuit-broken) → 503 `temporarily_unavailable`; a model with no usable backend → 400 `no_backend_for_protocol`. A registered model is not rejected only because a provider omits the client's protocol.
 7. On each attempt the request body's `model` is rewritten to that backend's `upstream`; provider-specific quirks are applied per backend as well.
 
 ## Validation (`umsp check` / `umsp validate`)

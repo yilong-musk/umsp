@@ -19,6 +19,7 @@ pub mod registry;
 pub mod server;
 pub mod sessions;
 pub mod stream;
+pub mod translate;
 pub mod upstream;
 pub mod usage;
 pub mod util;

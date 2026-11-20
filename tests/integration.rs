@@ -3795,6 +3795,127 @@ async fn oauth_accounts_send_independent_session_headers() {
     );
 }
 
+#[tokio::test]
+async fn registered_model_accepts_every_protocol_against_responses_only() {
+    let dir = temp_dir("translate-responses-only");
+    let (upstream, rec) = start_upstream().await;
+    let mut cfg = config(&dir, upstream, 50 * 1024 * 1024);
+    cfg.providers[0].protocols = vec!["responses".into()];
+    cfg.providers[0].quirks = None;
+    let state = AppState::new(cfg, env_file(&dir)).unwrap();
+    let app = build_router(state);
+
+    let chat = app.clone().oneshot(chat_request("normal")).await.unwrap();
+    assert_eq!(chat.status(), StatusCode::OK);
+    let chat_body = body_json(chat).await;
+    assert_eq!(chat_body["object"], "chat.completion");
+    assert_eq!(chat_body["model"], "upstream-model");
+    assert_eq!(chat_body["choices"][0]["message"]["content"], "hi");
+    assert_eq!(chat_body["usage"]["prompt_tokens"], 11);
+    let seen = rec.last();
+    assert!(
+        seen.get("input").is_some(),
+        "upstream saw a responses body: {seen}"
+    );
+    assert!(seen.get("messages").is_none(), "{seen}");
+    assert_eq!(seen["model"], "upstream-model");
+
+    let messages = app
+        .clone()
+        .oneshot(post_to(
+            "/v1/messages",
+            json!({
+                "model": "upstream-model",
+                "max_tokens": 32,
+                "system": "be brief",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": false
+            }),
+            "normal",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(messages.status(), StatusCode::OK);
+    let messages_body = body_json(messages).await;
+    assert_eq!(messages_body["type"], "message");
+    assert_eq!(messages_body["content"][0]["text"], "hi");
+    assert_eq!(messages_body["stop_reason"], "end_turn");
+    let seen = rec.last();
+    assert_eq!(seen["instructions"], "be brief");
+    assert_eq!(seen["max_output_tokens"], 32);
+
+    let stream = app.oneshot(stream_request("sse")).await.unwrap();
+    assert_eq!(stream.status(), StatusCode::OK);
+    let bytes = body_bytes(stream).await;
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains("\"content\":\"hi\""), "{text}");
+    assert!(text.contains("data: [DONE]"), "{text}");
+
+    let records = wait_records(&dir, 3).await;
+    assert!(
+        records.iter().all(|record| {
+            record
+                .quirks
+                .iter()
+                .any(|quirk| quirk.starts_with("translated:"))
+        }),
+        "{:?}",
+        records
+            .iter()
+            .map(|record| &record.quirks)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn higher_priority_responses_provider_is_tried_before_a_native_chat_backend() {
+    let dir = temp_dir("translate-priority");
+    let (root, fake) = start_scripted().await;
+    let mut cfg = config(&dir, format!("{root}/v1"), 50 * 1024 * 1024);
+    cfg.providers[0].base_url = format!("{root}/v1");
+    cfg.providers.push(Provider {
+        id: "responses-only".into(),
+        vendor: Some("open-design".into()),
+        base_url: format!("{root}/v1"),
+        anthropic_base_url: None,
+        api_key_env: "TEST_OD_KEY".into(),
+        auth: "api_key".into(),
+        protocols: vec!["responses".into()],
+        quirks: None,
+    });
+    cfg.models[0].backends = vec![
+        Backend {
+            provider: "responses-only".into(),
+            upstream: "only-model".into(),
+        },
+        Backend {
+            provider: "od".into(),
+            upstream: "upstream-model".into(),
+        },
+    ];
+    fake.queue("only-model", &[502]);
+    let state = AppState::new(cfg, env_file(&dir)).unwrap();
+    let app = build_router(state);
+    let response = app.oneshot(chat_request("normal")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["choices"][0]["message"]["content"], "ok");
+    assert_eq!(
+        fake.hits(),
+        vec!["only-model".to_string(), "upstream-model".to_string()]
+    );
+    let records = wait_records(&dir, 1).await;
+    assert_eq!(records[0].provider, "od");
+    assert!(
+        records[0]
+            .quirks
+            .iter()
+            .any(|quirk| quirk == "fallback_from:responses-only"),
+        "{:?}",
+        records[0].quirks
+    );
+}
+
 fn responses_named(model: &str) -> Request<Body> {
     Request::builder()
         .method("POST")

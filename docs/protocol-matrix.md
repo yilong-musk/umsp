@@ -1,6 +1,6 @@
 # Protocol matrix
 
-All three entry points share the same model registry and the same set of client keys; forwarding is same-protocol, with no cross-protocol translation.
+All three entry points share the same model registry and the same set of client keys. A registered model can be called on any of the three. When the provider lists the client's protocol, that attempt is forwarded unchanged. When it does not, the attempt is translated into the first protocol in the provider's own list and the response is translated back. Backend order stays the priority. `count_tokens` is not translated.
 
 | Dimension | Chat Completions | Responses | Anthropic Messages |
 |---|---|---|---|
@@ -36,7 +36,7 @@ All three entry points share the same model registry and the same set of client 
   while OD still returns 501 and is not forwarded.
 - usage: cache creation in Messages supports both DS's flat `cache_creation_input_tokens`
   and OD's nested `cache_creation.ephemeral_*`.
-- No cross-protocol translation / budgeting; see `docs/internal/m4b-verification.md` for fallback and
+- Translation is per attempt and only on a protocol mismatch; see `docs/internal/m4b-verification.md` for fallback and
   circuit breaking: switch in backend list order (each backend at most once), and return
   503 `temporarily_unavailable` when the circuit is open.
 

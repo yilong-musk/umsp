@@ -1569,6 +1569,9 @@ struct AttemptTarget {
     model: Model,
     provider: Provider,
     upstream: String,
+    /// Protocol actually sent upstream. Equals the client protocol on a
+    /// passthrough, and a protocol the provider lists when translating.
+    upstream_protocol: String,
 }
 
 /// Outcome of one attempt, before anything reaches the client.
@@ -1576,7 +1579,14 @@ enum AttemptResult {
     Response(ChatOutcome),
     Stream(ChatStream),
     Error(ProxyError),
-    CircuitOpen { reason: Option<String> },
+    CircuitOpen {
+        reason: Option<String>,
+    },
+    /// The client body could not be translated into this provider's protocol.
+    /// Retryable via a later backend, and not a circuit failure.
+    Untranslatable {
+        message: String,
+    },
 }
 
 impl AttemptResult {
@@ -1587,7 +1597,9 @@ impl AttemptResult {
         match self {
             AttemptResult::Response(outcome) => upstream::status_is_retryable(outcome.status),
             AttemptResult::Stream(stream) => upstream::status_is_retryable(stream.status),
-            AttemptResult::Error(_) | AttemptResult::CircuitOpen { .. } => true,
+            AttemptResult::Error(_)
+            | AttemptResult::CircuitOpen { .. }
+            | AttemptResult::Untranslatable { .. } => true,
         }
     }
 
@@ -1600,6 +1612,7 @@ impl AttemptResult {
                 "circuit_open:{}",
                 reason.as_deref().unwrap_or("provider_circuit_open")
             ),
+            AttemptResult::Untranslatable { message } => message.clone(),
         }
     }
 
@@ -1625,11 +1638,13 @@ impl AttemptResult {
     }
 }
 
-/// Ordered backends that can serve `model` for this protocol.
+/// Ordered backends that can serve `model`.
 ///
-/// Backends whose provider is missing, does not speak the protocol (or cannot
-/// proxy count_tokens) are skipped; the rest are tried in config order, so the
-/// first entry is the preferred route and later ones are fallbacks.
+/// A backend is eligible when its provider exists and speaks at least one of
+/// the three protocols. The attempt uses the client protocol when the provider
+/// lists it (passthrough) and otherwise the first protocol in that provider's
+/// list (translation). `count_tokens` stays strict: the provider must speak
+/// Messages and implement the endpoint. Order is config order.
 fn attempt_candidates(
     cfg: &Config,
     model: &Model,
@@ -1641,19 +1656,100 @@ fn attempt_candidates(
         .iter()
         .filter_map(|backend| {
             let provider = cfg.providers.iter().find(|p| p.id == backend.provider)?;
-            if !provider.supports(protocol) {
-                return None;
-            }
-            if count_tokens && !provider.supports_count_tokens() {
-                return None;
-            }
+            let upstream_protocol = if count_tokens {
+                if !provider.supports(protocol) || !provider.supports_count_tokens() {
+                    return None;
+                }
+                protocol
+            } else {
+                crate::translate::select_upstream_protocol(&provider.protocols, protocol)?
+            };
             Some(AttemptTarget {
                 model: model.clone(),
                 provider: provider.clone(),
                 upstream: backend.upstream.clone(),
+                upstream_protocol: upstream_protocol.to_string(),
             })
         })
         .collect()
+}
+
+/// Body for one attempt. Passthrough keeps the client JSON and only rewrites
+/// `model` plus provider quirks. A protocol mismatch is translated first.
+fn prepare_attempt(
+    base: &Value,
+    target: &AttemptTarget,
+    client_protocol: &str,
+    client_name: &str,
+) -> std::result::Result<(Value, Vec<String>), String> {
+    if target.upstream_protocol == client_protocol {
+        return Ok(attempt_payload(base, target, client_protocol, client_name));
+    }
+    let translated =
+        crate::translate::translate_request(base, client_protocol, &target.upstream_protocol)
+            .map_err(|err| {
+                format!(
+                    "cannot translate {client_protocol} request to {}: {err}",
+                    target.upstream_protocol
+                )
+            })?;
+    let mut notes = vec![format!(
+        "translated:{client_protocol}->{}",
+        target.upstream_protocol
+    )];
+    notes.extend(translated.notes);
+    let mut body = translated.body;
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("model".to_string(), Value::String(target.upstream.clone()));
+    }
+    if target.upstream_protocol == "chat" {
+        match target.provider.quirks.as_deref() {
+            Some("opendesign") => notes.extend(quirks::apply_request_quirks(&mut body)),
+            Some("deepseek") => {
+                notes.extend(quirks::apply_deepseek_request_quirks(
+                    &mut body,
+                    client_name,
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok((body, notes))
+}
+
+/// Passthrough keeps the client's headers. A translated hop drops Anthropic
+/// framing when the upstream protocol is not Messages, and fills
+/// `anthropic-version` when the upstream protocol is Messages.
+fn headers_for_attempt(
+    headers: &HeaderMap,
+    client_protocol: &str,
+    upstream_protocol: &str,
+) -> HeaderMap {
+    if client_protocol == upstream_protocol {
+        return headers.clone();
+    }
+    let mut out = headers.clone();
+    if upstream_protocol == "messages" {
+        if !out.contains_key("anthropic-version") {
+            out.insert(
+                "anthropic-version",
+                HeaderValue::from_static(DEFAULT_ANTHROPIC_VERSION),
+            );
+        }
+        return out;
+    }
+    let strip: Vec<HeaderName> = out
+        .keys()
+        .filter(|name| {
+            let lower = name.as_str();
+            lower.starts_with("anthropic-") || lower.starts_with("x-claude-")
+        })
+        .cloned()
+        .collect();
+    for name in strip {
+        out.remove(name);
+    }
+    out
 }
 
 /// Body for one attempt: `model` is rewritten to the backend's upstream id and
@@ -1838,7 +1934,7 @@ fn no_backend_response(protocol: &str, model_id: &str, request_id: &str) -> Resp
         protocol,
         StatusCode::BAD_REQUEST,
         "no_backend_for_protocol",
-        &format!("model '{model_id}' has no backend that serves this protocol"),
+        &format!("model '{model_id}' has no usable backend"),
         request_id,
     )
 }
@@ -1952,8 +2048,20 @@ fn upstream_failure_response(
     model_id: &str,
     target: &AttemptTarget,
     request_id: &str,
+    rewrite_error: bool,
 ) -> Response {
     if (400..500).contains(&status) && !matches!(status, 401..=403 | 429) {
+        if rewrite_error {
+            let message = crate::translate::error_message(body)
+                .unwrap_or_else(|| "the upstream service rejected the request".to_string());
+            return protocol_gateway_error(
+                protocol,
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
+                "upstream_rejected",
+                &message,
+                request_id,
+            );
+        }
         if body.is_empty() {
             return protocol_gateway_error(
                 protocol,
@@ -2008,8 +2116,10 @@ fn upstream_failure_response(
     protocol_gateway_error(protocol, status, code, message, request_id)
 }
 
-/// Shared non-streaming proxy path: one upstream call, one ledger row, body and
-/// key headers relayed verbatim.
+/// Shared non-streaming proxy path: one upstream call, one ledger row.
+///
+/// A provider that speaks the client protocol relays the body. A mismatch
+/// translates the successful body back into the client's protocol.
 #[allow(clippy::too_many_arguments)]
 async fn proxy_non_stream(
     state: AppState,
@@ -2045,10 +2155,6 @@ async fn proxy_non_stream(
     let mut last: Option<(AttemptResult, AttemptTarget, Vec<String>)> = None;
 
     for (index, target) in candidates.iter().enumerate() {
-        let (attempt_body, provider_quirks) =
-            attempt_payload(&payload, target, protocol, &client.name);
-        let mut attempt_quirks = request_quirks.clone();
-        attempt_quirks.extend(provider_quirks);
         if index > 0 {
             fallbacks_used += 1;
             let previous = &candidates[index - 1];
@@ -2062,6 +2168,28 @@ async fn proxy_non_stream(
                 previous_reason.as_deref().unwrap_or("retryable"),
             );
         }
+        let (attempt_body, attempt_quirks) =
+            match prepare_attempt(&payload, target, protocol, &client.name) {
+                Ok((body, provider_quirks)) => {
+                    let mut attempt_quirks = request_quirks.clone();
+                    attempt_quirks.extend(provider_quirks);
+                    (body, attempt_quirks)
+                }
+                Err(message) => {
+                    previous_reason = Some(message.clone());
+                    last = Some((
+                        AttemptResult::Untranslatable { message },
+                        target.clone(),
+                        Vec::new(),
+                    ));
+                    if index + 1 < candidates.len() {
+                        continue;
+                    }
+                    break;
+                }
+            };
+        let attempt_headers =
+            headers_for_attempt(&client_headers, protocol, &target.upstream_protocol);
         let admission = state.circuits().admit(&target.provider.id);
         // A granted half-open probe owns the single probe slot for the attempt.
         // Dropping the guard before a result is recorded (client cancel, aborted
@@ -2077,32 +2205,29 @@ async fn proxy_non_stream(
             },
             Admission::Allow | Admission::Probe(_) => {
                 let attempt_started = Instant::now();
-                let outcome = match &call {
-                    NonStreamCall::Chat => {
-                        up.chat(
-                            &target.provider,
-                            &target.upstream,
-                            &attempt_body,
-                            &client_headers,
-                        )
+                let outcome = if count_tokens {
+                    up.count_tokens(&target.provider, &attempt_body, &attempt_headers)
                         .await
-                    }
-                    NonStreamCall::Responses => {
-                        up.responses(&target.provider, &attempt_body, &client_headers)
+                } else {
+                    match target.upstream_protocol.as_str() {
+                        "responses" => {
+                            up.responses(&target.provider, &attempt_body, &attempt_headers)
+                                .await
+                        }
+                        "messages" => {
+                            let query = (protocol == "messages").then(|| call.query()).flatten();
+                            up.messages(&target.provider, query, &attempt_body, &attempt_headers)
+                                .await
+                        }
+                        _ => {
+                            up.chat(
+                                &target.provider,
+                                &target.upstream,
+                                &attempt_body,
+                                &attempt_headers,
+                            )
                             .await
-                    }
-                    NonStreamCall::Messages { .. } => {
-                        up.messages(
-                            &target.provider,
-                            call.query(),
-                            &attempt_body,
-                            &client_headers,
-                        )
-                        .await
-                    }
-                    NonStreamCall::MessagesCountTokens => {
-                        up.count_tokens(&target.provider, &attempt_body, &client_headers)
-                            .await
+                        }
                     }
                 };
                 match outcome {
@@ -2168,7 +2293,31 @@ async fn proxy_non_stream(
     }
 
     match result {
-        AttemptResult::Response(outcome) => {
+        AttemptResult::Response(mut outcome) => {
+            if outcome.status < 400 && target.upstream_protocol != protocol {
+                match crate::translate::translate_response(
+                    &outcome.body,
+                    &target.upstream_protocol,
+                    protocol,
+                    &target.model.id,
+                ) {
+                    Ok(body) => outcome.body = body,
+                    Err(err) => {
+                        record.status = StatusCode::BAD_GATEWAY.as_u16();
+                        record.upstream_status = Some(outcome.status);
+                        record.error_code = Some("translation_failed".to_string());
+                        record.duration_ms = outcome.duration_ms;
+                        state.finish_request(&record);
+                        return protocol_gateway_error(
+                            protocol,
+                            StatusCode::BAD_GATEWAY,
+                            "translation_failed",
+                            &err,
+                            &request_id,
+                        );
+                    }
+                }
+            }
             record.status = mapped_upstream_status(outcome.status);
             record.upstream_status = Some(outcome.status);
             record.bytes_out = outcome.body.len() as u64;
@@ -2199,6 +2348,7 @@ async fn proxy_non_stream(
                     &target.model.id,
                     &target,
                     &request_id,
+                    target.upstream_protocol != protocol,
                 );
             }
 
@@ -2267,6 +2417,18 @@ async fn proxy_non_stream(
                 reason.as_deref().or(Some("provider_circuit_open")),
             );
             circuit_open_response(protocol, &request_id)
+        }
+        AttemptResult::Untranslatable { message } => {
+            record.status = StatusCode::BAD_REQUEST.as_u16();
+            record.error_code = Some("translation_failed".to_string());
+            state.finish_request(&record);
+            protocol_gateway_error(
+                protocol,
+                StatusCode::BAD_REQUEST,
+                "translation_failed",
+                &message,
+                &request_id,
+            )
         }
         AttemptResult::Stream(_) => unreachable!("non-streaming path cannot produce a stream"),
     }
@@ -2694,15 +2856,11 @@ async fn proxy_stream(
     let mut last: Option<(
         AttemptResult,
         AttemptTarget,
-        crate::metrics::Inflight,
+        Option<crate::metrics::Inflight>,
         Vec<String>,
     )> = None;
 
     for (index, target) in candidates.iter().enumerate() {
-        let (attempt_body, provider_quirks) =
-            attempt_payload(&payload, target, protocol_name, &client.name);
-        let mut attempt_quirks = request_quirks.clone();
-        attempt_quirks.extend(provider_quirks);
         if index > 0 {
             fallbacks_used += 1;
             let previous = &candidates[index - 1];
@@ -2716,6 +2874,29 @@ async fn proxy_stream(
                 previous_reason.as_deref().unwrap_or("retryable"),
             );
         }
+        let (attempt_body, attempt_quirks) =
+            match prepare_attempt(&payload, target, protocol_name, &client.name) {
+                Ok((body, provider_quirks)) => {
+                    let mut attempt_quirks = request_quirks.clone();
+                    attempt_quirks.extend(provider_quirks);
+                    (body, attempt_quirks)
+                }
+                Err(message) => {
+                    previous_reason = Some(message.clone());
+                    last = Some((
+                        AttemptResult::Untranslatable { message },
+                        target.clone(),
+                        None,
+                        Vec::new(),
+                    ));
+                    if index + 1 < candidates.len() {
+                        continue;
+                    }
+                    break;
+                }
+            };
+        let attempt_headers =
+            headers_for_attempt(&client_headers, protocol_name, &target.upstream_protocol);
         let admission = state.circuits().admit(&target.provider.id);
         // A granted half-open probe owns the single probe slot until this
         // attempt records a result; a cancelled request releases it on drop.
@@ -2731,31 +2912,36 @@ async fn proxy_stream(
                 reason: state.circuits().view(&target.provider.id).reason,
             },
             Admission::Allow | Admission::Probe(_) => {
-                let opened = match protocol {
-                    StreamProtocol::Chat => {
-                        up.chat_stream(
-                            &target.provider,
-                            &attempt_body,
-                            &client_headers,
-                            header_timeout,
-                        )
-                        .await
-                    }
-                    StreamProtocol::Responses { .. } => {
+                let upstream_query = if target.upstream_protocol == "messages" {
+                    query.as_deref()
+                } else {
+                    None
+                };
+                let opened = match target.upstream_protocol.as_str() {
+                    "responses" => {
                         up.responses_stream(
                             &target.provider,
                             &attempt_body,
-                            &client_headers,
+                            &attempt_headers,
                             header_timeout,
                         )
                         .await
                     }
-                    StreamProtocol::Messages => {
+                    "messages" => {
                         up.messages_stream(
                             &target.provider,
-                            query.as_deref(),
+                            upstream_query,
                             &attempt_body,
-                            &client_headers,
+                            &attempt_headers,
+                            header_timeout,
+                        )
+                        .await
+                    }
+                    _ => {
+                        up.chat_stream(
+                            &target.provider,
+                            &attempt_body,
+                            &attempt_headers,
                             header_timeout,
                         )
                         .await
@@ -2793,7 +2979,7 @@ async fn proxy_stream(
                 .note_upstream_error(&target.provider.id, &code);
         }
         previous_reason = Some(result.reason());
-        last = Some((result, target.clone(), inflight, attempt_quirks));
+        last = Some((result, target.clone(), Some(inflight), attempt_quirks));
         if !(retryable && has_next) {
             break;
         }
@@ -2874,6 +3060,22 @@ async fn proxy_stream(
             );
             return circuit_open_response(protocol_name, &request_id);
         }
+        AttemptResult::Untranslatable { message } => {
+            {
+                let record = guard.record_mut();
+                record.status = StatusCode::BAD_REQUEST.as_u16();
+                record.error_code = Some("translation_failed".to_string());
+                record.duration_ms = started.elapsed().as_millis() as u64;
+            }
+            guard.commit();
+            return protocol_gateway_error(
+                protocol_name,
+                StatusCode::BAD_REQUEST,
+                "translation_failed",
+                &message,
+                &request_id,
+            );
+        }
         AttemptResult::Response(_) => {
             unreachable!("streaming path cannot produce a buffered response")
         }
@@ -2932,6 +3134,7 @@ async fn proxy_stream(
             &target.model.id,
             &target,
             &request_id,
+            target.upstream_protocol != protocol_name,
         );
     }
 
@@ -2953,6 +3156,25 @@ async fn proxy_stream(
         rx.recv().await.map(|item| (item, rx))
     });
 
+    let bridge = if target.upstream_protocol == protocol_name {
+        None
+    } else {
+        Some(
+            crate::translate::StreamBridge::new(
+                &target.upstream_protocol,
+                protocol_name,
+                &target.model.id,
+                matches!(
+                    protocol,
+                    StreamProtocol::Responses {
+                        emit_event_lines: true
+                    }
+                ),
+            )
+            .expect("client and upstream protocols are chat, responses, or messages"),
+        )
+    };
+    let inflight = inflight.expect("a live stream holds the in-flight gauge");
     // From here on the pump owns the record and writes it when the stream ends.
     tokio::spawn(pump_stream(
         state.clone(),
@@ -2964,6 +3186,7 @@ async fn proxy_stream(
         Duration::from_secs(cfg.server.stream_idle_timeout_s.max(1)),
         Duration::from_secs(cfg.server.stream_keepalive_s.max(1)),
         protocol,
+        bridge,
         inflight,
     ));
 
@@ -2999,6 +3222,55 @@ async fn proxy_stream(
 ///   `tx.closed()`/send failure, then dropping the upstream response cancels
 ///   the upstream request;
 /// - `[DONE]` is passed through untouched and never synthesized twice.
+enum PumpObserver {
+    Native(stream::Observer),
+    Bridge(crate::translate::StreamBridge),
+}
+
+impl PumpObserver {
+    fn transform(&mut self, chunk: &[u8], out: &mut Vec<u8>) -> bool {
+        match self {
+            Self::Native(observer) => observer.transform(chunk, out),
+            Self::Bridge(bridge) => bridge.push(chunk, out),
+        }
+    }
+
+    fn finish(&mut self, out: &mut Vec<u8>) {
+        match self {
+            Self::Native(observer) => observer.finish(out),
+            Self::Bridge(bridge) => bridge.finish(out),
+        }
+    }
+
+    fn done(&self) -> bool {
+        match self {
+            Self::Native(observer) => observer.done(),
+            Self::Bridge(bridge) => bridge.done(),
+        }
+    }
+
+    fn usage(&self) -> Option<Usage> {
+        match self {
+            Self::Native(observer) => observer.usage(),
+            Self::Bridge(bridge) => bridge.usage(),
+        }
+    }
+
+    fn keepalive(&self) -> &'static [u8] {
+        match self {
+            Self::Native(observer) => observer.keepalive(),
+            Self::Bridge(bridge) => bridge.keepalive(),
+        }
+    }
+
+    fn error_event(&self, message: &str) -> Vec<u8> {
+        match self {
+            Self::Native(observer) => observer.error_event(message),
+            Self::Bridge(bridge) => bridge.error_event(message),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn pump_stream(
     state: AppState,
@@ -3010,13 +3282,17 @@ async fn pump_stream(
     idle: Duration,
     keepalive: Duration,
     protocol: StreamProtocol,
+    bridge: Option<crate::translate::StreamBridge>,
     // Held for the whole stream so `umsp_inflight_requests` counts it.
     _inflight: crate::metrics::Inflight,
 ) {
     use futures_util::StreamExt;
 
     let mut upstream = resp.bytes_stream();
-    let mut observer = protocol.observer();
+    let mut observer = match bridge {
+        Some(bridge) => PumpObserver::Bridge(bridge),
+        None => PumpObserver::Native(protocol.observer()),
+    };
     let keepalive_frame = observer.keepalive();
     let mut bytes_out: u64 = 0;
     let mut upstream_error: Option<&'static str> = None;
@@ -3360,6 +3636,7 @@ async fn health_loop(state: AppState) {
                 model: model.clone(),
                 provider: provider.clone(),
                 upstream: upstream.clone(),
+                upstream_protocol: "chat".into(),
             };
             let up = Upstream::with_clients(
                 cfg.clone(),

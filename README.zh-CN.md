@@ -230,7 +230,7 @@ Prometheus 文本格式（`text/plain; version=0.0.4; charset=utf-8`），全部
 ### DeepSeek 官方 provider（M4a）
 
 `provider = "deepseek"`、`quirks = "deepseek"`：三个入口共用同一个模型 ID
-（`deepseek-v4.1-flash`，别名 `deepseek-flash`），同协议转发，不做跨协议翻译。
+（`deepseek-v4.1-flash`，别名 `deepseek-flash`）。DeepSeek 三种协议都支持，这些路由保持同协议透传。
 
 | 入口 | DS 上游路径 |
 |---|---|
@@ -284,7 +284,7 @@ Prometheus 文本格式（`text/plain; version=0.0.4; charset=utf-8`），全部
 
 限制（有意不做）：
 
-- **没有预算 / RPM / 429 预算拒绝**，不做跨协议翻译，不做多副本 / Redis。
+- **没有预算 / RPM / 429 预算拒绝**，不做多副本 / Redis。只有选中的 provider 不会说客户端协议时才做跨协议翻译。
 - Chat / Responses 的流式响应头超时沿用全局 `stream_header_timeout_s`（默认 300s）；
   DS 文档建议 600s（10 分钟未开始推理才断连），长思考任务可自行调大。
 
@@ -392,7 +392,7 @@ supports_websockets = false
 ### Anthropic Messages（M3）
 
 `POST /v1/messages` 接 OpenDesign 与 DeepSeek（M3 / M4a）。用于 Claude Code 等
-Anthropic 客户端；同协议转发，不做跨协议翻译。
+Anthropic 客户端。provider 会说 Messages 时请求原样转发；否则这一跳从它会说的协议翻译过来。
 
 - **入口**：`POST /v1/messages`，query string 原样带给上游（Claude Code 会发
   `?beta=true`）。`POST /v1/messages/count_tokens`：路由到 DS 时**真代理**到

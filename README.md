@@ -252,8 +252,8 @@ their status code and (redacted) body.
 ### DeepSeek official provider (M4a)
 
 `provider = "deepseek"`, `quirks = "deepseek"`: all three entry points share the same model ID
-(`deepseek-v4.1-flash`, alias `deepseek-flash`), forwarding the same protocol without
-cross-protocol translation.
+(`deepseek-v4.1-flash`, alias `deepseek-flash`). DeepSeek lists all three protocols, so
+these routes stay same-protocol passthrough.
 
 | Entry point | DS upstream path |
 |---|---|
@@ -320,8 +320,8 @@ cross-protocol translation.
 
 Limitations (intentionally not done):
 
-- **No budget / RPM / 429 budget rejection**, no cross-protocol translation, no multi-replica /
-  Redis.
+- **No budget / RPM / 429 budget rejection**, no multi-replica / Redis. Cross-protocol
+  translation runs only when the chosen provider does not speak the client's protocol.
 - For Chat / Responses streaming, the response-header timeout uses the global
   `stream_header_timeout_s` (default 300s); DS documentation recommends 600s (disconnect only if
   reasoning has not started for 10 minutes), so long-thinking tasks can raise it.
@@ -444,7 +444,8 @@ avoids Codex retrying WebSocket 5 times before falling back to HTTPS.
 ### Anthropic Messages (M3)
 
 `POST /v1/messages` serves OpenDesign and DeepSeek (M3 / M4a). Intended for Anthropic clients such
-as Claude Code; forwards the same protocol without cross-protocol translation.
+as Claude Code. When the provider speaks Messages, the body is forwarded as-is; otherwise the
+gateway translates that attempt from a protocol the provider does speak.
 
 - **Entry points**: `POST /v1/messages`, query string passed to the upstream as-is (Claude Code sends
   `?beta=true`). `POST /v1/messages/count_tokens`: when routed to DS, **genuinely proxies** to
