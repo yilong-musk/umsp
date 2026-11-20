@@ -12,6 +12,7 @@ use crate::stream;
 use crate::usage::Usage;
 
 const DEFAULT_MESSAGES_MAX_TOKENS: u64 = 8192;
+const MAX_STREAM_EVENT_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Proto {
@@ -180,6 +181,8 @@ struct CanonRequest {
     top_p: Option<Value>,
     stream: Option<bool>,
     stop: Vec<String>,
+    n: Option<u64>,
+    parallel_tool_calls: Option<bool>,
     response_format: Option<Value>,
     notes: Vec<String>,
 }
@@ -208,6 +211,8 @@ fn parse_request(body: &Value, from: Proto) -> Result<CanonRequest, String> {
         top_p: number_field(obj, "top_p"),
         stream: obj.get("stream").and_then(Value::as_bool),
         stop: Vec::new(),
+        n: None,
+        parallel_tool_calls: None,
         response_format: None,
         notes: Vec::new(),
     };
@@ -235,6 +240,8 @@ fn parse_chat_request(obj: &Map<String, Value>, canon: &mut CanonRequest) -> Res
         .and_then(Value::as_u64)
         .or_else(|| obj.get("max_completion_tokens").and_then(Value::as_u64));
     canon.stop = stop_list(obj.get("stop"));
+    canon.n = obj.get("n").and_then(Value::as_u64);
+    canon.parallel_tool_calls = obj.get("parallel_tool_calls").and_then(Value::as_bool);
     let (tools, dropped) = parse_chat_tools(obj.get("tools"));
     canon.tools = tools;
     canon.notes.extend(dropped);
@@ -285,6 +292,10 @@ fn parse_responses_request(
     canon: &mut CanonRequest,
 ) -> Result<(), String> {
     canon.max_tokens = obj.get("max_output_tokens").and_then(Value::as_u64);
+    canon.parallel_tool_calls = obj.get("parallel_tool_calls").and_then(Value::as_bool);
+    if obj.get("n").is_some() {
+        canon.notes.push("dropped_n".into());
+    }
     let (tools, dropped) = parse_responses_tools(obj.get("tools"));
     canon.tools = tools;
     canon.notes.extend(dropped);
@@ -452,6 +463,12 @@ fn emit_chat_request(canon: &CanonRequest, obj: &mut Map<String, Value>, notes: 
     if let Some(max) = canon.max_tokens {
         obj.insert("max_tokens".into(), json!(max));
     }
+    if let Some(n) = canon.n {
+        obj.insert("n".into(), json!(n));
+    }
+    if let Some(parallel) = canon.parallel_tool_calls {
+        obj.insert("parallel_tool_calls".into(), json!(parallel));
+    }
     if !canon.stop.is_empty() {
         obj.insert("stop".into(), json!(canon.stop));
     }
@@ -506,6 +523,12 @@ fn emit_responses_request(
 ) {
     if let Some(max) = canon.max_tokens {
         obj.insert("max_output_tokens".into(), json!(max));
+    }
+    if let Some(parallel) = canon.parallel_tool_calls {
+        obj.insert("parallel_tool_calls".into(), json!(parallel));
+    }
+    if canon.n.is_some() {
+        notes.push("dropped_n".into());
     }
     if !canon.stop.is_empty() {
         notes.push("dropped_stop".into());
@@ -582,6 +605,12 @@ fn emit_messages_request(
     if canon.response_format.is_some() {
         notes.push("dropped_response_format".into());
     }
+    if canon.n.is_some() {
+        notes.push("dropped_n".into());
+    }
+    if canon.parallel_tool_calls.is_some() {
+        notes.push("dropped_parallel_tool_calls".into());
+    }
     obj.insert("max_tokens".into(), json!(max));
     if !canon.stop.is_empty() {
         obj.insert("stop_sequences".into(), json!(canon.stop));
@@ -649,7 +678,7 @@ fn parse_response(body: &Value, from: Proto) -> Result<CanonResponse, String> {
     };
     let (text, calls, finish) = match from {
         Proto::Chat => parse_chat_response(obj),
-        Proto::Responses => parse_responses_response(obj),
+        Proto::Responses => parse_responses_response(obj)?,
         Proto::Messages => parse_messages_response(obj),
     };
     Ok(CanonResponse {
@@ -687,7 +716,9 @@ fn parse_chat_response(obj: &Map<String, Value>) -> (String, Vec<ToolCall>, &'st
     (text, calls, finish)
 }
 
-fn parse_responses_response(obj: &Map<String, Value>) -> (String, Vec<ToolCall>, &'static str) {
+fn parse_responses_response(
+    obj: &Map<String, Value>,
+) -> Result<(String, Vec<ToolCall>, &'static str), String> {
     let mut text = String::new();
     let mut calls = Vec::new();
     if let Some(items) = obj.get("output").and_then(Value::as_array) {
@@ -724,6 +755,9 @@ fn parse_responses_response(obj: &Map<String, Value>) -> (String, Vec<ToolCall>,
         .get("status")
         .and_then(Value::as_str)
         .unwrap_or("completed");
+    if matches!(status, "failed" | "cancelled") {
+        return Err("upstream response did not complete".into());
+    }
     let finish = match status {
         "incomplete" => match obj
             .get("incomplete_details")
@@ -735,7 +769,7 @@ fn parse_responses_response(obj: &Map<String, Value>) -> (String, Vec<ToolCall>,
         },
         _ => map_finish("stop", !calls.is_empty()),
     };
-    (text, calls, finish)
+    Ok((text, calls, finish))
 }
 
 fn parse_messages_response(obj: &Map<String, Value>) -> (String, Vec<ToolCall>, &'static str) {
@@ -949,8 +983,11 @@ impl StreamBridge {
                 out.extend(piece.into_bytes());
             }
         }
-        if self.carry.len() > 8 * 1024 * 1024 {
+        if self.carry.len() > MAX_STREAM_EVENT_BYTES {
+            let bytes = self.error_event("upstream sent an oversized stream event");
+            out.extend(bytes);
             self.carry.clear();
+            return true;
         }
         produced && self.saw_output
     }
@@ -3267,5 +3304,48 @@ mod tests {
                 .any(|note| note == "dropped_tool_choice:web_search")
         );
         assert!(translated.body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn n_and_parallel_tool_calls_are_mapped_or_noted() {
+        let body = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "n": 3,
+            "parallel_tool_calls": false
+        });
+        let to_responses = translate_request(&body, "chat", "responses").unwrap();
+        assert_eq!(to_responses.body["parallel_tool_calls"], false);
+        assert!(to_responses.notes.iter().any(|note| note == "dropped_n"));
+
+        let to_messages = translate_request(&body, "chat", "messages").unwrap();
+        assert!(to_messages.notes.iter().any(|note| note == "dropped_n"));
+        assert!(
+            to_messages
+                .notes
+                .iter()
+                .any(|note| note == "dropped_parallel_tool_calls")
+        );
+    }
+
+    #[test]
+    fn failed_responses_are_errors_instead_of_truncated_successes() {
+        let failed = json!({
+            "id": "resp_1",
+            "status": "failed",
+            "error": {"message": "boom"},
+            "output": []
+        });
+        let bytes = serde_json::to_vec(&failed).unwrap();
+        assert!(translate_response(&bytes, "responses", "chat", "logical").is_err());
+    }
+
+    #[test]
+    fn oversized_stream_events_end_the_stream_with_an_error() {
+        let mut bridge = StreamBridge::new("responses", "messages", "logical", false).unwrap();
+        let mut out = Vec::new();
+        bridge.push(&vec![b'x'; MAX_STREAM_EVENT_BYTES + 1], &mut out);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("oversized"), "{text}");
+        assert!(bridge.done());
     }
 }

@@ -36,7 +36,11 @@ lossy decision in the request's ledger `quirks` list.
 - Content: assistant images are dropped (`dropped_assistant_image`); a Messages `tool_result` with
   `is_error` becomes an `error:` prefix and omitted images are announced in the text.
 - Finish reasons: `content_filter` / `refusal` survive translation; Responses returns
-  `status: incomplete` with `incomplete_details.reason`.
+  `status: incomplete` with `incomplete_details.reason`. A Responses body with `status: failed` or
+  `cancelled` becomes an upstream error instead of a truncated success.
+- Concurrency: `n` and `parallel_tool_calls` pass through to Chat targets; Responses accepts
+  `parallel_tool_calls` but records `dropped_n`; Messages records `dropped_n` and
+  `dropped_parallel_tool_calls`.
 
 
 ## DeepSeek (M4a) highlights

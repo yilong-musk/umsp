@@ -150,6 +150,12 @@ umsp provider add --vendor grok
 umsp login grok-2
 umsp model add --id grok-4.7 --backend grok:grok-4.7 --backend grok-2:grok-4.7
 
+# Experimental / account risk: Grok support uses a public CLI OAuth client and the
+# `cli-chat-proxy` subscription endpoint. It is not an official xAI API integration: it can
+# break without notice and may violate xAI's terms of service, including account suspension.
+# Use it only with an account you are willing to risk. Session tokens stay in
+# sessions/<id>.json (0600) and are never written to logs or config.
+
 # Attach another backend to an existing model (insert at the front = highest priority)
 umsp model backend add claude-haiku-5.5 \
   --backend deepseek-2:deepseek-flash --first
