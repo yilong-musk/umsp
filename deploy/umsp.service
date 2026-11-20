@@ -1,0 +1,22 @@
+[Unit]
+Description=AI Gateway (umsp)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/umsp serve --config %h/.config/umsp/config.toml
+EnvironmentFile=%h/.config/umsp/env
+Restart=on-failure
+RestartSec=2
+MemoryMax=256M
+TasksMax=256
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ReadWritePaths=%h/.local/share/umsp
+LimitNOFILE=8192
+
+[Install]
+WantedBy=default.target

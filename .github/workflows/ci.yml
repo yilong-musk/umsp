@@ -1,0 +1,77 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: fmt + clippy + test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: language check
+        run: cargo run --quiet --manifest-path tools/langcheck/Cargo.toml
+      - name: cargo test
+        run: cargo test --locked
+
+  deny:
+    name: cargo deny (licenses, bans, sources, advisories)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  build-musl:
+    name: release (x86_64-unknown-linux-musl)
+    runs-on: ubuntu-24.04
+    needs: [test, deny]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: musl
+      - name: install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: build
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          AR_x86_64_unknown_linux_musl: ar
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+      - name: package
+        run: |
+          set -eu
+          version="$(awk -F'"' '/^\[package\]/{p=1;next} p && /^version *=/{print $2; exit}' Cargo.toml)"
+          stage="dist/umsp-${version}-x86_64-linux-musl"
+          mkdir -p "$stage"
+          install -m 755 target/x86_64-unknown-linux-musl/release/umsp "$stage/umsp"
+          install -m 644 config.example.toml "$stage/config.example.toml"
+          install -m 644 deploy/umsp.service "$stage/umsp.service"
+          install -m 644 README.md "$stage/README.md"
+          tar -C dist -czf "dist/umsp-${version}-x86_64-linux-musl.tar.gz" "umsp-${version}-x86_64-linux-musl"
+          sha256sum "dist/umsp-${version}-x86_64-linux-musl.tar.gz" > "dist/umsp-${version}-x86_64-linux-musl.tar.gz.sha256"
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: umsp-x86_64-linux-musl
+          path: |
+            dist/umsp-*.tar.gz
+            dist/umsp-*.tar.gz.sha256

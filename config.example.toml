@@ -1,0 +1,70 @@
+# umsp — AI Gateway configuration
+# Secrets live in ~/.config/umsp/env (mode 0600) and are referenced by api_key_env.
+#
+# Provider ids are full product names, not in-house abbreviations: once several
+# upstreams exist, "od" could mean anything. Lowercase letters, digits, "." and
+# "-" only.
+
+[server]
+listen = "127.0.0.1:3460"
+max_body_bytes = 52428800
+request_timeout_s = 600
+stream_idle_timeout_s = 300
+stream_header_timeout_s = 300
+stream_keepalive_s = 15
+state_dir = "~/.local/share/umsp"
+responses_emit_event_lines = true
+log_retention_days = 30
+
+[[providers]]
+id = "open-design"
+vendor = "open-design"
+base_url = "https://amr-link.open-design.ai/v1"
+api_key_env = "OPEN_DESIGN_API_KEY"
+protocols = ["chat", "responses", "messages"]
+quirks = "opendesign"
+
+[[providers]]
+id = "deepseek"
+vendor = "deepseek"
+base_url = "https://api.deepseek.com"
+anthropic_base_url = "https://api.deepseek.com/anthropic"
+api_key_env = "DEEPSEEK_API_KEY"
+protocols = ["chat", "responses", "messages"]
+quirks = "deepseek"
+
+# A model is one logical entry for clients. `backends` lists the upstreams that
+# can serve it, in priority order: the first healthy one wins, and later ones
+# cover retryable failures (same protocol, one hop each, never a loop).
+# Providers and upstream ids stay internal; clients only see `id`/aliases.
+[[models]]
+id = "deepseek-v4.1-flash"
+aliases = ["deepseek-flash"]
+context_length = 1048000
+max_completion_tokens = 128000
+capabilities = ["text", "vision", "tools", "reasoning"]
+display_name = "DeepSeek V4.1 Flash"
+backends = [
+  { provider = "open-design", upstream = "deepseek-v4.1-flash" },
+  { provider = "deepseek", upstream = "deepseek-flash" },
+]
+
+# `claude`-named so Claude Code's model discovery keeps it (it only lists ids
+# containing "claude"/"anthropic").
+[[models]]
+id = "claude-haiku-5.5"
+context_length = 1000000
+max_completion_tokens = 128000
+capabilities = ["text", "vision", "tools", "reasoning"]
+display_name = "Claude Haiku 5.5"
+backends = [
+  { provider = "open-design", upstream = "claude-haiku-5.5" },
+]
+
+# Client keys are created with `umsp client add --name <name>`; only hashes are stored.
+# [[clients]]
+# name = "planner"
+# key_hash = "sha256:<64 hex chars>"
+# key_prefix = "umsp_ab12cd34"
+# allowed_models = ["deepseek-*", "claude-*"]
+# allowed_protocols = ["chat", "responses", "messages"]

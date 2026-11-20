@@ -1,0 +1,12 @@
+/target
+/dist
+*.tmp
+*.toml.tmp
+.env
+# runtime material — never commit these
+/config.toml
+/env
+/*.key
+*.tar.gz
+/logs/
+/tools/langcheck/target/

@@ -1,0 +1,46 @@
+# cargo-deny configuration (spec 7.1).
+#
+# Run locally:  cargo deny check
+# In CI:        the `deny` job in .github/workflows/ci.yml
+#
+# Policy: permissive licenses only, no unknown registries or git sources,
+# RustSec advisories are blocking except the one documented exception below.
+
+[graph]
+targets = ["x86_64-unknown-linux-musl"]
+
+[advisories]
+version = 2
+yanked = "warn"
+ignore = [
+    # chrono is flagged "unmaintained" (no CVE, no safe upgrade). Replacing it
+    # with jiff/time touches every timestamp in the ledger, the CLI and stream
+    # parsing, so it is scheduled as its own change; revisit then.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; replacement tracked separately" },
+]
+
+[licenses]
+version = 2
+# `umsp` itself is not published, so it carries no license field yet.
+private = { ignore = true }
+# Copyleft licenses (GPL/AGPL/SSPL/LGPL-only) need an explicit decision before
+# they are added here; this is the permissive set the tree currently uses.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "Unlicense",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+]
+
+[bans]
+multiple-versions = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
