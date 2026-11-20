@@ -1,7 +1,7 @@
 CARGO   ?= cargo
 PREFIX  ?= $(HOME)/.local
 BIN     := umsp
-VERSION := $(shell git describe --tags --always 2>/dev/null || echo dev)
+VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 DIST    := dist/umsp-$(VERSION)-x86_64-unknown-linux-musl
 
 .PHONY: all check fmt clippy test lang build install clean
