@@ -6,12 +6,17 @@ use crate::config::{Config, Model};
 
 /// Resolve a requested model id: canonical first, then aliases.
 pub fn resolve<'a>(cfg: &'a Config, requested: &str) -> Option<&'a Model> {
-    if let Some(m) = cfg.models.iter().find(|m| m.id == requested) {
-        return Some(m);
+    resolve_models(&cfg.models, requested)
+}
+
+/// Resolve against an explicit model slice (the live catalog, or config models).
+pub fn resolve_models<'a>(models: &'a [Model], requested: &str) -> Option<&'a Model> {
+    if let Some(model) = models.iter().find(|model| model.id == requested) {
+        return Some(model);
     }
-    cfg.models
+    models
         .iter()
-        .find(|m| m.aliases.iter().any(|a| a == requested))
+        .find(|model| model.aliases.iter().any(|alias| alias == requested))
 }
 
 /// `(alias, canonical)` pairs, sorted, for `umsp model list --aliases`.
@@ -66,7 +71,11 @@ pub fn model_admin_payload(m: &Model) -> Value {
 }
 
 pub fn models_payload(cfg: &Config) -> Value {
-    let data: Vec<Value> = cfg.models.iter().map(model_payload).collect();
+    models_from(&cfg.models)
+}
+
+pub fn models_from(models: &[Model]) -> Value {
+    let data: Vec<Value> = models.iter().map(model_payload).collect();
     json!({ "object": "list", "data": data })
 }
 
