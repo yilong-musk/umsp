@@ -59,8 +59,8 @@ pub const VENDORS: &[Vendor] = &[
     Vendor {
         id: "qwen-token-plan",
         name: "Qwen Token Plan",
-        base_url: "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
-        anthropic_base_url: Some("https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic"),
+        base_url: "https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1",
+        anthropic_base_url: Some("https://token-plan.maas.qianwenaiapi.com/apps/anthropic"),
         protocols: &["chat", "messages"],
         quirks: None,
         auth: "api_key",
@@ -104,15 +104,15 @@ mod tests {
     }
 
     #[test]
-    fn qwen_token_plan_is_the_beijing_plan_not_payg() {
+    fn qwen_token_plan_uses_the_console_host_not_payg() {
         let vendor = find("qwen-token-plan").expect("catalog entry");
         assert_eq!(
             vendor.base_url,
-            "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+            "https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1"
         );
         assert_eq!(
             vendor.anthropic_base_url,
-            Some("https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic")
+            Some("https://token-plan.maas.qianwenaiapi.com/apps/anthropic")
         );
         assert_eq!(vendor.protocols, &["chat", "messages"]);
         assert!(vendor.quirks.is_none());

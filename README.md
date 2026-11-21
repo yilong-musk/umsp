@@ -161,13 +161,15 @@ short-lived `x-ratelimit-*` headers. Details: [docs/model-routing.md](docs/model
 
 ## Qwen Token Plan
 
-`umsp provider add --vendor qwen-token-plan` uses Alibaba Cloud Model Studio Token Plan
-(China Beijing only). It is not pay-as-you-go DashScope: a `sk-` key or the DashScope host
-will not draw down this plan. Chat goes to
-`https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1` and Messages to
-`https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic`. The key variable is
-`QWEN_TOKEN_PLAN_API_KEY`. Responses is not offered. Alibaba documents the plan for
-interactive clients.
+`umsp provider add --vendor qwen-token-plan` uses the Qwen Token Plan host shown in the
+subscription console (`token-plan.maas.qianwenaiapi.com`), not pay-as-you-go DashScope and
+not the international `qwencloudapi.com` host. A `sk-` key or the DashScope host will not
+draw down this plan. Chat goes to
+`https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1` and Messages to
+`https://token-plan.maas.qianwenaiapi.com/apps/anthropic`. The key variable is
+`QWEN_TOKEN_PLAN_API_KEY`. Responses is not offered. The plan is documented for
+interactive clients. The older regional host
+`token-plan.cn-beijing.maas.aliyuncs.com` still answers, but it is not the console URL.
 
 ## Documentation
 

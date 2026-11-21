@@ -156,11 +156,13 @@ umsp doctor [--online]                  # 诊断；--online 会花少量 token
 
 ## 千问 Token Plan
 
-`umsp provider add --vendor qwen-token-plan` 使用阿里云百炼 Token Plan（仅华北2北京），
-不是按量付费的 DashScope。`sk-` 开头的通用 Key 或 DashScope 域名不会扣这份套餐。
-Chat 走 `https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1`，
-Messages 走 `https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic`。
-密钥变量是 `QWEN_TOKEN_PLAN_API_KEY`。不提供 Responses。阿里云文档把该套餐限定在交互式客户端。
+`umsp provider add --vendor qwen-token-plan` 使用订阅后台显示的千问 Token Plan
+（`token-plan.maas.qianwenaiapi.com`），不是按量付费的 DashScope，也不是海外的
+`qwencloudapi.com`。`sk-` 开头的通用 Key 或 DashScope 域名不会扣这份套餐。
+Chat 走 `https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1`，
+Messages 走 `https://token-plan.maas.qianwenaiapi.com/apps/anthropic`。
+密钥变量是 `QWEN_TOKEN_PLAN_API_KEY`。不提供 Responses。该套餐限定在交互式客户端。
+旧的华北 2 域名 `token-plan.cn-beijing.maas.aliyuncs.com` 目前仍可应答，但不是后台给出的地址。
 
 ## 文档
 

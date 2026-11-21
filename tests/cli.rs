@@ -241,11 +241,11 @@ fn provider_add_qwen_token_plan_writes_the_plan_endpoints() {
     let cfg = sb.read_config();
     assert!(cfg.contains("vendor = \"qwen-token-plan\""), "{cfg}");
     assert!(
-        cfg.contains("https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"),
+        cfg.contains("https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1"),
         "{cfg}"
     );
     assert!(
-        cfg.contains("https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic"),
+        cfg.contains("https://token-plan.maas.qianwenaiapi.com/apps/anthropic"),
         "{cfg}"
     );
     assert!(cfg.contains("QWEN_TOKEN_PLAN_API_KEY"), "{cfg}");
