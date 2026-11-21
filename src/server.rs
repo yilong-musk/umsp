@@ -19,12 +19,13 @@ use crate::circuit::{Admission, CircuitBreaker, CircuitState};
 use crate::config::{Client, Config, Model, Provider};
 use crate::envfile::EnvFile;
 use crate::error::{Result, UmspError};
+use crate::grok_billing;
 use crate::health::{self, Balance};
 use crate::keys;
 use crate::metrics::Metrics;
 use crate::quirks;
 use crate::registry;
-use crate::route::{PinDrop, PlanKind, RouteTable};
+use crate::route::{PinDrop, PlanKind, RouteTable, UsageWindow};
 use crate::sessions::{self, SessionError, SessionStore};
 use crate::stream;
 use crate::upstream::{self, forward_request_headers, relay_response_headers};
@@ -137,6 +138,25 @@ impl AppState {
             .lock()
             .expect("route lock poisoned")
             .note_balance(provider, balance.is_available, total, Instant::now());
+    }
+
+    /// Read the tightest fresh usage window for admin output.
+    pub fn route_usage(&self, provider: &str) -> Option<crate::route::UsageSnapshot> {
+        self.inner
+            .routes
+            .lock()
+            .expect("route lock poisoned")
+            .usage_summary(provider, Instant::now())
+    }
+
+    /// Record a fresh usage window for `provider`. Selection reads this on
+    /// the next request; a spent window makes the provider ineligible.
+    pub fn note_provider_usage(&self, provider: &str, window: UsageWindow) {
+        self.inner
+            .routes
+            .lock()
+            .expect("route lock poisoned")
+            .note_usage(provider, vec![window]);
     }
 
     /// Remember `provider` for `model` when the model has no live pin.
@@ -1092,6 +1112,17 @@ async fn healthz_handler(
         if circuit.state != CircuitState::Closed {
             entry["status"] = json!("degraded");
             overall_ok = false;
+        }
+        if let Some(usage) = state.route_usage(&provider.id) {
+            entry["usage"] = json!({
+                "remaining_fraction": usage.remaining_fraction,
+                "windows": usage.windows,
+                "reset_in_s": usage.reset_in_s,
+            });
+            if usage.remaining_fraction <= 0.0 {
+                entry["status"] = json!("degraded");
+                overall_ok = false;
+            }
         }
         let health = state.provider_health(&provider.id);
         if let Some(status) = health.last_status {
@@ -2267,6 +2298,9 @@ struct AttemptCursor {
     planned: Vec<AttemptTarget>,
     index: usize,
     loaded: bool,
+    /// A non-empty candidate list produced an empty plan: every backend is
+    /// known to be spent, so retrying one would only burn a request.
+    exhausted: bool,
     /// Completions read and write the model pin. `count_tokens` does not.
     use_pin: bool,
 }
@@ -2286,6 +2320,7 @@ impl AttemptCursor {
                 &self.skipped,
                 self.use_pin,
             );
+            self.exhausted = self.planned.is_empty() && !candidates.is_empty();
             self.loaded = true;
         }
         while self.index < self.planned.len() {
@@ -2442,6 +2477,7 @@ async fn proxy_non_stream(
         planned: Vec::new(),
         index: 0,
         loaded: false,
+        exhausted: false,
         use_pin: !count_tokens,
     };
     let mut fallbacks_used = 0u32;
@@ -2602,6 +2638,9 @@ async fn proxy_non_stream(
     }
 
     let Some((result, target, attempt_quirks)) = last else {
+        if cursor.exhausted {
+            return circuit_open_response(protocol, &request_id);
+        }
         return no_backend_response(protocol, &model.id, &request_id);
     };
     let duration_ms = started.elapsed().as_millis() as u64;
@@ -3182,6 +3221,7 @@ async fn proxy_stream(
         planned: Vec::new(),
         index: 0,
         loaded: false,
+        exhausted: false,
         use_pin: true,
     };
     let mut fallbacks_used = 0u32;
@@ -3324,7 +3364,12 @@ async fn proxy_stream(
         break;
     }
 
-    let (result, target, inflight, attempt_quirks) = last.expect("at least one attempt candidate");
+    let Some((result, target, inflight, attempt_quirks)) = last else {
+        if cursor.exhausted {
+            return circuit_open_response(protocol_name, &request_id);
+        }
+        return no_backend_response(protocol_name, &model.id, &request_id);
+    };
     {
         let record = guard.record_mut();
         record.requested_model = target.model.id.clone();
@@ -3882,6 +3927,8 @@ pub fn plog(
 
 /// How often an open DeepSeek circuit re-checks `/user/balance`.
 const BALANCE_INTERVAL: Duration = Duration::from_secs(300);
+/// Grok billing is free; poll it often enough to keep the 5-minute snapshot fresh.
+const GROK_USAGE_INTERVAL: Duration = Duration::from_secs(240);
 /// How often the health task looks at the circuits at all.
 const HEALTH_TICK: Duration = Duration::from_secs(60);
 
@@ -3919,12 +3966,59 @@ async fn health_loop(state: AppState) {
     let mut ticker = tokio::time::interval(HEALTH_TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_balance: HashMap<String, Instant> = HashMap::new();
+    let mut last_grok_usage: HashMap<String, Instant> = HashMap::new();
+    let mut grok_user_ids: HashMap<String, String> = HashMap::new();
     loop {
         ticker.tick().await;
         let cfg = state.cfg();
         let circuits = state.circuits();
         for provider in &cfg.providers {
             let view = circuits.view(&provider.id);
+            if provider.vendor.as_deref() == Some("grok") && provider.uses_oauth() {
+                let due = last_grok_usage
+                    .get(&provider.id)
+                    .map(|at| at.elapsed() >= GROK_USAGE_INTERVAL)
+                    .unwrap_or(true);
+                if due {
+                    last_grok_usage.insert(provider.id.clone(), Instant::now());
+                    let upstream = balance_upstream(&cfg, &provider.id);
+                    let user_id = grok_user_ids.get(&provider.id).map(String::as_str);
+                    match grok_billing::fetch_usage(
+                        state.http(),
+                        &state.sessions(),
+                        provider,
+                        &state
+                            .env()
+                            .get("UMSP_GROK_CLI_VERSION")
+                            .unwrap_or_else(|| sessions::GROK_CLI_VERSION.to_string()),
+                        user_id,
+                    )
+                    .await
+                    {
+                        Ok((usage, user_id)) => {
+                            grok_user_ids.insert(provider.id.clone(), user_id);
+                            if let Some(window) = usage.into_window() {
+                                let remaining = window.remaining_fraction;
+                                state.note_provider_usage(&provider.id, window);
+                                plog_health(
+                                    "grok_usage",
+                                    &provider.id,
+                                    &upstream,
+                                    &format!("remaining_{:.0}pct", remaining * 100.0),
+                                );
+                            } else {
+                                plog_health(
+                                    "grok_usage",
+                                    &provider.id,
+                                    &upstream,
+                                    "billing_period_ended",
+                                );
+                            }
+                        }
+                        Err(err) => plog_health("grok_usage_failed", &provider.id, &upstream, &err),
+                    }
+                }
+            }
             // DeepSeek balance is free. Refresh it for healthy providers too, so
             // selection can skip an exhausted account without waiting for a failure.
             if provider.quirks.as_deref() == Some("deepseek") {

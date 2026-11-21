@@ -6,7 +6,19 @@ Since 2026-11-20, models and providers are decoupled: **a model is a logical ent
 
 - Callers only know model ids (for example `deepseek-v4.1-flash`); `/v1/models` contains exactly one entry per model.
 - provider / upstream never appear in model ids, `/v1/models`, or `allowed_models`.
-- A model may have multiple backends. A provider is skipped when its circuit is open or, for DeepSeek, a fresh balance observation says the account is unavailable or empty. Healthy providers are tried in configuration order. The provider that serves the model sticks for five hours, or until it cannot take a request.
+- A model may have multiple backends. A provider is skipped when its circuit is open or a fresh usage window is exhausted. Providers with fresh usage (`U`) are tried first, then providers with neither usage nor a usable balance (`X`), then balance-only providers (`B`). The provider that serves the model sticks for five hours, or until it cannot take a request. The full ordering rules are in [Capacity-aware selection](#capacity-aware-selection).
+
+## Capacity-aware selection
+
+Selection reads in-memory capacity snapshots; it never calls an upstream on the request path.
+
+- **U** — at least one fresh usage window. Ranked by the tightest remaining fraction, ascending. The second-tightest fraction breaks a tie, then configuration order. Only fractions are compared: request counts, token counts and currency amounts from different vendors are never compared as absolutes.
+- **X** — no fresh usage and no fresh, usable balance.
+- **B** — no fresh usage, but a fresh balance that is available and non-zero. Balance is a health gate, not a cross-provider ranking signal.
+
+A fresh window was observed within five minutes and, when it has a reset time, still has not reset. Any fresh window at `0` makes the provider ineligible; if every backend is spent, the request gets `503 temporarily_unavailable` instead of burning a call on an exhausted account. A provider with a fresh usage window is not gated by a balance observation: usage wins.
+
+Grok's four `x-ratelimit-*` response headers are short-lived throttles (they refill within minutes), **not** the weekly subscription pool. The health loop polls `GET {base_url}/billing?format=credits` every four minutes using the provider's session token and the numeric `x-userid` from `GET {base_url}/v1/user`. It converts `creditUsagePercent` to `remaining_fraction = 1 - used / 100` and `currentPeriod.end` to the reset time. The pool is unified across Grok products (`isUnifiedBillingUser`). If billing cannot be read, the provider has no fresh usage and falls to X or B by its balance data.
 
 ## Configuration
 
@@ -80,11 +92,11 @@ The data plane speaks Responses only for this vendor and adds the Grok CLI proxy
 ## Resolution and routing
 
 1. The request's `model` is first matched exactly against `id`, then against aliases; neither → 404 `model_not_found`.
-2. Candidate backends = entries in `backends` whose provider exists and speaks at least one protocol. Providers whose circuit is open, or whose fresh balance is unavailable or empty (DeepSeek), are skipped; the rest stay in configuration order. A live pin for the model is tried first for five hours. `count_tokens` still requires a Messages backend that can proxy it, and it does not read or write that pin. The attempt uses the client protocol when the provider lists it, and otherwise translates into the first protocol in that provider's list.
+2. Candidate backends = entries in `backends` whose provider exists and speaks at least one protocol. Providers whose circuit is open or whose fresh usage window is exhausted are skipped. The rest are grouped U > X > B; U groups are ranked by remaining fraction, then configuration order. A live pin for the model is tried first for five hours. `count_tokens` still requires a Messages backend that can proxy it, and it does not read or write that pin. The attempt uses the client protocol when the provider lists it, and otherwise translates into the first protocol in that provider's list.
 3. Try that order; only retryable failures (connection errors, timeouts, 429, 5xx, 402) move on to the next backend, while 400/401/403/404/422 return immediately. A retryable failure of one upstream still tries a later backend of the same provider. 402 and an open circuit skip the rest of that provider.
 4. Each backend is tried at most once; the list is linear, so no loop exists.
 5. Switching happens only before any byte has been sent to the client; once SSE has returned 200 there is no further switching.
-6. All backends unavailable (for example all circuit-broken) → 503 `temporarily_unavailable`; a model with no usable backend → 400 `no_backend_for_protocol`. A registered model is not rejected only because a provider omits the client's protocol.
+6. All backends unavailable (all circuit-broken or all usage-exhausted) → 503 `temporarily_unavailable`; a model with no usable backend → 400 `no_backend_for_protocol`. A registered model is not rejected only because a provider omits the client's protocol.
 7. On each attempt the request body's `model` is rewritten to that backend's `upstream`; provider-specific quirks are applied per backend as well.
 
 ## Validation (`umsp check` / `umsp validate`)

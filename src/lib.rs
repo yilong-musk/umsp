@@ -11,6 +11,7 @@ pub mod commands;
 pub mod config;
 pub mod envfile;
 pub mod error;
+pub mod grok_billing;
 pub mod health;
 pub mod keys;
 pub mod metrics;

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
 use axum::extract::State;
@@ -17,6 +17,7 @@ use tower::ServiceExt;
 use umsp::config::{Backend, Client, Config, Model, PROTOCOLS, Provider, ServerConfig};
 use umsp::envfile::EnvFile;
 use umsp::keys;
+use umsp::route::UsageWindow;
 use umsp::server::{AppState, build_router};
 use umsp::usage::{LogStore, RequestRecord};
 
@@ -3335,6 +3336,41 @@ async fn not_found_never_opens_the_circuit() {
 }
 
 #[tokio::test]
+async fn a_spent_usage_window_skips_the_only_provider() {
+    let dir = temp_dir("usage-spent");
+    let (upstream, rec) = start_upstream().await;
+    let cfg = config(&dir, upstream, 52_428_800);
+    let state = AppState::new(cfg, env_file(&dir)).unwrap();
+    let now = Instant::now();
+    state.note_provider_usage(
+        "od",
+        UsageWindow {
+            duration: Duration::from_secs(7 * 86400),
+            remaining_fraction: 0.0,
+            reset_at: Some(now + Duration::from_secs(3600)),
+            observed_at: now,
+        },
+    );
+    let app = build_router(state);
+
+    let response = app
+        .clone()
+        .oneshot(chat_model("upstream-model", false))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let response = app
+        .oneshot(chat_model("upstream-model", true))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        rec.seen.lock().unwrap().is_empty(),
+        "a spent provider must not be called"
+    );
+}
+
+#[tokio::test]
 async fn half_open_probe_client_error_does_not_wedge_the_circuit() {
     let dir = temp_dir("circuit-probe-404");
     let (root, fake) = start_scripted().await;
@@ -4102,4 +4138,116 @@ fn responses_named(model: &str) -> Request<Body> {
             .unwrap(),
         ))
         .unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// Grok weekly billing producer
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+struct BillingCall {
+    path: String,
+    authorization: String,
+    user_id: Option<String>,
+}
+
+#[derive(Clone, Default)]
+struct BillingFake {
+    seen: Arc<Mutex<Vec<BillingCall>>>,
+}
+
+async fn billing_user(
+    State(fake): State<BillingFake>,
+    headers: axum::http::HeaderMap,
+) -> Json<Value> {
+    fake.seen.lock().unwrap().push(BillingCall {
+        path: "/v1/user".into(),
+        authorization: header(&headers, "authorization").unwrap_or_default(),
+        user_id: header(&headers, "x-userid"),
+    });
+    Json(json!({"xUserId": "2011310503512195073"}))
+}
+
+async fn billing_credits(
+    State(fake): State<BillingFake>,
+    headers: axum::http::HeaderMap,
+) -> Json<Value> {
+    fake.seen.lock().unwrap().push(BillingCall {
+        path: "/v1/billing".into(),
+        authorization: header(&headers, "authorization").unwrap_or_default(),
+        user_id: header(&headers, "x-userid"),
+    });
+    Json(json!({
+        "config": {
+            "currentPeriod": {
+                "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                "start": "2026-11-19T08:33:29.430+00:00",
+                "end": "2099-11-26T08:33:29.430+00:00"
+            },
+            "creditUsagePercent": 44.0,
+            "productUsage": [{"product": "GrokBuild", "usagePercent": 44.0}],
+            "isUnifiedBillingUser": true
+        }
+    }))
+}
+
+fn header(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+}
+
+#[tokio::test]
+async fn grok_billing_reads_the_weekly_pool_and_user_id() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let fake = BillingFake::default();
+    let app = Router::new()
+        .route("/v1/user", axum::routing::get(billing_user))
+        .route("/v1/billing", axum::routing::get(billing_credits))
+        .with_state(fake.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let dir = temp_dir("grok-billing");
+    let sessions_dir = dir.join("sessions");
+    std::fs::create_dir_all(&sessions_dir).unwrap();
+    umsp::sessions::write_session(
+        &sessions_dir,
+        "grok",
+        "session-token",
+        "refresh-token",
+        "2099-01-01T00:00:00Z",
+    )
+    .unwrap();
+    let store = umsp::sessions::SessionStore::new(sessions_dir, reqwest::Client::new());
+    let provider = Provider {
+        id: "grok".into(),
+        vendor: Some("grok".into()),
+        base_url: format!("http://{addr}/v1"),
+        anthropic_base_url: None,
+        api_key_env: String::new(),
+        auth: "oauth".into(),
+        protocols: vec!["responses".into()],
+        quirks: None,
+    };
+
+    let (usage, user_id) =
+        umsp::grok_billing::fetch_usage(&reqwest::Client::new(), &store, &provider, "1.0.46", None)
+            .await
+            .unwrap();
+    assert!((usage.remaining_fraction - 0.56).abs() < 1e-9);
+    assert_eq!(usage.used_percent, 44.0);
+    assert_eq!(user_id, "2011310503512195073");
+
+    let seen = fake.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].path, "/v1/user");
+    assert_eq!(seen[0].user_id, None);
+    assert_eq!(seen[1].path, "/v1/billing");
+    assert_eq!(seen[1].user_id.as_deref(), Some("2011310503512195073"));
+    assert_eq!(seen[1].authorization, "Bearer session-token");
 }

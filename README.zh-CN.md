@@ -19,7 +19,7 @@ Anthropic Messages 三种协议收在同一个端口上，按协议原样转发�
 > `/healthz`（含熔断状态）、`/metrics`、OpenAI Chat Completions / OpenAI Responses /
 > Anthropic Messages 三种协议经**多家上游**（OpenDesign / DeepSeek）的非流式与流式 SSE 透传、
 > `/v1/messages/count_tokens`（DS 代理 / OD 501）、**按后端列表切换**、**provider 熔断**、
-> **DS 余额健康**、请求账本与 `umsp usage`。
+> **容量/用量感知的后端选择**、**DS 余额健康**、请求账本与 `umsp usage`。
 > 预算/RPM 限额不在本期范围。
 > 模型与路由设计见 `docs/model-routing.md`；协议细节见 `docs/quirks.md` 与
 > `docs/protocol-matrix.md`。`docs/internal/m0-…m5-verification.md` 是各里程碑的历史验收快照，
@@ -145,6 +145,8 @@ umsp model add --id grok-4.7 --backend grok:grok-4.7 --backend grok-2:grok-4.7
 # session token 只存放在 sessions/<id>.json（0600），不会写入日志或配置。
 # 网关会发送必需的 x-grok-client-version；xAI 提高最低版本时，在 env 文件里
 # 设置 UMSP_GROK_CLI_VERSION 并重启。
+# 周额度不在 x-ratelimit-* 响应头里（那是分钟级限流），而是由后台每 4 分钟读取
+# GET /v1/billing?format=credits 的 creditUsagePercent；详见 docs/model-routing.md。
 
 # 给已有模型补一个后端（插到平局顺序的最前）
 umsp model backend add claude-haiku-5.5 \
@@ -153,7 +155,7 @@ umsp model backend add claude-haiku-5.5 \
 # env 文件里的密钥只看掩码
 umsp env list
 
-# 一个逻辑模型，两个上游后端。配置顺序就是尝试顺序，余额只决定是否跳过。
+# 一个逻辑模型，两个上游后端。配置顺序用于打破平局；用量决定选择顺序。
 umsp model add --id deepseek-v4.1-flash \
   --backend open-design:deepseek-v4.1-flash \
   --backend deepseek:deepseek-flash \
@@ -174,7 +176,7 @@ CLI 修改配置时用 `toml_edit` 保留注释与格式，写临时文件后 `r
 
 | 方法 | 路径 | 鉴权 | 说明 |
 |---|---|---|---|
-| GET | `/healthz` | 否 | 网关与 provider 状态，含 `circuit`/`failures`/`opened_at`/`reason`；`?probe=1` 真探测（缓存 30s，DS 先查余额不花 token） |
+| GET | `/healthz` | 否 | 网关与 provider 状态，含 `circuit`/`failures`/`opened_at`/`reason` 与 fresh 用量快照（`remaining_fraction`/`windows`/`reset_in_s`）；`?probe=1` 真探测（缓存 30s，DS 先查余额不花 token） |
 | GET | `/metrics` | 否 | Prometheus 文本（`text/plain; version=0.0.4`），内存聚合，不触发上游；仅回环（非回环来源 403 `loopback_only`） |
 | HEAD | `/api/hello` | 否 | 204，Claude Code 连接预热 |
 | GET | `/v1/models` | 是 | 本地注册表，扁平 `context_length` / `max_completion_tokens` / `capabilities` / `display_name` |
@@ -267,9 +269,11 @@ Prometheus 文本格式（`text/plain; version=0.0.4; charset=utf-8`），全部
 ### 后端切换与熔断
 
 - **backends**：`[[models]] backends = [{ provider, upstream }, ...]`。请求只考虑这些后端。
-  provider 的熔断打开，或（DeepSeek）最新余额观测显示不可用/为空时，会被跳过。健康的 provider
-  按配置顺序尝试；真正服务该模型的 provider 会记住 5 小时，直到记录过期或这家调不通。切换只
-  发生在**尚未向客户端发出任何响应字节**之前（SSE 一旦返回 200 就不再切），每个后端最多试一次。
+  provider 的熔断打开或某个 fresh 用量窗口耗尽时会被跳过。有 fresh 用量的 provider（U）先试，
+  既无用量也无可用余额的（X）次之，只有可用余额的（B）最后；U 内按最紧的剩余比例升序，
+  只比较比例，绝不比较请求数/token 数/货币金额的绝对值。真正服务该模型的 provider 会记住
+  5 小时，直到记录过期或这家调不通。切换只发生在**尚未向客户端发出任何响应字节**之前
+  （SSE 一旦返回 200 就不再切），每个后端最多试一次。
 - **可重试**：连接错误、超时、429、5xx、402；**不重试**：400/401/403/404/422（401 是上游 key
   配置错误，换后端只会把几家都打爆）。所有后端都失败时，客户端拿到中性网关错误（`upstream_error`，502）；
   上游原始状态与 body 留在账本（`upstream_status` / `upstream_body`）。`count_tokens` 只会选实现了它的后端。
@@ -501,7 +505,7 @@ context_length = 1048000            # 拍平后的 context_length（Hermes 读�
 max_completion_tokens = 128000
 capabilities = ["text", "vision", "tools", "reasoning"]
 display_name = "DeepSeek V4.1 Flash"
-backends = [                        # 平局顺序；余额只决定是否跳过
+backends = [                        # 平局顺序；用量与余额决定健康选择
   { provider = "open-design", upstream = "deepseek-v4.1-flash" },
   { provider = "deepseek",    upstream = "deepseek-flash" },
 ]
