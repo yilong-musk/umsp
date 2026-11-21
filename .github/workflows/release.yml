@@ -103,6 +103,7 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           name: umsp-musl
@@ -110,6 +111,7 @@ jobs:
       - name: publish assets
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
@@ -118,6 +120,7 @@ jobs:
             gh release upload "$tag" dist/*.tar.gz dist/*.sha256 --clobber
           else
             gh release create "$tag" dist/*.tar.gz dist/*.sha256 \
+              --target "${GITHUB_SHA}" \
               --title "$tag" \
               --notes "Static musl build of UMSP ${tag}."
           fi
