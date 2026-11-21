@@ -61,7 +61,7 @@ pub const VENDORS: &[Vendor] = &[
         name: "Qwen Token Plan",
         base_url: "https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1",
         anthropic_base_url: Some("https://token-plan.maas.qianwenaiapi.com/apps/anthropic"),
-        protocols: &["chat", "messages"],
+        protocols: &["chat", "responses", "messages"],
         quirks: None,
         auth: "api_key",
         docs_url: Some("https://help.aliyun.com/zh/model-studio/base-url"),
@@ -114,7 +114,7 @@ mod tests {
             vendor.anthropic_base_url,
             Some("https://token-plan.maas.qianwenaiapi.com/apps/anthropic")
         );
-        assert_eq!(vendor.protocols, &["chat", "messages"]);
+        assert_eq!(vendor.protocols, &["chat", "responses", "messages"]);
         assert!(vendor.quirks.is_none());
         assert_eq!(vendor.auth, "api_key");
     }

@@ -125,8 +125,9 @@ quirks = "deepseek"                # also determines the count_tokens proxy
 # `qwen-token-plan` is the Qwen Token Plan console host, not pay-as-you-go DashScope
 # and not the international qwencloudapi.com host.
 # Chat: https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1
+# Responses: https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1/responses
 # Messages: https://token-plan.maas.qianwenaiapi.com/apps/anthropic
-# The key variable is QWEN_TOKEN_PLAN_API_KEY. Responses is not offered.
+# The key variable is QWEN_TOKEN_PLAN_API_KEY. Protocols: chat, responses, messages.
 # token-plan.cn-beijing.maas.aliyuncs.com still answers, but it is not the console URL.
 # Adding a vendor requires changing that one place and rebuilding; an unknown vendor in the config fails validation.
 # `auth = "oauth"` (grok) stores one session per provider id under sessions/<id>.json.

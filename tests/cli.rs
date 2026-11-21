@@ -249,6 +249,10 @@ fn provider_add_qwen_token_plan_writes_the_plan_endpoints() {
         "{cfg}"
     );
     assert!(cfg.contains("QWEN_TOKEN_PLAN_API_KEY"), "{cfg}");
+    assert!(
+        cfg.contains("protocols = [\"chat\", \"responses\", \"messages\"]"),
+        "{cfg}"
+    );
 }
 
 #[test]

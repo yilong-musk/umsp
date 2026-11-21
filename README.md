@@ -165,9 +165,10 @@ short-lived `x-ratelimit-*` headers. Details: [docs/model-routing.md](docs/model
 subscription console (`token-plan.maas.qianwenaiapi.com`), not pay-as-you-go DashScope and
 not the international `qwencloudapi.com` host. A `sk-` key or the DashScope host will not
 draw down this plan. Chat goes to
-`https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1` and Messages to
+`https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1`, Responses to
+`https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1/responses`, and Messages to
 `https://token-plan.maas.qianwenaiapi.com/apps/anthropic`. The key variable is
-`QWEN_TOKEN_PLAN_API_KEY`. Responses is not offered. The plan is documented for
+`QWEN_TOKEN_PLAN_API_KEY`. The plan is documented for
 interactive clients. The older regional host
 `token-plan.cn-beijing.maas.aliyuncs.com` still answers, but it is not the console URL.
 
