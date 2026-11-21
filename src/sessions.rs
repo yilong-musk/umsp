@@ -24,6 +24,9 @@ pub const GROK_ISSUER: &str = "https://auth.x.ai";
 pub const GROK_SCOPES: &str = "openid profile email offline_access grok-cli:access api:access";
 /// Tells `cli-chat-proxy` to validate the bearer as a CLI session token.
 pub const CLI_TOKEN_AUTH: &str = "xai-grok-cli";
+/// Grok CLI version sent to `cli-chat-proxy`. xAI rejects requests below its
+/// current minimum (1.0.13 as of 2026-11-21) with HTTP 426.
+pub const GROK_CLI_VERSION: &str = "1.0.46";
 
 const DEVICE_PATH: &str = "/oauth2/device/code";
 const TOKEN_PATH: &str = "/oauth2/token";
@@ -539,7 +542,10 @@ fn try_open_browser(url: &str) {
 }
 
 pub fn is_cli_session_header(name: &str) -> bool {
-    matches!(name, "x-xai-token-auth" | "x-grok-model-override")
+    matches!(
+        name,
+        "x-xai-token-auth" | "x-grok-model-override" | "x-grok-client-version"
+    )
 }
 
 #[cfg(test)]

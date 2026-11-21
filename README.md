@@ -155,6 +155,8 @@ umsp model add --id grok-4.7 --backend grok:grok-4.7 --backend grok-2:grok-4.7
 # break without notice and may violate xAI's terms of service, including account suspension.
 # Use it only with an account you are willing to risk. Session tokens stay in
 # sessions/<id>.json (0600) and are never written to logs or config.
+# The gateway sends the required x-grok-client-version; if xAI raises the
+# minimum, set UMSP_GROK_CLI_VERSION in the env file and restart.
 
 # Attach another backend to an existing model (insert at the front = highest priority)
 umsp model backend add claude-haiku-5.5 \
