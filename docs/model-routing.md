@@ -5,6 +5,8 @@ Since 2026-11-20, models and providers are decoupled: **a model is a logical ent
 ## Principles
 
 - Callers only know model ids (for example `deepseek-v4.1-flash`); `/v1/models` contains exactly one entry per model.
+- The gateway re-reads each provider's `GET {base_url}/models` every 10 minutes and deduplicates by id. The same id on several providers is one model, with one backend per provider in configuration order. A failed read keeps that provider's previous list. Configured `[[models]]` entries still supply metadata (context, capabilities, aliases) and any backend whose upstream name differs from the advertised id. A configured model that no provider has listed stays, so a provider without a model list does not disappear. Until the first successful read, `/v1/models` is the configured set.
+- A client's `allowed_models` still filters that list. An empty list, or `*`, shows the full catalog.
 - provider / upstream never appear in model ids, `/v1/models`, or `allowed_models`.
 - A model may have multiple backends. A provider is skipped when its circuit is open or a fresh usage window is exhausted. Providers with fresh usage (`U`) are tried first, then providers with neither usage nor a usable balance (`X`), then balance-only providers (`B`). The provider that serves the model sticks for five hours, or until it cannot take a request. The full ordering rules are in [Capacity-aware selection](#capacity-aware-selection).
 

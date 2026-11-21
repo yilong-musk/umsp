@@ -5,6 +5,7 @@
 //! with `event:` line patching) against OpenDesign. The library target exists so
 //! integration tests can drive the real router.
 
+pub mod catalog;
 pub mod circuit;
 pub mod cli;
 pub mod commands;
