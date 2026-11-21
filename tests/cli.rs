@@ -224,8 +224,35 @@ fn provider_add_needs_a_known_vendor() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(text.contains("unknown vendor 'openrouter'"), "{text}");
-    assert!(text.contains("open-design, deepseek, grok"), "{text}");
+    assert!(
+        text.contains("open-design, deepseek, grok, qwen-token-plan"),
+        "{text}"
+    );
     assert!(!sb.read_config().contains("openrouter"));
+}
+
+#[test]
+fn provider_add_qwen_token_plan_writes_the_plan_endpoints() {
+    let sb = Sandbox::new("qwen-token-plan");
+    sb.ok(
+        &["provider", "add", "--vendor", "qwen-token-plan", "--no-key"],
+        None,
+    );
+    let cfg = sb.read_config();
+    assert!(cfg.contains("vendor = \"qwen-token-plan\""), "{cfg}");
+    assert!(
+        cfg.contains("https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1"),
+        "{cfg}"
+    );
+    assert!(
+        cfg.contains("https://token-plan.maas.qianwenaiapi.com/apps/anthropic"),
+        "{cfg}"
+    );
+    assert!(cfg.contains("QWEN_TOKEN_PLAN_API_KEY"), "{cfg}");
+    assert!(
+        cfg.contains("protocols = [\"chat\", \"responses\", \"messages\"]"),
+        "{cfg}"
+    );
 }
 
 #[test]

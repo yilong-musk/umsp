@@ -159,6 +159,19 @@ The gateway sends the required `x-grok-client-version` (override with `UMSP_GROK
 xAI raises the minimum). Weekly subscription usage is read from the billing endpoint, not from the
 short-lived `x-ratelimit-*` headers. Details: [docs/model-routing.md](docs/model-routing.md).
 
+## Qwen Token Plan
+
+`umsp provider add --vendor qwen-token-plan` uses the Qwen Token Plan host shown in the
+subscription console (`token-plan.maas.qianwenaiapi.com`), not pay-as-you-go DashScope and
+not the international `qwencloudapi.com` host. A `sk-` key or the DashScope host will not
+draw down this plan. Chat goes to
+`https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1`, Responses to
+`https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1/responses`, and Messages to
+`https://token-plan.maas.qianwenaiapi.com/apps/anthropic`. The key variable is
+`QWEN_TOKEN_PLAN_API_KEY`. The plan is documented for
+interactive clients. The older regional host
+`token-plan.cn-beijing.maas.aliyuncs.com` still answers, but it is not the console URL.
+
 ## Documentation
 
 | Document | Contents |

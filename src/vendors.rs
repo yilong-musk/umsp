@@ -56,6 +56,16 @@ pub const VENDORS: &[Vendor] = &[
         auth: "oauth",
         docs_url: None,
     },
+    Vendor {
+        id: "qwen-token-plan",
+        name: "Qwen Token Plan",
+        base_url: "https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1",
+        anthropic_base_url: Some("https://token-plan.maas.qianwenaiapi.com/apps/anthropic"),
+        protocols: &["chat", "responses", "messages"],
+        quirks: None,
+        auth: "api_key",
+        docs_url: Some("https://help.aliyun.com/zh/model-studio/base-url"),
+    },
 ];
 
 pub fn find(id: &str) -> Option<&'static Vendor> {
@@ -91,5 +101,21 @@ mod tests {
             }
             assert!(["api_key", "oauth"].contains(&vendor.auth));
         }
+    }
+
+    #[test]
+    fn qwen_token_plan_uses_the_console_host_not_payg() {
+        let vendor = find("qwen-token-plan").expect("catalog entry");
+        assert_eq!(
+            vendor.base_url,
+            "https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1"
+        );
+        assert_eq!(
+            vendor.anthropic_base_url,
+            Some("https://token-plan.maas.qianwenaiapi.com/apps/anthropic")
+        );
+        assert_eq!(vendor.protocols, &["chat", "responses", "messages"]);
+        assert!(vendor.quirks.is_none());
+        assert_eq!(vendor.auth, "api_key");
     }
 }

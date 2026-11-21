@@ -154,6 +154,17 @@ umsp doctor [--online]                  # 诊断；--online 会花少量 token
 覆盖。周额度从 billing 接口读取，不来自短周期的 `x-ratelimit-*` 响应头。细节见
 [docs/model-routing.md](docs/model-routing.md)（英文）。
 
+## 千问 Token Plan
+
+`umsp provider add --vendor qwen-token-plan` 使用订阅后台显示的千问 Token Plan
+（`token-plan.maas.qianwenaiapi.com`），不是按量付费的 DashScope，也不是海外的
+`qwencloudapi.com`。`sk-` 开头的通用 Key 或 DashScope 域名不会扣这份套餐。
+Chat 走 `https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1`，
+Responses 走 `https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1/responses`，
+Messages 走 `https://token-plan.maas.qianwenaiapi.com/apps/anthropic`。
+密钥变量是 `QWEN_TOKEN_PLAN_API_KEY`。该套餐限定在交互式客户端。
+旧的华北 2 域名 `token-plan.cn-beijing.maas.aliyuncs.com` 目前仍可应答，但不是后台给出的地址。
+
 ## 文档
 
 | 文档 | 内容 |
