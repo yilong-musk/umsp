@@ -159,6 +159,16 @@ The gateway sends the required `x-grok-client-version` (override with `UMSP_GROK
 xAI raises the minimum). Weekly subscription usage is read from the billing endpoint, not from the
 short-lived `x-ratelimit-*` headers. Details: [docs/model-routing.md](docs/model-routing.md).
 
+## Qwen Token Plan
+
+`umsp provider add --vendor qwen-token-plan` uses Alibaba Cloud Model Studio Token Plan
+(China Beijing only). It is not pay-as-you-go DashScope: a `sk-` key or the DashScope host
+will not draw down this plan. Chat goes to
+`https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1` and Messages to
+`https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic`. The key variable is
+`QWEN_TOKEN_PLAN_API_KEY`. Responses is not offered. Alibaba documents the plan for
+interactive clients.
+
 ## Documentation
 
 | Document | Contents |

@@ -121,7 +121,11 @@ api_key_env = "DEEPSEEK_API_KEY"
 protocols = ["chat", "responses", "messages"]
 quirks = "deepseek"                # also determines the count_tokens proxy
 
-# The vendor catalog lives in code (src/vendors.rs): open-design, deepseek, grok.
+# The vendor catalog lives in code (src/vendors.rs): open-design, deepseek, grok, qwen-token-plan.
+# `qwen-token-plan` is Alibaba Cloud Model Studio Token Plan (China Beijing), not pay-as-you-go DashScope.
+# Chat: https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+# Messages: https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic
+# The key variable is QWEN_TOKEN_PLAN_API_KEY. Responses is not offered.
 # Adding a vendor requires changing that one place and rebuilding; an unknown vendor in the config fails validation.
 # `auth = "oauth"` (grok) stores one session per provider id under sessions/<id>.json.
 # `auth = "api_key"` (the default) still reads api_key_env from the env file.
