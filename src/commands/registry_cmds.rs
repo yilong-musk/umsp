@@ -6,8 +6,8 @@ use serde_json::{Value, json};
 use toml_edit::Table;
 
 use crate::cli::{
-    ClientAddArgs, ClientCmd, KeyCmd, ModelAddArgs, ModelBackendCmd, ModelCmd, ProviderAddArgs,
-    ProviderCmd, ProviderTestArgs, VendorCmd,
+    CatalogCmd, ClientAddArgs, ClientCmd, KeyCmd, ModelAddArgs, ModelBackendCmd, ModelCmd,
+    ProviderAddArgs, ProviderCmd, ProviderTestArgs, VendorCmd,
 };
 use crate::commands::config_edit::{self, ConfigDoc};
 use crate::config::{Config, PROTOCOLS};
@@ -402,6 +402,60 @@ fn health_url(listen: &str) -> Option<String> {
         host.to_string()
     };
     Some(format!("http://{host}:{port}/healthz"))
+}
+
+pub fn run_catalog(path: &Path, cmd: CatalogCmd, json_output: bool) -> Result<i32> {
+    match cmd {
+        CatalogCmd::Refresh => refresh_running_catalog(path, json_output),
+    }
+}
+
+fn refresh_running_catalog(path: &Path, json_output: bool) -> Result<i32> {
+    let cfg = Config::load(path)?;
+    let url = gateway_url(&cfg.server.listen, "/catalog/refresh").ok_or_else(|| {
+        UmspError::config(format!("cannot parse listen address {}", cfg.server.listen))
+    })?;
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| UmspError::other("RUNTIME", format!("tokio: {err}")))?;
+    let value = rt.block_on(async move {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(90))
+            .build()
+            .map_err(|err| UmspError::network(format!("http client: {err}")))?;
+        let response = client.post(&url).send().await.map_err(|_| {
+            UmspError::network("gateway is not running; start it with `umsp serve`")
+        })?;
+        let status = response.status();
+        let body = response.json::<Value>().await.map_err(|err| {
+            UmspError::network(format!("catalog refresh returned invalid JSON: {err}"))
+        })?;
+        if !status.is_success() {
+            return Err(UmspError::network(format!(
+                "catalog refresh failed with HTTP {status}"
+            )));
+        }
+        Ok::<Value, UmspError>(body)
+    })?;
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string(&value).unwrap_or_else(|_| "{}".into())
+        );
+    } else {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
+        );
+    }
+    Ok(0)
+}
+
+fn gateway_url(listen: &str, path: &str) -> Option<String> {
+    let health = health_url(listen)?;
+    Some(format!("{}{path}", health.trim_end_matches("/healthz")))
 }
 
 /// Circuit state only lives in the gateway process; ask it, and treat a dead

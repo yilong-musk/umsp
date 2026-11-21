@@ -44,6 +44,7 @@ pub fn run(cli: Cli) -> Result<i32> {
         }
         Command::Vendor { cmd } => registry_cmds::run_vendor(&config_path, cmd, json),
         Command::Model { cmd } => registry_cmds::run_model(&config_path, cmd, json, no_reload),
+        Command::Catalog { cmd } => registry_cmds::run_catalog(&config_path, cmd, json),
         Command::Client { cmd } => registry_cmds::run_client(&config_path, cmd, json, no_reload),
         Command::Key { cmd } => registry_cmds::run_key(&config_path, cmd, json, no_reload),
         Command::Usage { cmd } => usage_cmd::run(&config_path, cmd, json),

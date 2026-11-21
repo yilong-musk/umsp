@@ -69,6 +69,11 @@ pub enum Command {
         #[command(subcommand)]
         cmd: ModelCmd,
     },
+    /// Read upstream model lists into the running gateway
+    Catalog {
+        #[command(subcommand)]
+        cmd: CatalogCmd,
+    },
     /// Manage gateway clients (keys + model allow-lists)
     Client {
         #[command(subcommand)]
@@ -175,6 +180,12 @@ pub enum EnvCmd {
     },
     /// Remove one variable
     Unset { name: String },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CatalogCmd {
+    /// Re-read every provider model list now
+    Refresh,
 }
 
 #[derive(Debug, Subcommand)]
@@ -557,6 +568,7 @@ mod tests {
             "doctor",
             "provider",
             "model",
+            "catalog",
             "client",
             "key",
             "usage",
