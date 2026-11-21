@@ -1,6 +1,6 @@
 //! HTTP data plane: auth, `/v1/models`, `/healthz`, Chat Completions proxy.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -24,6 +24,7 @@ use crate::keys;
 use crate::metrics::Metrics;
 use crate::quirks;
 use crate::registry;
+use crate::route::{PinDrop, PlanKind, RouteTable, UsageWindow};
 use crate::sessions::{self, SessionError, SessionStore};
 use crate::stream;
 use crate::upstream::{self, forward_request_headers, relay_response_headers};
@@ -63,6 +64,7 @@ struct Inner {
     health: Mutex<HashMap<String, ProviderHealth>>,
     probe_cache: Mutex<HashMap<String, ProbeCacheEntry>>,
     circuits: CircuitBreaker,
+    routes: Mutex<RouteTable>,
     logs: LogStore,
     metrics: Metrics,
     sessions: SessionStore,
@@ -112,6 +114,7 @@ impl AppState {
                 health: Mutex::new(HashMap::new()),
                 probe_cache: Mutex::new(HashMap::new()),
                 circuits: CircuitBreaker::default(),
+                routes: Mutex::new(RouteTable::default()),
                 logs,
                 metrics: Metrics::new(),
                 sessions,
@@ -121,6 +124,111 @@ impl AppState {
 
     pub fn circuits(&self) -> &CircuitBreaker {
         &self.inner.circuits
+    }
+
+    /// Record usage windows observed for `provider`. Selection reads this on
+    /// later requests and does not refresh it itself.
+    pub fn note_provider_usage(&self, provider: &str, windows: Vec<UsageWindow>) {
+        self.inner
+            .routes
+            .lock()
+            .expect("route lock poisoned")
+            .note_usage(provider, windows);
+    }
+
+    /// Record a balance observation. `total` is the upstream's decimal string.
+    pub fn note_provider_balance(&self, provider: &str, balance: &Balance) {
+        let total = balance
+            .total
+            .as_deref()
+            .and_then(|raw| raw.trim().parse::<f64>().ok());
+        self.inner
+            .routes
+            .lock()
+            .expect("route lock poisoned")
+            .note_balance(provider, balance.is_available, total, Instant::now());
+    }
+
+    /// Remember `provider` for `model` when the model has no live pin.
+    /// Returns true when a new record was written.
+    fn remember_route(&self, model: &str, provider: &str) -> bool {
+        self.inner
+            .routes
+            .lock()
+            .expect("route lock poisoned")
+            .remember(model, provider, Instant::now())
+    }
+
+    /// Drop the model's pin only when it still names `provider`.
+    fn forget_route(&self, model: &str, provider: &str) -> bool {
+        self.inner
+            .routes
+            .lock()
+            .expect("route lock poisoned")
+            .forget_if(model, provider)
+    }
+
+    /// Backends to try, in selection order. A live pin's provider is first, and
+    /// every backend of a provider is kept in configuration order. `use_pin`
+    /// false leaves the stored pin untouched.
+    fn route_targets(
+        &self,
+        model: &str,
+        candidates: &[AttemptTarget],
+        excluded: &HashSet<String>,
+        skipped: &HashSet<(String, String)>,
+        use_pin: bool,
+    ) -> Vec<AttemptTarget> {
+        let mut ids = Vec::new();
+        let mut closed = HashMap::new();
+        let mut backends = Vec::new();
+        for candidate in candidates {
+            if !ids.contains(&candidate.provider.id) {
+                ids.push(candidate.provider.id.clone());
+            }
+            let state = self.circuits().view(&candidate.provider.id).state;
+            closed.insert(candidate.provider.id.clone(), state == CircuitState::Closed);
+            backends.push((candidate.provider.id.clone(), candidate.upstream.clone()));
+        }
+        let (order, drop) = {
+            let routes = self.inner.routes.lock().expect("route lock poisoned");
+            let now = Instant::now();
+            let plan = routes.plan(model, &ids, excluded, &closed, now, use_pin);
+            let mut order = plan.provider_ids.clone();
+            if plan.kind == PlanKind::Pinned {
+                let mut tail_excluded = excluded.clone();
+                if let Some(pin_id) = order.first() {
+                    tail_excluded.insert(pin_id.clone());
+                }
+                let tail = routes.plan(model, &ids, &tail_excluded, &closed, now, false);
+                order.extend(tail.provider_ids);
+            }
+            (order, plan.drop)
+        };
+        if use_pin {
+            if let Some((provider, reason)) = drop {
+                if self.forget_route(model, &provider) {
+                    plog_route("route_unpin", model, &provider, reason.as_str());
+                }
+            }
+        }
+        let pairs = crate::route::expand_backends(&order, &backends, skipped);
+        let mut used = vec![false; candidates.len()];
+        pairs
+            .into_iter()
+            .filter_map(|(provider, upstream)| {
+                let index = candidates
+                    .iter()
+                    .enumerate()
+                    .position(|(index, candidate)| {
+                        !used[index]
+                            && candidate.provider.id == provider
+                            && candidate.upstream == upstream
+                    })?;
+                used[index] = true;
+                Some(candidates[index].clone())
+            })
+            .collect()
     }
 
     pub fn cfg(&self) -> Arc<Config> {
@@ -1065,6 +1173,7 @@ async fn probe_provider(state: &AppState, cfg: &Config, provider: &Provider) -> 
     if provider.quirks.as_deref() == Some("deepseek") {
         match deepseek_balance(state, provider).await {
             Ok(balance) => {
+                state.note_provider_balance(&provider.id, &balance);
                 if !balance.is_available {
                     let value = json!({
                         "status": "degraded",
@@ -1638,13 +1747,13 @@ impl AttemptResult {
     }
 }
 
-/// Ordered backends that can serve `model`.
+/// Backends that can serve `model`, in configuration order.
 ///
 /// A backend is eligible when its provider exists and speaks at least one of
 /// the three protocols. The attempt uses the client protocol when the provider
 /// lists it (passthrough) and otherwise the first protocol in that provider's
 /// list (translation). `count_tokens` stays strict: the provider must speak
-/// Messages and implement the endpoint. Order is config order.
+/// Messages and implement the endpoint. Selection reorders this list.
 fn attempt_candidates(
     cfg: &Config,
     model: &Model,
@@ -1890,6 +1999,21 @@ fn note_circuit_error(state: &AppState, target: &AttemptTarget, err: &ProxyError
     }
 }
 
+/// Operational log event for provider selection (no keys, no bodies).
+fn plog_route(event: &str, model: &str, provider: &str, reason: &str) {
+    eprintln!(
+        "{}",
+        json!({
+            "ts": util::now_rfc3339(),
+            "level": if event == "route_unpin" { "warn" } else { "info" },
+            "event": event,
+            "model": model,
+            "provider": provider,
+            "reason": reason,
+        })
+    );
+}
+
 /// Operational log event for the circuit state machine (no keys, no bodies).
 fn plog_health(event: &str, provider: &str, model: &str, reason: &str) {
     eprintln!(
@@ -2128,6 +2252,149 @@ fn upstream_failure_response(
     protocol_gateway_error(protocol, status, code, message, request_id)
 }
 
+/// Walks one selection list. A failed upstream is skipped; the provider's
+/// other backends stay in the list. The list is built once.
+struct AttemptCursor {
+    excluded_providers: HashSet<String>,
+    skipped: HashSet<(String, String)>,
+    planned: Vec<AttemptTarget>,
+    index: usize,
+    loaded: bool,
+    /// Completions read and write the model pin. `count_tokens` does not.
+    use_pin: bool,
+}
+
+impl AttemptCursor {
+    fn next(
+        &mut self,
+        state: &AppState,
+        model: &str,
+        candidates: &[AttemptTarget],
+    ) -> Option<AttemptTarget> {
+        if !self.loaded {
+            self.planned = state.route_targets(
+                model,
+                candidates,
+                &self.excluded_providers,
+                &self.skipped,
+                self.use_pin,
+            );
+            self.loaded = true;
+        }
+        while self.index < self.planned.len() {
+            let target = self.planned[self.index].clone();
+            self.index += 1;
+            if self.excluded_providers.contains(&target.provider.id) {
+                continue;
+            }
+            let key = (target.provider.id.clone(), target.upstream.clone());
+            if self.skipped.contains(&key) {
+                continue;
+            }
+            return Some(target);
+        }
+        None
+    }
+
+    fn skip_backend(&mut self, provider: &str, upstream: &str) {
+        self.skipped
+            .insert((provider.to_string(), upstream.to_string()));
+    }
+
+    fn skip_provider(&mut self, provider: &str) {
+        self.excluded_providers.insert(provider.to_string());
+    }
+
+    fn has_more(&self) -> bool {
+        self.planned.iter().skip(self.index).any(|target| {
+            !self.excluded_providers.contains(&target.provider.id)
+                && !self
+                    .skipped
+                    .contains(&(target.provider.id.clone(), target.upstream.clone()))
+        })
+    }
+}
+
+fn attempt_succeeded(result: &AttemptResult) -> bool {
+    match result {
+        AttemptResult::Response(outcome) => (200..300).contains(&outcome.status),
+        AttemptResult::Stream(stream) => (200..300).contains(&stream.status),
+        _ => false,
+    }
+}
+
+fn backend_remains(
+    candidates: &[AttemptTarget],
+    provider: &str,
+    skipped: &HashSet<(String, String)>,
+) -> bool {
+    candidates.iter().any(|candidate| {
+        candidate.provider.id == provider
+            && !skipped.contains(&(candidate.provider.id.clone(), candidate.upstream.clone()))
+    })
+}
+
+/// Move past a failed attempt. A local translation miss does not clear the
+/// pin. An unreachable backend clears it only after that provider has no
+/// backend left. Balance exhaustion and an open circuit clear it immediately.
+fn advance_route(
+    state: &AppState,
+    model: &str,
+    candidates: &[AttemptTarget],
+    cursor: &mut AttemptCursor,
+    target: &AttemptTarget,
+    result: &AttemptResult,
+) -> bool {
+    if attempt_succeeded(result) {
+        if cursor.use_pin {
+            note_route_success(state, model, &target.provider.id);
+        }
+        return false;
+    }
+    if !result.retryable() {
+        return false;
+    }
+    let provider_wide = match result {
+        AttemptResult::CircuitOpen { .. } => true,
+        AttemptResult::Response(outcome) => outcome.status == 402,
+        AttemptResult::Stream(stream) => stream.status == 402,
+        _ => false,
+    };
+    let clears_pin = !matches!(result, AttemptResult::Untranslatable { .. });
+    if provider_wide {
+        if cursor.use_pin {
+            note_route_failure(state, model, &target.provider.id);
+        }
+        cursor.skip_provider(&target.provider.id);
+        return true;
+    }
+    cursor.skip_backend(&target.provider.id, &target.upstream);
+    if cursor.use_pin
+        && clears_pin
+        && !backend_remains(candidates, &target.provider.id, &cursor.skipped)
+    {
+        note_route_failure(state, model, &target.provider.id);
+    }
+    true
+}
+
+fn note_route_success(state: &AppState, model: &str, provider: &str) {
+    if state.remember_route(model, provider) {
+        plog_route("route_pin", model, provider, "selected");
+    }
+}
+
+fn note_route_failure(state: &AppState, model: &str, provider: &str) {
+    if state.forget_route(model, provider) {
+        plog_route(
+            "route_unpin",
+            model,
+            provider,
+            PinDrop::Unreachable.as_str(),
+        );
+    }
+}
+
 /// Shared non-streaming proxy path: one upstream call, one ledger row.
 ///
 /// A provider that speaks the client protocol relays the body. A mismatch
@@ -2162,125 +2429,177 @@ async fn proxy_non_stream(
         return no_backend_response(protocol, &model.id, &request_id);
     }
 
+    let mut cursor = AttemptCursor {
+        excluded_providers: HashSet::new(),
+        skipped: HashSet::new(),
+        planned: Vec::new(),
+        index: 0,
+        loaded: false,
+        use_pin: !count_tokens,
+    };
     let mut fallbacks_used = 0u32;
     let mut previous_reason: Option<String> = None;
+    let mut previous: Option<AttemptTarget> = None;
+    let mut first_provider: Option<String> = None;
+    let mut translation_error: Option<String> = None;
     let mut last: Option<(AttemptResult, AttemptTarget, Vec<String>)> = None;
 
-    for (index, target) in candidates.iter().enumerate() {
-        if index > 0 {
+    loop {
+        let Some(target) = cursor.next(&state, &model.id, &candidates) else {
+            break;
+        };
+        if let Some(prev) = &previous {
             fallbacks_used += 1;
-            let previous = &candidates[index - 1];
             plog_fallback(
                 &request_id,
                 &client.name,
-                &previous.provider.id,
-                &previous.upstream,
+                &prev.provider.id,
+                &prev.upstream,
                 &target.provider.id,
                 &target.upstream,
                 previous_reason.as_deref().unwrap_or("retryable"),
             );
         }
-        let (attempt_body, attempt_quirks) =
-            match prepare_attempt(&payload, target, protocol, &client.name) {
-                Ok((body, provider_quirks)) => {
-                    let mut attempt_quirks = request_quirks.clone();
-                    attempt_quirks.extend(provider_quirks);
-                    (body, attempt_quirks)
-                }
-                Err(message) => {
-                    previous_reason = Some(message.clone());
-                    last = Some((
-                        AttemptResult::Untranslatable { message },
-                        target.clone(),
-                        Vec::new(),
-                    ));
-                    if index + 1 < candidates.len() {
-                        continue;
-                    }
-                    break;
+        first_provider.get_or_insert_with(|| target.provider.id.clone());
+        let (mut result, attempt_quirks) =
+            match prepare_attempt(&payload, &target, protocol, &client.name) {
+                Err(message) => (AttemptResult::Untranslatable { message }, Vec::new()),
+                Ok((attempt_body, mut attempt_quirks)) => {
+                    attempt_quirks.splice(0..0, request_quirks.iter().cloned());
+                    let attempt_headers =
+                        headers_for_attempt(&client_headers, protocol, &target.upstream_protocol);
+                    let admission = state.circuits().admit(&target.provider.id);
+                    // A granted half-open probe owns the single probe slot for the attempt.
+                    // Dropping the guard before a result is recorded (client cancel, aborted
+                    // task) only releases the slot; the circuit stays half_open.
+                    let _probe = match &admission {
+                        Admission::Probe(guard) => Some(guard),
+                        _ => None,
+                    };
+                    let _inflight = state.metrics().inflight(&target.provider.id);
+                    let result = match &admission {
+                        Admission::Reject => AttemptResult::CircuitOpen {
+                            reason: state.circuits().view(&target.provider.id).reason,
+                        },
+                        Admission::Allow | Admission::Probe(_) => {
+                            let attempt_started = Instant::now();
+                            let outcome = if count_tokens {
+                                up.count_tokens(&target.provider, &attempt_body, &attempt_headers)
+                                    .await
+                            } else {
+                                match target.upstream_protocol.as_str() {
+                                    "responses" => {
+                                        up.responses(
+                                            &target.provider,
+                                            &attempt_body,
+                                            &attempt_headers,
+                                        )
+                                        .await
+                                    }
+                                    "messages" => {
+                                        let query = (protocol == "messages")
+                                            .then(|| call.query())
+                                            .flatten();
+                                        up.messages(
+                                            &target.provider,
+                                            query,
+                                            &attempt_body,
+                                            &attempt_headers,
+                                        )
+                                        .await
+                                    }
+                                    _ => {
+                                        up.chat(
+                                            &target.provider,
+                                            &target.upstream,
+                                            &attempt_body,
+                                            &attempt_headers,
+                                        )
+                                        .await
+                                    }
+                                }
+                            };
+                            match outcome {
+                                Ok(outcome) => {
+                                    state.note_health(
+                                        &target.provider.id,
+                                        outcome.status,
+                                        outcome.duration_ms,
+                                        (outcome.status >= 400)
+                                            .then(|| format!("http_{}", outcome.status)),
+                                    );
+                                    note_circuit_result(
+                                        &state,
+                                        &target,
+                                        outcome.status,
+                                        _probe.is_some(),
+                                    );
+                                    AttemptResult::Response(outcome)
+                                }
+                                Err(err) => {
+                                    state.note_health(
+                                        &target.provider.id,
+                                        0,
+                                        attempt_started.elapsed().as_millis() as u64,
+                                        Some(err.code().to_string()),
+                                    );
+                                    note_circuit_error(&state, &target, &err);
+                                    AttemptResult::Error(err)
+                                }
+                            }
+                        }
+                    };
+                    (result, attempt_quirks)
                 }
             };
-        let attempt_headers =
-            headers_for_attempt(&client_headers, protocol, &target.upstream_protocol);
-        let admission = state.circuits().admit(&target.provider.id);
-        // A granted half-open probe owns the single probe slot for the attempt.
-        // Dropping the guard before a result is recorded (client cancel, aborted
-        // task) only releases the slot; the circuit stays half_open.
-        let _probe = match &admission {
-            Admission::Probe(guard) => Some(guard),
-            _ => None,
-        };
-        let _inflight = state.metrics().inflight(&target.provider.id);
-        let result = match &admission {
-            Admission::Reject => AttemptResult::CircuitOpen {
-                reason: state.circuits().view(&target.provider.id).reason,
-            },
-            Admission::Allow | Admission::Probe(_) => {
-                let attempt_started = Instant::now();
-                let outcome = if count_tokens {
-                    up.count_tokens(&target.provider, &attempt_body, &attempt_headers)
-                        .await
-                } else {
-                    match target.upstream_protocol.as_str() {
-                        "responses" => {
-                            up.responses(&target.provider, &attempt_body, &attempt_headers)
-                                .await
-                        }
-                        "messages" => {
-                            let query = (protocol == "messages").then(|| call.query()).flatten();
-                            up.messages(&target.provider, query, &attempt_body, &attempt_headers)
-                                .await
-                        }
-                        _ => {
-                            up.chat(
-                                &target.provider,
-                                &target.upstream,
-                                &attempt_body,
-                                &attempt_headers,
-                            )
-                            .await
-                        }
-                    }
-                };
-                match outcome {
-                    Ok(outcome) => {
-                        state.note_health(
-                            &target.provider.id,
-                            outcome.status,
-                            outcome.duration_ms,
-                            (outcome.status >= 400).then(|| format!("http_{}", outcome.status)),
-                        );
-                        note_circuit_result(&state, target, outcome.status, _probe.is_some());
-                        AttemptResult::Response(outcome)
-                    }
-                    Err(err) => {
-                        state.note_health(
-                            &target.provider.id,
-                            0,
-                            attempt_started.elapsed().as_millis() as u64,
-                            Some(err.code().to_string()),
-                        );
-                        note_circuit_error(&state, target, &err);
-                        AttemptResult::Error(err)
-                    }
-                }
-            }
-        };
-        let retryable = result.retryable();
-        let has_next = index + 1 < candidates.len();
         if let Some(code) = result.upstream_fault() {
             state
                 .metrics()
                 .note_upstream_error(&target.provider.id, &code);
         }
-        previous_reason = Some(result.reason());
-        last = Some((result, target.clone(), attempt_quirks));
-        if !(retryable && has_next) {
-            break;
+        if let AttemptResult::Response(outcome) = &mut result {
+            if (200..300).contains(&outcome.status) && target.upstream_protocol != protocol {
+                match crate::translate::translate_response(
+                    &outcome.body,
+                    &target.upstream_protocol,
+                    protocol,
+                    &target.model.id,
+                ) {
+                    Ok(body) => outcome.body = body,
+                    Err(message) => {
+                        cursor.skip_backend(&target.provider.id, &target.upstream);
+                        previous_reason = Some("translation_failed".to_string());
+                        if cursor.has_more() {
+                            previous = Some(target);
+                            continue;
+                        }
+                        translation_error = Some(message);
+                        last = Some((result, target, attempt_quirks));
+                        break;
+                    }
+                }
+            }
         }
+        previous_reason = Some(result.reason());
+        let proceed = advance_route(
+            &state,
+            &model.id,
+            &candidates,
+            &mut cursor,
+            &target,
+            &result,
+        );
+        last = Some((result, target.clone(), attempt_quirks));
+        if proceed {
+            previous = Some(target);
+            continue;
+        }
+        break;
     }
 
-    let (result, target, attempt_quirks) = last.expect("at least one attempt candidate");
+    let Some((result, target, attempt_quirks)) = last else {
+        return no_backend_response(protocol, &model.id, &request_id);
+    };
     let duration_ms = started.elapsed().as_millis() as u64;
     let mut record = request_record(
         &request_id,
@@ -2296,39 +2615,29 @@ async fn proxy_non_stream(
     );
     record.fallbacks = fallbacks_used;
     if fallbacks_used > 0 {
-        record
-            .quirks
-            .push(format!("fallback_from:{}", candidates[0].provider.id));
+        if let Some(from) = &first_provider {
+            record.quirks.push(format!("fallback_from:{from}"));
+        }
     }
     if let Some(quirk) = call.quirk() {
         record.quirks.push(quirk.to_string());
     }
 
     match result {
-        AttemptResult::Response(mut outcome) => {
-            if outcome.status < 400 && target.upstream_protocol != protocol {
-                match crate::translate::translate_response(
-                    &outcome.body,
-                    &target.upstream_protocol,
+        AttemptResult::Response(outcome) => {
+            if let Some(message) = translation_error {
+                record.status = StatusCode::BAD_GATEWAY.as_u16();
+                record.upstream_status = Some(outcome.status);
+                record.error_code = Some("translation_failed".to_string());
+                record.duration_ms = outcome.duration_ms;
+                state.finish_request(&record);
+                return protocol_gateway_error(
                     protocol,
-                    &target.model.id,
-                ) {
-                    Ok(body) => outcome.body = body,
-                    Err(err) => {
-                        record.status = StatusCode::BAD_GATEWAY.as_u16();
-                        record.upstream_status = Some(outcome.status);
-                        record.error_code = Some("translation_failed".to_string());
-                        record.duration_ms = outcome.duration_ms;
-                        state.finish_request(&record);
-                        return protocol_gateway_error(
-                            protocol,
-                            StatusCode::BAD_GATEWAY,
-                            "translation_failed",
-                            &err,
-                            &request_id,
-                        );
-                    }
-                }
+                    StatusCode::BAD_GATEWAY,
+                    "translation_failed",
+                    &message,
+                    &request_id,
+                );
             }
             record.status = mapped_upstream_status(outcome.status);
             record.upstream_status = Some(outcome.status);
@@ -2860,11 +3169,21 @@ async fn proxy_stream(
         started,
     );
 
-    // Backends are tried in config order; a retry is only possible before any
-    // byte reaches the client, so everything up to the `200` below is safe.
+    // A retry is only possible before any byte reaches the client, so
+    // everything up to the `200` below is safe.
 
+    let mut cursor = AttemptCursor {
+        excluded_providers: HashSet::new(),
+        skipped: HashSet::new(),
+        planned: Vec::new(),
+        index: 0,
+        loaded: false,
+        use_pin: true,
+    };
     let mut fallbacks_used = 0u32;
     let mut previous_reason: Option<String> = None;
+    let mut previous: Option<AttemptTarget> = None;
+    let mut first_provider: Option<String> = None;
     let mut last: Option<(
         AttemptResult,
         AttemptTarget,
@@ -2872,129 +3191,136 @@ async fn proxy_stream(
         Vec<String>,
     )> = None;
 
-    for (index, target) in candidates.iter().enumerate() {
-        if index > 0 {
+    loop {
+        let Some(target) = cursor.next(&state, &model.id, &candidates) else {
+            break;
+        };
+        if let Some(prev) = &previous {
             fallbacks_used += 1;
-            let previous = &candidates[index - 1];
             plog_fallback(
                 &request_id,
                 &client.name,
-                &previous.provider.id,
-                &previous.upstream,
+                &prev.provider.id,
+                &prev.upstream,
                 &target.provider.id,
                 &target.upstream,
                 previous_reason.as_deref().unwrap_or("retryable"),
             );
         }
-        let (attempt_body, attempt_quirks) =
-            match prepare_attempt(&payload, target, protocol_name, &client.name) {
-                Ok((body, provider_quirks)) => {
-                    let mut attempt_quirks = request_quirks.clone();
-                    attempt_quirks.extend(provider_quirks);
-                    (body, attempt_quirks)
-                }
-                Err(message) => {
-                    previous_reason = Some(message.clone());
-                    last = Some((
-                        AttemptResult::Untranslatable { message },
-                        target.clone(),
-                        None,
-                        Vec::new(),
-                    ));
-                    if index + 1 < candidates.len() {
-                        continue;
-                    }
-                    break;
+        first_provider.get_or_insert_with(|| target.provider.id.clone());
+        let (result, inflight, attempt_quirks) =
+            match prepare_attempt(&payload, &target, protocol_name, &client.name) {
+                Err(message) => (AttemptResult::Untranslatable { message }, None, Vec::new()),
+                Ok((attempt_body, mut attempt_quirks)) => {
+                    attempt_quirks.splice(0..0, request_quirks.iter().cloned());
+                    let attempt_headers = headers_for_attempt(
+                        &client_headers,
+                        protocol_name,
+                        &target.upstream_protocol,
+                    );
+                    let admission = state.circuits().admit(&target.provider.id);
+                    // A granted half-open probe owns the single probe slot until this
+                    // attempt records a result; a cancelled request releases it on drop.
+                    let _probe = match &admission {
+                        Admission::Probe(guard) => Some(guard),
+                        _ => None,
+                    };
+                    // In-flight gauge: the guard travels with a live stream into the pump,
+                    // and is dropped as soon as an attempt ends.
+                    let inflight = state.metrics().inflight(&target.provider.id);
+                    let result = match &admission {
+                        Admission::Reject => AttemptResult::CircuitOpen {
+                            reason: state.circuits().view(&target.provider.id).reason,
+                        },
+                        Admission::Allow | Admission::Probe(_) => {
+                            let upstream_query = if target.upstream_protocol == "messages" {
+                                query.as_deref()
+                            } else {
+                                None
+                            };
+                            let opened = match target.upstream_protocol.as_str() {
+                                "responses" => {
+                                    up.responses_stream(
+                                        &target.provider,
+                                        &attempt_body,
+                                        &attempt_headers,
+                                        header_timeout,
+                                    )
+                                    .await
+                                }
+                                "messages" => {
+                                    up.messages_stream(
+                                        &target.provider,
+                                        upstream_query,
+                                        &attempt_body,
+                                        &attempt_headers,
+                                        header_timeout,
+                                    )
+                                    .await
+                                }
+                                _ => {
+                                    up.chat_stream(
+                                        &target.provider,
+                                        &attempt_body,
+                                        &attempt_headers,
+                                        header_timeout,
+                                    )
+                                    .await
+                                }
+                            };
+                            match opened {
+                                Ok(stream) => {
+                                    state.note_health(
+                                        &target.provider.id,
+                                        stream.status,
+                                        started.elapsed().as_millis() as u64,
+                                        (stream.status >= 400)
+                                            .then(|| format!("http_{}", stream.status)),
+                                    );
+                                    note_circuit_result(
+                                        &state,
+                                        &target,
+                                        stream.status,
+                                        _probe.is_some(),
+                                    );
+                                    AttemptResult::Stream(stream)
+                                }
+                                Err(err) => {
+                                    state.note_health(
+                                        &target.provider.id,
+                                        0,
+                                        started.elapsed().as_millis() as u64,
+                                        Some(err.code().to_string()),
+                                    );
+                                    note_circuit_error(&state, &target, &err);
+                                    AttemptResult::Error(err)
+                                }
+                            }
+                        }
+                    };
+                    (result, Some(inflight), attempt_quirks)
                 }
             };
-        let attempt_headers =
-            headers_for_attempt(&client_headers, protocol_name, &target.upstream_protocol);
-        let admission = state.circuits().admit(&target.provider.id);
-        // A granted half-open probe owns the single probe slot until this
-        // attempt records a result; a cancelled request releases it on drop.
-        let _probe = match &admission {
-            Admission::Probe(guard) => Some(guard),
-            _ => None,
-        };
-        // In-flight gauge: the guard travels with a live stream into the pump,
-        // and is dropped as soon as an attempt ends.
-        let inflight = state.metrics().inflight(&target.provider.id);
-        let result = match &admission {
-            Admission::Reject => AttemptResult::CircuitOpen {
-                reason: state.circuits().view(&target.provider.id).reason,
-            },
-            Admission::Allow | Admission::Probe(_) => {
-                let upstream_query = if target.upstream_protocol == "messages" {
-                    query.as_deref()
-                } else {
-                    None
-                };
-                let opened = match target.upstream_protocol.as_str() {
-                    "responses" => {
-                        up.responses_stream(
-                            &target.provider,
-                            &attempt_body,
-                            &attempt_headers,
-                            header_timeout,
-                        )
-                        .await
-                    }
-                    "messages" => {
-                        up.messages_stream(
-                            &target.provider,
-                            upstream_query,
-                            &attempt_body,
-                            &attempt_headers,
-                            header_timeout,
-                        )
-                        .await
-                    }
-                    _ => {
-                        up.chat_stream(
-                            &target.provider,
-                            &attempt_body,
-                            &attempt_headers,
-                            header_timeout,
-                        )
-                        .await
-                    }
-                };
-                match opened {
-                    Ok(stream) => {
-                        state.note_health(
-                            &target.provider.id,
-                            stream.status,
-                            started.elapsed().as_millis() as u64,
-                            (stream.status >= 400).then(|| format!("http_{}", stream.status)),
-                        );
-                        note_circuit_result(&state, target, stream.status, _probe.is_some());
-                        AttemptResult::Stream(stream)
-                    }
-                    Err(err) => {
-                        state.note_health(
-                            &target.provider.id,
-                            0,
-                            started.elapsed().as_millis() as u64,
-                            Some(err.code().to_string()),
-                        );
-                        note_circuit_error(&state, target, &err);
-                        AttemptResult::Error(err)
-                    }
-                }
-            }
-        };
-        let retryable = result.retryable();
-        let has_next = index + 1 < candidates.len();
         if let Some(code) = result.upstream_fault() {
             state
                 .metrics()
                 .note_upstream_error(&target.provider.id, &code);
         }
         previous_reason = Some(result.reason());
-        last = Some((result, target.clone(), Some(inflight), attempt_quirks));
-        if !(retryable && has_next) {
-            break;
+        let proceed = advance_route(
+            &state,
+            &model.id,
+            &candidates,
+            &mut cursor,
+            &target,
+            &result,
+        );
+        last = Some((result, target.clone(), inflight, attempt_quirks));
+        if proceed {
+            previous = Some(target);
+            continue;
         }
+        break;
     }
 
     let (result, target, inflight, attempt_quirks) = last.expect("at least one attempt candidate");
@@ -3006,9 +3332,9 @@ async fn proxy_stream(
         record.fallbacks = fallbacks_used;
         record.quirks.extend(attempt_quirks);
         if fallbacks_used > 0 {
-            record
-                .quirks
-                .push(format!("fallback_from:{}", candidates[0].provider.id));
+            if let Some(from) = &first_provider {
+                record.quirks.push(format!("fallback_from:{from}"));
+            }
         }
     }
 
@@ -3559,6 +3885,19 @@ async fn deepseek_balance(
     health::fetch_balance(state.http(), provider, &key).await
 }
 
+fn balance_upstream(cfg: &Config, provider_id: &str) -> String {
+    cfg.models
+        .iter()
+        .find_map(|model| {
+            model
+                .backends
+                .iter()
+                .find(|backend| backend.provider == provider_id)
+                .map(|backend| backend.upstream.clone())
+        })
+        .unwrap_or_else(|| provider_id.to_string())
+}
+
 /// Recovery loop for open circuits. DeepSeek is re-checked through the free
 /// balance endpoint every five minutes; everything else gets one minimal
 /// inference probe (`max_tokens: 1`, `reasoning_effort: none`).
@@ -3575,6 +3914,73 @@ async fn health_loop(state: AppState) {
         let circuits = state.circuits();
         for provider in &cfg.providers {
             let view = circuits.view(&provider.id);
+            // DeepSeek balance is free. Refresh it for healthy providers too, so
+            // selection can see a balance-only provider without waiting for a failure.
+            if provider.quirks.as_deref() == Some("deepseek") {
+                let due = last_balance
+                    .get(&provider.id)
+                    .map(|at| at.elapsed() >= BALANCE_INTERVAL)
+                    .unwrap_or(true);
+                if due {
+                    last_balance.insert(provider.id.clone(), Instant::now());
+                    match deepseek_balance(&state, provider).await {
+                        Ok(balance) => {
+                            state.note_provider_balance(&provider.id, &balance);
+                            if view.state != CircuitState::Closed {
+                                if balance.is_available {
+                                    let balance_reason = matches!(
+                                        view.reason.as_deref(),
+                                        Some("insufficient_balance")
+                                            | Some("balance_check_failed")
+                                            | None
+                                    );
+                                    if balance_reason && circuits.close(&provider.id) {
+                                        let upstream = balance_upstream(&cfg, &provider.id);
+                                        plog_health(
+                                            "circuit_close",
+                                            &provider.id,
+                                            &upstream,
+                                            "balance_restored",
+                                        );
+                                    }
+                                    if balance_reason {
+                                        continue;
+                                    }
+                                } else {
+                                    circuits.force_open(
+                                        &provider.id,
+                                        "insufficient_balance",
+                                        circuits.config().ds_balance_cooldown,
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            let upstream = balance_upstream(&cfg, &provider.id);
+                            let reason = format!("balance_check_failed:{err}");
+                            if view.state == CircuitState::Closed {
+                                plog_health(
+                                    "balance_check_failed",
+                                    &provider.id,
+                                    &upstream,
+                                    &reason,
+                                );
+                            } else {
+                                plog_health("circuit_open", &provider.id, &upstream, &reason);
+                                if view.state == CircuitState::HalfOpen {
+                                    circuits.force_open(
+                                        &provider.id,
+                                        "balance_check_failed",
+                                        BALANCE_INTERVAL,
+                                    );
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
             if view.state == CircuitState::Closed {
                 continue;
             }
@@ -3586,60 +3992,6 @@ async fn health_loop(state: AppState) {
             }) else {
                 continue;
             };
-
-            if provider.quirks.as_deref() == Some("deepseek") {
-                let due = last_balance
-                    .get(&provider.id)
-                    .map(|at| at.elapsed() >= BALANCE_INTERVAL)
-                    .unwrap_or(true);
-                if due {
-                    last_balance.insert(provider.id.clone(), Instant::now());
-                    match deepseek_balance(&state, provider).await {
-                        Ok(balance) if balance.is_available => {
-                            let balance_reason = matches!(
-                                view.reason.as_deref(),
-                                Some("insufficient_balance") | Some("balance_check_failed") | None
-                            );
-                            if balance_reason && circuits.close(&provider.id) {
-                                plog_health(
-                                    "circuit_close",
-                                    &provider.id,
-                                    &upstream,
-                                    "balance_restored",
-                                );
-                            }
-                            if balance_reason {
-                                continue;
-                            }
-                        }
-                        Ok(_) => {
-                            // Still no credit: keep the long open window.
-                            circuits.force_open(
-                                &provider.id,
-                                "insufficient_balance",
-                                circuits.config().ds_balance_cooldown,
-                            );
-                            continue;
-                        }
-                        Err(err) => {
-                            plog_health(
-                                "circuit_open",
-                                &provider.id,
-                                &upstream,
-                                &format!("balance_check_failed:{err}"),
-                            );
-                            if view.state == CircuitState::HalfOpen {
-                                circuits.force_open(
-                                    &provider.id,
-                                    "balance_check_failed",
-                                    BALANCE_INTERVAL,
-                                );
-                            }
-                            continue;
-                        }
-                    }
-                }
-            }
 
             let Some(_probe_guard) = circuits.take_probe(&provider.id) else {
                 continue;

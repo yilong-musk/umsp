@@ -16,6 +16,7 @@ pub mod keys;
 pub mod metrics;
 pub mod quirks;
 pub mod registry;
+pub mod route;
 pub mod server;
 pub mod sessions;
 pub mod stream;

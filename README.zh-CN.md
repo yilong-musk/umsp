@@ -107,7 +107,7 @@ hermes chat -q "只回复：正常" \
 | `umsp logout <provider>` | 删除该 provider 的 session 文件 |
 | `umsp env list\|set\|unset` | 管理 env 文件里的上游密钥（只显示掩码；`set` 在 TTY 上隐藏输入） |
 | `umsp model list [--aliases]\|add\|remove` | 管理本地模型注册表（逻辑 id + aliases） |
-| `umsp model backend add\|remove` | 给已有模型挂/摘后端（`--first` 插到最前，即最高优先级） |
+| `umsp model backend add\|remove` | 给已有模型挂/摘后端（`--first` 插到平局顺序的最前） |
 | `umsp client list\|add\|remove\|rotate` | 管理客户端 key（只存 SHA-256） |
 | `umsp key list\|add\|revoke` | `client` 的兼容别名 |
 | `umsp usage summary\|by-client\|by-model\|by-protocol\|prune` | 聚合 JSONL 账本 |
@@ -144,14 +144,14 @@ umsp model add --id grok-4.7 --backend grok:grok-4.7 --backend grok-2:grok-4.7
 # 接口可能随时变化，也可能违反 xAI 服务条款（包括封号）。只在你愿意承担风险的账号上使用。
 # session token 只存放在 sessions/<id>.json（0600），不会写入日志或配置。
 
-# 给已有模型补一个后端（插到最前 = 最高优先级）
+# 给已有模型补一个后端（插到平局顺序的最前）
 umsp model backend add claude-haiku-5.5 \
   --backend deepseek-2:deepseek-flash --first
 
 # env 文件里的密钥只看掩码
 umsp env list
 
-# 一个逻辑模型，两个上游后端；顺序即优先级（前面失败才轮到后面）
+# 一个逻辑模型，两个上游后端。配置顺序是用量和余额排序之后的平局打破规则。
 umsp model add --id deepseek-v4.1-flash \
   --backend open-design:deepseek-v4.1-flash \
   --backend deepseek:deepseek-flash \
@@ -264,9 +264,11 @@ Prometheus 文本格式（`text/plain; version=0.0.4; charset=utf-8`），全部
 
 ### 后端切换与熔断
 
-- **backends**：`[[models]] backends = [{ provider, upstream }, ...]`，顺序即优先级。每个请求按顺序
-  尝试，只切到**同协议**且能服务该协议的后端；每个后端最多试一次，因此不可能循环。切换只发生在
-  **尚未向客户端发出任何响应字节**之前（SSE 一旦返回 200 就不再切）。
+- **backends**：`[[models]] backends = [{ provider, upstream }, ...]`。请求只考虑这些后端。健康
+  的按新鲜用量窗口排序（剩余越少越优先，先比更短的窗口），然后是用量和余额都没有的，最后才是
+  只有余额的。配置顺序用来打破平局。真正服务这个模型的 provider 会记住 5 小时，直到记录过期或
+  这家调不通。切换只发生在**尚未向客户端发出任何响应字节**之前（SSE 一旦返回 200 就不再切），
+  每个后端最多试一次。
 - **可重试**：连接错误、超时、429、5xx、402；**不重试**：400/401/403/404/422（401 是上游 key
   配置错误，换后端只会把几家都打爆）。所有后端都失败时，客户端拿到中性网关错误（`upstream_error`，502）；
   上游原始状态与 body 留在账本（`upstream_status` / `upstream_body`）。`count_tokens` 只会选实现了它的后端。
@@ -498,7 +500,7 @@ context_length = 1048000            # 拍平后的 context_length（Hermes 读�
 max_completion_tokens = 128000
 capabilities = ["text", "vision", "tools", "reasoning"]
 display_name = "DeepSeek V4.1 Flash"
-backends = [                        # 顺序即优先级；一个失败才轮到下一个
+backends = [                        # 用量和余额排序之后的平局顺序
   { provider = "open-design", upstream = "deepseek-v4.1-flash" },
   { provider = "deepseek",    upstream = "deepseek-flash" },
 ]

@@ -3376,31 +3376,15 @@ async fn cancelled_half_open_probe_releases_the_slot() {
 }
 
 #[tokio::test]
-async fn open_circuit_still_uses_a_closed_fallback() {
-    let dir = temp_dir("circuit-fb");
+async fn a_successful_provider_sticks_until_it_fails() {
+    let dir = temp_dir("route-pin");
     let (app, fake) = m4b_gateway(&dir, true).await;
-    fake.queue("upstream-model", &[500; 5]);
+    fake.queue("upstream-model", &[500, 200]);
+    fake.queue("fallback-model", &[200, 500]);
 
-    // Five requests: primary fails, the fallback answers.
-    for _ in 0..5 {
-        let response = app
-            .clone()
-            .oneshot(chat_model("upstream-model", false))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(
-            !response.headers().contains_key("x-umsp-provider"),
-            "provider header must not leak to clients"
-        );
-    }
-    let health = body_json(app.clone().oneshot(healthz_request()).await.unwrap()).await;
-    assert_eq!(health["providers"]["od"]["circuit"], "open");
-    assert_eq!(fake.hits_of("upstream-model"), 5);
-
-    // Sixth request: the circuit rejects the primary before any call; the
-    // fallback still serves it, and only one hop is allowed.
+    // Primary fails, fallback answers, and the model pins the fallback.
     let response = app
+        .clone()
         .oneshot(chat_model("upstream-model", false))
         .await
         .unwrap();
@@ -3409,15 +3393,75 @@ async fn open_circuit_still_uses_a_closed_fallback() {
         !response.headers().contains_key("x-umsp-provider"),
         "provider header must not leak to clients"
     );
+
+    // The pin fails, so the request selects again and the primary answers.
+    let response = app
+        .clone()
+        .oneshot(chat_model("upstream-model", false))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // The new pin is the primary. The fallback is not called.
+    let response = app
+        .oneshot(chat_model("upstream-model", false))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        fake.hits_of("upstream-model"),
-        5,
-        "an open circuit must not be retried"
+        fake.hits(),
+        vec![
+            "upstream-model".to_string(),
+            "fallback-model".to_string(),
+            "fallback-model".to_string(),
+            "upstream-model".to_string(),
+            "upstream-model".to_string(),
+        ]
     );
-    let records = wait_records(&dir, 6).await;
-    assert_eq!(records.len(), 6);
-    assert_eq!(records[5].fallbacks, 1);
-    assert_eq!(records[5].provider, "deepseek");
+    let records = wait_records(&dir, 3).await;
+    assert_eq!(records[0].provider, "deepseek");
+    assert_eq!(records[0].fallbacks, 1);
+    assert!(
+        records[0]
+            .quirks
+            .iter()
+            .any(|quirk| quirk == "fallback_from:od")
+    );
+    assert_eq!(records[1].provider, "od");
+    assert_eq!(records[1].fallbacks, 1);
+    assert!(
+        records[1]
+            .quirks
+            .iter()
+            .any(|quirk| quirk == "fallback_from:deepseek")
+    );
+    assert_eq!(records[2].provider, "od");
+    assert_eq!(records[2].fallbacks, 0);
+}
+
+#[tokio::test]
+async fn a_retryable_failure_tries_the_same_providers_next_upstream() {
+    let dir = temp_dir("route-second-upstream");
+    let (root, fake) = start_scripted().await;
+    let mut cfg = m4b_config(&dir, format!("{root}/v1"), root, false);
+    cfg.models[0].backends.push(Backend {
+        provider: "od".into(),
+        upstream: "second-model".into(),
+    });
+    let state = AppState::new(cfg, env_file(&dir)).unwrap();
+    let app = build_router(state);
+    fake.queue("upstream-model", &[503]);
+    fake.queue("second-model", &[200]);
+
+    let response = app
+        .oneshot(chat_model("upstream-model", false))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        fake.hits(),
+        vec!["upstream-model".to_string(), "second-model".to_string()]
+    );
 }
 
 #[tokio::test]

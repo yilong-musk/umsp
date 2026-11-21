@@ -231,7 +231,7 @@ pub enum ModelCmd {
     Add(Box<ModelAddArgs>),
     /// Remove a model
     Remove { id: String },
-    /// Manage a model's backends (order = priority)
+    /// Manage a model's backends (config order is the tie-break)
     Backend {
         #[command(subcommand)]
         cmd: ModelBackendCmd,
@@ -246,7 +246,7 @@ pub enum ModelBackendCmd {
         /// provider:upstream
         #[arg(long = "backend")]
         backend: String,
-        /// Put it at the front — highest priority
+        /// Put it at the front of the tie-break order
         #[arg(long)]
         first: bool,
     },
@@ -262,7 +262,7 @@ pub enum ModelBackendCmd {
 pub struct ModelAddArgs {
     #[arg(long)]
     pub id: String,
-    /// Repeatable backend as `provider:upstream`; order is priority.
+    /// Repeatable backend as `provider:upstream`; order is the tie-break.
     #[arg(long = "backend", required = true, action = clap::ArgAction::Append)]
     pub backends: Vec<String>,
     /// Repeatable alias
