@@ -67,7 +67,7 @@ umsp login grok-2
 umsp model add --id grok-4.7 --backend grok:grok-4.7 --backend grok-2:grok-4.7
 ```
 
-The data plane speaks Responses only for this vendor and adds the Grok CLI proxy headers (`X-XAI-Token-Auth: xai-grok-cli`, `x-grok-model-override`) on the way up. API-key providers are unchanged.
+The data plane speaks Responses only for this vendor and adds the Grok CLI proxy headers (`X-XAI-Token-Auth: xai-grok-cli`, `x-grok-client-version`, `x-grok-model-override`) on the way up. `x-grok-client-version` defaults to 1.0.46; override it with `UMSP_GROK_CLI_VERSION` in the env file when xAI raises the minimum. API-key providers are unchanged.
 
 - **Vendors are built in**: only ids listed by `umsp vendor list` can be added; endpoint, protocols, and quirks are determined by `src/vendors.rs`, and `provider add` does not accept a custom base_url; an unknown vendor fails outright (exit code 2). Adding a vendor = adding one record in `src/vendors.rs` (and keeping the references valid in the `config.rs` validation).
 - **A provider is an independent instance**: every `provider add --vendor X` allocates a unique id (`X`, `X-2`, `X-3`…). The same vendor / same key can be added multiple times; each entry has its own id, circuit state, and metric labels, and none overwrites another. Without `--api-key-env` it defaults to `<ID>_API_KEY`; `--id` is only a readability hint.

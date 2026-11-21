@@ -266,6 +266,13 @@ async fn fake_chat(
             )
                 .into_response();
         }
+        "error426" => {
+            return (
+                StatusCode::UPGRADE_REQUIRED,
+                Json(json!({"error": {"message": "Your Grok CLI version (none) is outdated"}})),
+            )
+                .into_response();
+        }
         _ => {}
     }
     let choices = match mode.as_str() {
@@ -425,6 +432,13 @@ async fn fake_responses(
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(json!({"error": {"message": "bad upstream key", "type": "authentication_error", "code": "invalid_api_key"}})),
+            )
+                .into_response();
+        }
+        "error426" => {
+            return (
+                StatusCode::UPGRADE_REQUIRED,
+                Json(json!({"error": {"message": "Your Grok CLI version (none) is outdated"}})),
             )
                 .into_response();
         }
@@ -1221,6 +1235,24 @@ async fn upstream_401_becomes_a_neutral_gateway_error() {
         "the gateway could not authenticate with the upstream service"
     );
     assert_eq!(value["error"]["code"], "upstream_auth_failed");
+}
+
+#[tokio::test]
+async fn upstream_426_becomes_a_neutral_gateway_error() {
+    let dir = temp_dir("upstream-426");
+    let (app, _, _) = gateway(&dir, 50 * 1024 * 1024).await;
+    let response = app.oneshot(chat_request("error426")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        response.headers().get("x-umsp-code").unwrap(),
+        "upstream_client_outdated"
+    );
+    let value = body_json(response).await;
+    assert_eq!(value["error"]["code"], "upstream_client_outdated");
+    assert!(
+        !value.to_string().to_lowercase().contains("grok"),
+        "vendor client details must not leak: {value}"
+    );
 }
 
 #[tokio::test]
@@ -3916,9 +3948,17 @@ async fn oauth_accounts_send_independent_session_headers() {
     assert_eq!(auth(1), "Bearer token-account-a");
     assert_eq!(hdr(1, "x-xai-token-auth"), "xai-grok-cli");
     assert_eq!(hdr(1, "x-grok-model-override"), "grok-4.7");
+    assert_eq!(
+        hdr(1, "x-grok-client-version"),
+        umsp::sessions::GROK_CLI_VERSION
+    );
     assert_eq!(auth(2), "Bearer token-account-b");
     assert_eq!(hdr(2, "x-xai-token-auth"), "xai-grok-cli");
     assert_eq!(hdr(2, "x-grok-model-override"), "grok-4.7");
+    assert_eq!(
+        hdr(2, "x-grok-client-version"),
+        umsp::sessions::GROK_CLI_VERSION
+    );
     assert!(
         !std::fs::read_to_string(dir.join("sessions/grok.json"))
             .unwrap()
