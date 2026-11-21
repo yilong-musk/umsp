@@ -68,6 +68,8 @@ struct Inner {
     routes: Mutex<RouteTable>,
     /// Last successful upstream model-id list, keyed by provider id.
     catalog: RwLock<HashMap<String, Vec<String>>>,
+    /// When the catalog was last refreshed, automatic or manual.
+    catalog_refreshed_at: Mutex<Option<Instant>>,
     logs: LogStore,
     metrics: Metrics,
     sessions: SessionStore,
@@ -119,6 +121,7 @@ impl AppState {
                 circuits: CircuitBreaker::default(),
                 routes: Mutex::new(RouteTable::default()),
                 catalog: RwLock::new(HashMap::new()),
+                catalog_refreshed_at: Mutex::new(None),
                 logs,
                 metrics: Metrics::new(),
                 sessions,
@@ -276,6 +279,23 @@ impl AppState {
             .write()
             .expect("catalog lock poisoned")
             .insert(provider.to_string(), ids);
+    }
+
+    fn catalog_due(&self) -> bool {
+        self.inner
+            .catalog_refreshed_at
+            .lock()
+            .expect("catalog clock poisoned")
+            .map(|at| at.elapsed() >= CATALOG_INTERVAL)
+            .unwrap_or(true)
+    }
+
+    fn mark_catalog_refreshed(&self) {
+        *self
+            .inner
+            .catalog_refreshed_at
+            .lock()
+            .expect("catalog clock poisoned") = Some(Instant::now());
     }
 
     pub fn env(&self) -> &EnvFile {
@@ -903,6 +923,7 @@ pub fn build_router(state: AppState) -> Router {
             Router::new()
                 .route("/healthz", get(healthz_handler))
                 .route("/metrics", get(metrics_handler))
+                .route("/catalog/refresh", post(catalog_refresh_handler))
                 .route_layer(middleware::from_fn(admin_loopback_guard)),
         )
         .merge(api)
@@ -1100,7 +1121,7 @@ fn visible_models(cfg: &Config, client: Option<&str>, payload: &Value) -> Value 
     json!({ "object": "list", "data": data })
 }
 
-/// Admin endpoints (`/healthz`, `/metrics`) answer loopback peers only
+/// Admin endpoints (`/healthz`, `/metrics`, `/catalog/refresh`) answer loopback peers only
 /// (spec 6.2 / 8.5). A request with no `ConnectInfo` never crossed a socket —
 /// the in-process router used by tests — so it is allowed.
 async fn admin_loopback_guard(req: Request, next: Next) -> Response {
@@ -3963,8 +3984,8 @@ pub fn plog(
 /// How often an open DeepSeek circuit re-checks `/user/balance`.
 const BALANCE_INTERVAL: Duration = Duration::from_secs(300);
 /// How often each provider's model list is re-read. A failed read keeps the
-/// previous list.
-const CATALOG_INTERVAL: Duration = Duration::from_secs(600);
+/// previous list. `umsp catalog refresh` reads immediately and resets this clock.
+const CATALOG_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
 /// Grok billing is free; poll it often enough to keep the 5-minute snapshot fresh.
 const GROK_USAGE_INTERVAL: Duration = Duration::from_secs(240);
 /// How often the health task looks at the circuits at all.
@@ -3994,18 +4015,35 @@ fn balance_upstream(cfg: &Config, provider_id: &str) -> String {
         .unwrap_or_else(|| provider_id.to_string())
 }
 
-async fn refresh_catalog(state: &AppState) {
+async fn refresh_catalog(state: &AppState) -> Vec<Value> {
+    state.mark_catalog_refreshed();
     let cfg = state.cfg();
+    let mut rows = Vec::new();
     for provider in &cfg.providers {
         match fetch_model_ids(state, provider).await {
             Ok(ids) => {
                 let count = ids.len();
                 state.note_catalog(&provider.id, ids);
                 plog_health("catalog", &provider.id, "", &format!("models_{count}"));
+                rows.push(json!({"id": provider.id, "models": count}));
             }
-            Err(err) => plog_health("catalog_failed", &provider.id, "", &err),
+            Err(err) => {
+                plog_health("catalog_failed", &provider.id, "", &err);
+                rows.push(json!({"id": provider.id, "error": err}));
+            }
         }
     }
+    rows
+}
+
+async fn catalog_refresh_handler(State(state): State<AppState>) -> Response {
+    let providers = refresh_catalog(&state).await;
+    let body = serde_json::to_vec(&json!({"ok": true, "providers": providers})).unwrap_or_default();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .expect("valid response")
 }
 
 async fn fetch_model_ids(
@@ -4065,17 +4103,12 @@ async fn health_loop(state: AppState) {
     let mut last_balance: HashMap<String, Instant> = HashMap::new();
     let mut last_grok_usage: HashMap<String, Instant> = HashMap::new();
     let mut grok_user_ids: HashMap<String, String> = HashMap::new();
-    let mut last_catalog: Option<Instant> = None;
     loop {
         ticker.tick().await;
-        let catalog_due = last_catalog
-            .map(|at| at.elapsed() >= CATALOG_INTERVAL)
-            .unwrap_or(true);
-        if catalog_due {
-            last_catalog = Some(Instant::now());
+        if state.catalog_due() {
             let refresh = state.clone();
             tokio::spawn(async move {
-                refresh_catalog(&refresh).await;
+                let _ = refresh_catalog(&refresh).await;
             });
         }
         let cfg = state.cfg();
