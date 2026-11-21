@@ -2919,6 +2919,10 @@ impl ScriptedFake {
     fn die_in_stream(&self) {
         self.stream_dies.store(true, Ordering::SeqCst);
     }
+
+    fn heal_stream(&self) {
+        self.stream_dies.store(false, Ordering::SeqCst);
+    }
 }
 
 async fn scripted_handler(
@@ -3437,6 +3441,89 @@ async fn a_successful_provider_sticks_until_it_fails() {
     );
     assert_eq!(records[2].provider, "od");
     assert_eq!(records[2].fallbacks, 0);
+}
+
+#[tokio::test]
+async fn open_circuit_still_uses_a_closed_fallback() {
+    let dir = temp_dir("circuit-fb");
+    let (root, fake) = start_scripted().await;
+    let cfg = m4b_config(&dir, format!("{root}/v1"), root, true);
+    let state = AppState::new(cfg, env_file(&dir)).unwrap();
+    assert!(
+        state
+            .circuits()
+            .force_open("od", "test", Duration::from_secs(60))
+    );
+    let app = build_router(state);
+    fake.queue("fallback-model", &[200, 200]);
+
+    let response = app
+        .clone()
+        .oneshot(chat_model("upstream-model", false))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        fake.hits_of("upstream-model"),
+        0,
+        "an open circuit must not be called"
+    );
+
+    // The fallback is now pinned, so the next request skips the open provider again.
+    let response = app
+        .oneshot(chat_model("upstream-model", false))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(fake.hits_of("upstream-model"), 0);
+    assert_eq!(fake.hits_of("fallback-model"), 2);
+}
+
+#[tokio::test]
+async fn a_stream_that_dies_after_200_unpins_the_provider() {
+    let dir = temp_dir("route-stream-unpin");
+    let (app, fake) = m4b_gateway(&dir, true).await;
+
+    // First request: primary fails, fallback succeeds, so the model pins deepseek.
+    fake.queue("upstream-model", &[500]);
+    fake.queue("fallback-model", &[200]);
+    let response = app
+        .clone()
+        .oneshot(chat_model("upstream-model", false))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // The pinned stream starts with 200 and then dies: the pump must unpin it.
+    fake.die_in_stream();
+    let response = app
+        .clone()
+        .oneshot(chat_model("upstream-model", true))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    fake.heal_stream();
+
+    // With the pin gone, selection falls back to configuration order (od first).
+    fake.queue("upstream-model", &[200]);
+    let response = app
+        .oneshot(chat_model("upstream-model", false))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        fake.hits(),
+        vec![
+            "upstream-model".to_string(),
+            "fallback-model".to_string(),
+            "fallback-model".to_string(),
+            "upstream-model".to_string(),
+        ]
+    );
 }
 
 #[tokio::test]

@@ -24,7 +24,7 @@ use crate::keys;
 use crate::metrics::Metrics;
 use crate::quirks;
 use crate::registry;
-use crate::route::{PinDrop, PlanKind, RouteTable, UsageWindow};
+use crate::route::{PinDrop, PlanKind, RouteTable};
 use crate::sessions::{self, SessionError, SessionStore};
 use crate::stream;
 use crate::upstream::{self, forward_request_headers, relay_response_headers};
@@ -124,16 +124,6 @@ impl AppState {
 
     pub fn circuits(&self) -> &CircuitBreaker {
         &self.inner.circuits
-    }
-
-    /// Record usage windows observed for `provider`. Selection reads this on
-    /// later requests and does not refresh it itself.
-    pub fn note_provider_usage(&self, provider: &str, windows: Vec<UsageWindow>) {
-        self.inner
-            .routes
-            .lock()
-            .expect("route lock poisoned")
-            .note_usage(provider, windows);
     }
 
     /// Record a balance observation. `total` is the upstream's decimal string.
@@ -2444,10 +2434,7 @@ async fn proxy_non_stream(
     let mut translation_error: Option<String> = None;
     let mut last: Option<(AttemptResult, AttemptTarget, Vec<String>)> = None;
 
-    loop {
-        let Some(target) = cursor.next(&state, &model.id, &candidates) else {
-            break;
-        };
+    while let Some(target) = cursor.next(&state, &model.id, &candidates) {
         if let Some(prev) = &previous {
             fallbacks_used += 1;
             plog_fallback(
@@ -3191,10 +3178,7 @@ async fn proxy_stream(
         Vec<String>,
     )> = None;
 
-    loop {
-        let Some(target) = cursor.next(&state, &model.id, &candidates) else {
-            break;
-        };
+    while let Some(target) = cursor.next(&state, &model.id, &candidates) {
         if let Some(prev) = &previous {
             fallbacks_used += 1;
             plog_fallback(
@@ -3751,6 +3735,16 @@ async fn pump_stream(
         }
     }
 
+    // A stream that failed after its 200 is evidence against the provider:
+    // drop the five-hour pin so the next request can select again.
+    if !disconnected {
+        if let Some(code) = record.error_code.clone() {
+            if state.forget_route(&record.requested_model, &provider_id) {
+                plog_route("route_unpin", &record.requested_model, &provider_id, &code);
+            }
+        }
+    }
+
     record.client_disconnected = disconnected;
     record.bytes_out = bytes_out;
     record.duration_ms = started.elapsed().as_millis() as u64;
@@ -3915,7 +3909,7 @@ async fn health_loop(state: AppState) {
         for provider in &cfg.providers {
             let view = circuits.view(&provider.id);
             // DeepSeek balance is free. Refresh it for healthy providers too, so
-            // selection can see a balance-only provider without waiting for a failure.
+            // selection can skip an exhausted account without waiting for a failure.
             if provider.quirks.as_deref() == Some("deepseek") {
                 let due = last_balance
                     .get(&provider.id)

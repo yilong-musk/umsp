@@ -293,11 +293,11 @@ these routes stay same-protocol passthrough.
 ### Backend failover and circuit breaking
 
 - **backends**: `[[models]] backends = [{ provider, upstream }, ...]`. A request considers only
-  those backends. Healthy ones are ordered by fresh usage windows (less remaining first, shorter
-  window first), then providers with neither usage nor balance data, then balance-only providers.
-  Configuration order breaks ties. The provider that serves a model is remembered for five hours
-  and is reused until that record expires or the provider cannot take a request. Failover happens
-  only **before any response bytes have been sent to the client** (once SSE has returned 200, it no
+  those backends. A provider is skipped when its circuit is open or, for DeepSeek, a fresh balance
+  observation says the account is unavailable or empty. Healthy providers are tried in
+  configuration order; the provider that serves a model is remembered for five hours and is
+  reused until that record expires or the provider cannot take a request. Failover happens only
+  **before any response bytes have been sent to the client** (once SSE has returned 200, it no
   longer switches), and each backend is tried at most once.
 - **Retryable**: connection errors, timeouts, 429, 5xx, 402; **not retried**: 400/401/403/404/422
   (401 is an upstream key misconfiguration; switching backends would only burn through every vendor).
@@ -560,7 +560,7 @@ context_length = 1048000            # flattened context_length (Hermes reads thi
 max_completion_tokens = 128000
 capabilities = ["text", "vision", "tools", "reasoning"]
 display_name = "DeepSeek V4.1 Flash"
-backends = [                        # tie-break order after usage and balance selection
+backends = [                        # tie-break order; balance only gates health selection
   { provider = "open-design", upstream = "deepseek-v4.1-flash" },
   { provider = "deepseek",    upstream = "deepseek-flash" },
 ]

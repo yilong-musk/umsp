@@ -151,7 +151,7 @@ umsp model backend add claude-haiku-5.5 \
 # env 文件里的密钥只看掩码
 umsp env list
 
-# 一个逻辑模型，两个上游后端。配置顺序是用量和余额排序之后的平局打破规则。
+# 一个逻辑模型，两个上游后端。配置顺序就是尝试顺序，余额只决定是否跳过。
 umsp model add --id deepseek-v4.1-flash \
   --backend open-design:deepseek-v4.1-flash \
   --backend deepseek:deepseek-flash \
@@ -264,11 +264,10 @@ Prometheus 文本格式（`text/plain; version=0.0.4; charset=utf-8`），全部
 
 ### 后端切换与熔断
 
-- **backends**：`[[models]] backends = [{ provider, upstream }, ...]`。请求只考虑这些后端。健康
-  的按新鲜用量窗口排序（剩余越少越优先，先比更短的窗口），然后是用量和余额都没有的，最后才是
-  只有余额的。配置顺序用来打破平局。真正服务这个模型的 provider 会记住 5 小时，直到记录过期或
-  这家调不通。切换只发生在**尚未向客户端发出任何响应字节**之前（SSE 一旦返回 200 就不再切），
-  每个后端最多试一次。
+- **backends**：`[[models]] backends = [{ provider, upstream }, ...]`。请求只考虑这些后端。
+  provider 的熔断打开，或（DeepSeek）最新余额观测显示不可用/为空时，会被跳过。健康的 provider
+  按配置顺序尝试；真正服务该模型的 provider 会记住 5 小时，直到记录过期或这家调不通。切换只
+  发生在**尚未向客户端发出任何响应字节**之前（SSE 一旦返回 200 就不再切），每个后端最多试一次。
 - **可重试**：连接错误、超时、429、5xx、402；**不重试**：400/401/403/404/422（401 是上游 key
   配置错误，换后端只会把几家都打爆）。所有后端都失败时，客户端拿到中性网关错误（`upstream_error`，502）；
   上游原始状态与 body 留在账本（`upstream_status` / `upstream_body`）。`count_tokens` 只会选实现了它的后端。
@@ -500,7 +499,7 @@ context_length = 1048000            # 拍平后的 context_length（Hermes 读�
 max_completion_tokens = 128000
 capabilities = ["text", "vision", "tools", "reasoning"]
 display_name = "DeepSeek V4.1 Flash"
-backends = [                        # 用量和余额排序之后的平局顺序
+backends = [                        # 平局顺序；余额只决定是否跳过
   { provider = "open-design", upstream = "deepseek-v4.1-flash" },
   { provider = "deepseek",    upstream = "deepseek-flash" },
 ]

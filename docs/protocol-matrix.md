@@ -1,6 +1,6 @@
 # Protocol matrix
 
-All three entry points share the same model registry and the same set of client keys. A registered model can be called on any of the three. When the provider lists the client's protocol, that attempt is forwarded unchanged. When it does not, the attempt is translated into the first protocol in the provider's own list and the response is translated back. Configuration order is the tie-break after usage and balance. `count_tokens` is not translated and does not read or write the model's provider pin.
+All three entry points share the same model registry and the same set of client keys. A registered model can be called on any of the three. When the provider lists the client's protocol, that attempt is forwarded unchanged. When it does not, the attempt is translated into the first protocol in the provider's own list and the response is translated back. Providers with an open circuit or an exhausted balance are skipped; otherwise configuration order decides. `count_tokens` is not translated and does not read or write the model's provider pin.
 
 | Dimension | Chat Completions | Responses | Anthropic Messages |
 |---|---|---|---|

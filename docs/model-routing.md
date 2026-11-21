@@ -6,7 +6,7 @@ Since 2026-11-20, models and providers are decoupled: **a model is a logical ent
 
 - Callers only know model ids (for example `deepseek-v4.1-flash`); `/v1/models` contains exactly one entry per model.
 - provider / upstream never appear in model ids, `/v1/models`, or `allowed_models`.
-- A model may have multiple backends. Among healthy providers, one with a fresh usage window is preferred (less remaining first, and the shorter window before the longer one), then one with neither usage nor balance data, then one with only a balance. Configuration order breaks ties. The provider that serves the model sticks for five hours, or until it cannot take a request.
+- A model may have multiple backends. A provider is skipped when its circuit is open or, for DeepSeek, a fresh balance observation says the account is unavailable or empty. Healthy providers are tried in configuration order. The provider that serves the model sticks for five hours, or until it cannot take a request.
 
 ## Configuration
 
@@ -80,7 +80,7 @@ The data plane speaks Responses only for this vendor and adds the Grok CLI proxy
 ## Resolution and routing
 
 1. The request's `model` is first matched exactly against `id`, then against aliases; neither → 404 `model_not_found`.
-2. Candidate backends = entries in `backends` whose provider exists and speaks at least one protocol. Healthy ones are ordered by fresh usage windows (less remaining first, shorter window first), then providers with neither usage nor balance data, then balance-only providers. Configuration order breaks ties. A live pin for the model is tried first for five hours. `count_tokens` still requires a Messages backend that can proxy it, and it does not read or write that pin. The attempt uses the client protocol when the provider lists it, and otherwise translates into the first protocol in that provider's list.
+2. Candidate backends = entries in `backends` whose provider exists and speaks at least one protocol. Providers whose circuit is open, or whose fresh balance is unavailable or empty (DeepSeek), are skipped; the rest stay in configuration order. A live pin for the model is tried first for five hours. `count_tokens` still requires a Messages backend that can proxy it, and it does not read or write that pin. The attempt uses the client protocol when the provider lists it, and otherwise translates into the first protocol in that provider's list.
 3. Try that order; only retryable failures (connection errors, timeouts, 429, 5xx, 402) move on to the next backend, while 400/401/403/404/422 return immediately. A retryable failure of one upstream still tries a later backend of the same provider. 402 and an open circuit skip the rest of that provider.
 4. Each backend is tried at most once; the list is linear, so no loop exists.
 5. Switching happens only before any byte has been sent to the client; once SSE has returned 200 there is no further switching.
