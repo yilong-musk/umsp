@@ -163,7 +163,7 @@ umsp model backend add claude-haiku-5.5 \
 # Keys in the env file are shown masked only
 umsp env list
 
-# One logical model, two upstream backends. Config order is the tie-break after usage and balance.
+# One logical model, two upstream backends. Config order is the order; balance only gates health.
 umsp model add --id deepseek-v4.1-flash \
   --backend open-design:deepseek-v4.1-flash \
   --backend deepseek:deepseek-flash \
