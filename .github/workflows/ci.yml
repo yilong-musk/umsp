@@ -15,6 +15,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - name: deploy script
+        run: bash scripts/deploy-host-test.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -59,15 +61,7 @@ jobs:
       - name: package
         run: |
           set -eu
-          version="$(awk -F'"' '/^\[package\]/{p=1;next} p && /^version *=/{print $2; exit}' Cargo.toml)"
-          stage="dist/umsp-${version}-x86_64-linux-musl"
-          mkdir -p "$stage"
-          install -m 755 target/x86_64-unknown-linux-musl/release/umsp "$stage/umsp"
-          install -m 644 config.example.toml "$stage/config.example.toml"
-          install -m 644 deploy/umsp.service "$stage/umsp.service"
-          install -m 644 README.md "$stage/README.md"
-          tar -C dist -czf "dist/umsp-${version}-x86_64-linux-musl.tar.gz" "umsp-${version}-x86_64-linux-musl"
-          sha256sum "dist/umsp-${version}-x86_64-linux-musl.tar.gz" > "dist/umsp-${version}-x86_64-linux-musl.tar.gz.sha256"
+          ./scripts/stage-release.sh target/x86_64-unknown-linux-musl/release/umsp
           ls -l dist
       - uses: actions/upload-artifact@v4
         with:

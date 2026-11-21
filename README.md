@@ -31,7 +31,11 @@ sha256sum -c umsp-<version>-x86_64-unknown-linux-musl.tar.gz.sha256
 file ~/.local/bin/umsp                   # statically linked
 ```
 
-Build from source (static musl):
+Pushing an annotated tag `vX.Y.Z` (the number must match `version` in `Cargo.toml`)
+publishes this archive and installs it on the configured host. See
+[GitHub release deploy](docs/operations.md#github-release-deploy).
+
+### Build from source
 
 ```bash
 sudo apt-get install -y musl-tools

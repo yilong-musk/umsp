@@ -1,0 +1,168 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to redeploy (vX.Y.Z)"
+        required: true
+        type: string
+
+# One production install at a time. A second tag waits; it does not cancel
+# a deploy that may already have swapped the binary.
+concurrency:
+  group: umsp-production-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: fmt + clippy + test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: tag matches Cargo.toml and is on main
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          ver="$(awk -F'"' '/^\[package\]/{p=1; next} p && /^version *=/{print $2; exit}' Cargo.toml)"
+          [[ "$tag" == "v${ver}" ]]
+          git fetch origin main
+          git merge-base --is-ancestor HEAD origin/main
+      - name: deploy script
+        run: bash scripts/deploy-host-test.sh
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: language check
+        run: cargo run --quiet --manifest-path tools/langcheck/Cargo.toml
+      - name: cargo test
+        run: cargo test --locked
+
+  deny:
+    name: cargo deny
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  package:
+    name: musl archive
+    if: github.event_name == 'push'
+    needs: [test, deny]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: musl
+      - name: install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: build
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          AR_x86_64_unknown_linux_musl: ar
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+      - name: package
+        run: ./scripts/stage-release.sh target/x86_64-unknown-linux-musl/release/umsp
+      - uses: actions/upload-artifact@v4
+        with:
+          name: umsp-musl
+          path: |
+            dist/umsp-*.tar.gz
+            dist/umsp-*.tar.gz.sha256
+
+  publish:
+    name: github release
+    if: github.event_name == 'push'
+    needs: [package]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: umsp-musl
+          path: dist
+      - name: publish assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          ls -l dist
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/*.tar.gz dist/*.sha256 --clobber
+          else
+            gh release create "$tag" dist/*.tar.gz dist/*.sha256 \
+              --title "$tag" \
+              --notes "Static musl build of UMSP ${tag}."
+          fi
+          gh release view "$tag" --json tagName,assets \
+            --jq '{tag: .tagName, assets: [.assets[].name]}'
+
+  deploy:
+    name: deploy host
+    needs: [publish]
+    if: >-
+      always() && (
+        needs.publish.result == 'success' ||
+        (github.event_name == 'workflow_dispatch' && needs.publish.result == 'skipped')
+      )
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: install the release
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "refusing tag" >&2
+            exit 2
+          fi
+          for name in DEPLOY_SSH_KEY DEPLOY_HOST DEPLOY_USER DEPLOY_KNOWN_HOSTS; do
+            if [[ -z "${!name}" ]]; then
+              echo "missing secret ${name}" >&2
+              exit 1
+            fi
+          done
+          install -d -m 700 "${HOME}/.ssh"
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "${HOME}/.ssh/umsp_deploy"
+          chmod 600 "${HOME}/.ssh/umsp_deploy"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "${HOME}/.ssh/umsp_known_hosts"
+          ssh -i "${HOME}/.ssh/umsp_deploy" \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="${HOME}/.ssh/umsp_known_hosts" \
+            -o ConnectTimeout=20 \
+            "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "deploy ${TAG}"

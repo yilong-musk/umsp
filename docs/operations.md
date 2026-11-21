@@ -144,8 +144,9 @@ systemctl --user status umsp
 journalctl --user -u umsp -f
 ```
 
-`EnvironmentFile=%h/.config/umsp/env` injects upstream keys via systemd; `ProtectHome=read-only` +
-`ReadWritePaths=%h/.local/share/umsp` ensure only the ledger directory is writable.
+`EnvironmentFile=%h/.config/umsp/env` injects upstream keys via systemd. `ProtectHome=read-only`
+and `ReadWritePaths=%h/.local/share/umsp %h/.config/umsp/sessions` leave the rest of the home
+directory read-only: the process may write the ledger and OAuth session files, nothing else.
 
 Hardening already baked into the unit (`deploy/umsp.service`, passes `systemd-analyze verify`):
 
@@ -154,12 +155,66 @@ Hardening already baked into the unit (`deploy/umsp.service`, passes `systemd-an
 | `MemoryMax` | `256M` | If exceeded, the process is OOM-killed by the cgroup and restarted via `Restart=on-failure` (measured peak 14 MB, ample headroom) |
 | `TasksMax` | `256` | Thread/task limit |
 | `LimitNOFILE` | `8192` | Concurrent connection fd limit |
-| `NoNewPrivileges` / `ProtectSystem=strict` / `ProtectHome=read-only` | — | Read-only system and home directories, with only the ledger directory writable |
+| `NoNewPrivileges` / `ProtectSystem=strict` / `ProtectHome=read-only` | — | Read-only system and home directories; only the ledger directory and `sessions/` are writable |
 | `PrivateTmp` | `true` | Private /tmp |
 
 Prerequisites: `~/.local/bin/umsp` exists, `umsp init` has generated
 `~/.config/umsp/{config.toml,env}`, and `umsp doctor` is all green. `umsp doctor` probes `/metrics`
 when serve is running (skipped = not running, not counted as failure).
+
+---
+
+## GitHub release deploy
+
+Pushing an annotated tag `vX.Y.Z` is the production deploy. `X.Y.Z` must equal
+`version` in `Cargo.toml` (no pre-release suffix), and the tagged commit must
+already be on `main`.
+
+[`.github/workflows/release.yml`](../.github/workflows/release.yml) then:
+
+1. Runs fmt, clippy, tests, the English-only check, and `cargo deny`.
+2. Builds `umsp-<version>-x86_64-unknown-linux-musl.tar.gz` and publishes it
+   as a GitHub Release.
+3. Opens SSH and runs exactly `deploy vX.Y.Z`.
+
+The deploy key is forced to `~/.local/bin/umsp-deploy` (`scripts/deploy-host.sh`).
+That command can only download a `vX.Y.Z` release of this repository. It checks
+the checksum and the archive member list, requires a static binary whose
+`umsp version --json` matches the tag, then swaps `~/.local/bin/umsp`. The user
+unit is replaced only when `deploy/umsp.service` changed. Config, the env file,
+`sessions/`, and the ledger are never written. If `GET /healthz` does not report
+the tag's version with a small `uptime_s`, the previous binary and unit are put
+back and the service is restarted again.
+
+An unchanged checksum with a healthy `/healthz` does not restart the process.
+Redeploy a tag that is already published from Actions → **release** → **Run
+workflow** (input `vX.Y.Z`). That path downloads the existing asset; it does
+not rebuild.
+
+Prepare a host once:
+
+```bash
+install -m 0755 scripts/deploy-host.sh ~/.local/bin/umsp-deploy
+```
+
+Add one `authorized_keys` line (the key cannot open a shell):
+
+```text
+restrict,command="/home/ubuntu/.local/bin/umsp-deploy" ssh-ed25519 AAAA... umsp-deploy
+```
+
+Repository secrets, set on the host's terms: `DEPLOY_HOST`, `DEPLOY_USER`,
+`DEPLOY_SSH_KEY` (the matching private key), `DEPLOY_KNOWN_HOSTS` (one
+`ssh-keyscan` line for that host).
+
+Roll back the last swap by hand:
+
+```bash
+install -m 0755 ~/.local/bin/umsp.bak ~/.local/bin/umsp
+install -m 0644 ~/.config/systemd/user/umsp.service.bak ~/.config/systemd/user/umsp.service
+systemctl --user daemon-reload
+systemctl --user restart umsp
+```
 
 ---
 
