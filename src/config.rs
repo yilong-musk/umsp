@@ -225,8 +225,9 @@ pub struct Model {
     pub display_name: Option<String>,
     #[serde(default = "default_created")]
     pub created: i64,
-    /// Upstream backends that can serve this model, in priority order. A model
-    /// is one logical entry for clients; providers are an implementation detail.
+    /// Upstream backends that can serve this model. Configuration order is the
+    /// tie-break after usage and balance. A model is one logical entry for
+    /// clients; providers are an implementation detail.
     #[serde(default)]
     pub backends: Vec<Backend>,
     #[serde(default)]
@@ -736,8 +737,9 @@ quirks = "deepseek"
 # protocols = ["responses"]
 
 # A model is one logical entry for clients. `backends` lists the upstreams that
-# can serve it, in priority order: the first healthy one wins, and later ones
-# cover retryable failures (same protocol, one hop each, never a loop).
+# can serve it. Healthy providers are ordered by usage, then unknown capacity,
+# then balance; this list is only the tie-break. Later backends cover retryable
+# failures (same protocol, one hop each, never a loop).
 # Providers and upstream ids stay internal; clients only see `id`/aliases.
 [[models]]
 id = "deepseek-v4.1-flash"

@@ -25,7 +25,7 @@ budget/rate-limiting logic.
 > non-streaming and streaming SSE pass-through for the three protocols OpenAI Chat Completions /
 > OpenAI Responses / Anthropic Messages across **multiple upstreams** (OpenDesign / DeepSeek),
 > `/v1/messages/count_tokens` (proxied for DS / 501 for OD), **failover across the backend list**,
-> **provider circuit breaking**, **DS balance health**, request ledger and `umsp usage`.
+> **provider circuit breaking**, **capacity-aware backend selection**, **DS balance health**, request ledger and `umsp usage`.
 > Budget/RPM limits are out of scope for this milestone.
 > See `docs/model-routing.md` for the model and routing design; see `docs/quirks.md` and
 > `docs/protocol-matrix.md` for protocol details. `docs/internal/m0-…m5-verification.md` are historical
@@ -117,7 +117,7 @@ config path globally.
 | `umsp logout <provider>` | Delete that provider's session file |
 | `umsp env list\|set\|unset` | Manage upstream keys in the env file (masked display only; `set` hides input on a TTY) |
 | `umsp model list [--aliases]\|add\|remove` | Manage the local model registry (logical id + aliases) |
-| `umsp model backend add\|remove` | Attach/detach a backend for an existing model (`--first` inserts at the front, i.e. highest priority) |
+| `umsp model backend add\|remove` | Attach/detach a backend for an existing model (`--first` inserts at the front of the tie-break order) |
 | `umsp client list\|add\|remove\|rotate` | Manage client keys (only SHA-256 stored) |
 | `umsp key list\|add\|revoke` | Compatibility alias for `client` |
 | `umsp usage summary\|by-client\|by-model\|by-protocol\|prune` | Aggregate the JSONL ledger |
@@ -158,14 +158,14 @@ umsp model add --id grok-4.7 --backend grok:grok-4.7 --backend grok-2:grok-4.7
 # The gateway sends the required x-grok-client-version; if xAI raises the
 # minimum, set UMSP_GROK_CLI_VERSION in the env file and restart.
 
-# Attach another backend to an existing model (insert at the front = highest priority)
+# Attach another backend to an existing model (insert at the front of the tie-break order)
 umsp model backend add claude-haiku-5.5 \
   --backend deepseek-2:deepseek-flash --first
 
 # Keys in the env file are shown masked only
 umsp env list
 
-# One logical model, two upstream backends; order is priority (the next is tried only if the previous fails)
+# One logical model, two upstream backends. Config order breaks ties; usage gates selection.
 umsp model add --id deepseek-v4.1-flash \
   --backend open-design:deepseek-v4.1-flash \
   --backend deepseek:deepseek-flash \
@@ -188,7 +188,7 @@ with `--no-reload`).
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| GET | `/healthz` | No | Gateway and provider status, including `circuit`/`failures`/`opened_at`/`reason`; `?probe=1` performs a real probe (cached 30s; DS checks balance first so no tokens are spent) |
+| GET | `/healthz` | No | Gateway and provider status, including `circuit`/`failures`/`opened_at`/`reason` and a fresh `usage` snapshot (`remaining_fraction`, `windows`, `reset_in_s`); `?probe=1` performs a real probe (cached 30s; DS checks balance first so no tokens are spent) |
 | GET | `/metrics` | No | Prometheus text (`text/plain; version=0.0.4`), aggregated in memory, does not hit upstreams; loopback only (non-loopback sources get 403 `loopback_only`) |
 | HEAD | `/api/hello` | No | 204, Claude Code connection warm-up |
 | GET | `/v1/models` | Yes | Local registry, with flattened `context_length` / `max_completion_tokens` / `capabilities` / `display_name` |
@@ -294,11 +294,15 @@ these routes stay same-protocol passthrough.
 
 ### Backend failover and circuit breaking
 
-- **backends**: `[[models]] backends = [{ provider, upstream }, ...]`, order is priority. Each
-  request tries them in order, failing over only to backends that use the **same protocol** and can
-  serve it; each backend is tried at most once, so loops are impossible. Failover happens only
-  **before any response bytes have been sent to the client** (once SSE has returned 200, it no longer
-  switches).
+- **backends**: `[[models]] backends = [{ provider, upstream }, ...]`. A request considers only
+  those backends. A provider is skipped when its circuit is open or a fresh usage window is
+  exhausted. Providers with fresh usage (U) are tried before providers with neither usage nor a
+  usable balance (X), which are tried before balance-only providers (B). U is ranked by the
+  tightest remaining fraction; only fractions are compared, never request/token/currency
+  absolutes. The provider that serves a model is remembered for five hours and is reused until
+  that record expires or the provider cannot take a request. Failover happens only **before any
+  response bytes have been sent to the client** (once SSE has returned 200, it no longer switches),
+  and each backend is tried at most once.
 - **Retryable**: connection errors, timeouts, 429, 5xx, 402; **not retried**: 400/401/403/404/422
   (401 is an upstream key misconfiguration; switching backends would only burn through every vendor).
   When all backends fail, the client gets a neutral gateway error (`upstream_error`, 502); the raw
@@ -560,7 +564,7 @@ context_length = 1048000            # flattened context_length (Hermes reads thi
 max_completion_tokens = 128000
 capabilities = ["text", "vision", "tools", "reasoning"]
 display_name = "DeepSeek V4.1 Flash"
-backends = [                        # order is priority; the next is tried only after one fails
+backends = [                        # tie-break order; usage and balance gate health selection
   { provider = "open-design", upstream = "deepseek-v4.1-flash" },
   { provider = "deepseek",    upstream = "deepseek-flash" },
 ]

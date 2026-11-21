@@ -44,8 +44,9 @@ quirks = "deepseek"
 # protocols = ["responses"]
 
 # A model is one logical entry for clients. `backends` lists the upstreams that
-# can serve it, in priority order: the first healthy one wins, and later ones
-# cover retryable failures (same protocol, one hop each, never a loop).
+# can serve it. Providers with an open circuit or an exhausted balance are
+# skipped; otherwise this list is the order. Later backends cover retryable
+# failures (same protocol, one hop each, never a loop).
 # Providers and upstream ids stay internal; clients only see `id`/aliases.
 [[models]]
 id = "deepseek-v4.1-flash"

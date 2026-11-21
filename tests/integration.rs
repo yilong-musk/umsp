@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
 use axum::extract::State;
@@ -17,6 +17,7 @@ use tower::ServiceExt;
 use umsp::config::{Backend, Client, Config, Model, PROTOCOLS, Provider, ServerConfig};
 use umsp::envfile::EnvFile;
 use umsp::keys;
+use umsp::route::UsageWindow;
 use umsp::server::{AppState, build_router};
 use umsp::usage::{LogStore, RequestRecord};
 
@@ -2951,6 +2952,10 @@ impl ScriptedFake {
     fn die_in_stream(&self) {
         self.stream_dies.store(true, Ordering::SeqCst);
     }
+
+    fn heal_stream(&self) {
+        self.stream_dies.store(false, Ordering::SeqCst);
+    }
 }
 
 async fn scripted_handler(
@@ -3331,6 +3336,41 @@ async fn not_found_never_opens_the_circuit() {
 }
 
 #[tokio::test]
+async fn a_spent_usage_window_skips_the_only_provider() {
+    let dir = temp_dir("usage-spent");
+    let (upstream, rec) = start_upstream().await;
+    let cfg = config(&dir, upstream, 52_428_800);
+    let state = AppState::new(cfg, env_file(&dir)).unwrap();
+    let now = Instant::now();
+    state.note_provider_usage(
+        "od",
+        UsageWindow {
+            duration: Duration::from_secs(7 * 86400),
+            remaining_fraction: 0.0,
+            reset_at: Some(now + Duration::from_secs(3600)),
+            observed_at: now,
+        },
+    );
+    let app = build_router(state);
+
+    let response = app
+        .clone()
+        .oneshot(chat_model("upstream-model", false))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let response = app
+        .oneshot(chat_model("upstream-model", true))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        rec.seen.lock().unwrap().is_empty(),
+        "a spent provider must not be called"
+    );
+}
+
+#[tokio::test]
 async fn half_open_probe_client_error_does_not_wedge_the_circuit() {
     let dir = temp_dir("circuit-probe-404");
     let (root, fake) = start_scripted().await;
@@ -3408,31 +3448,15 @@ async fn cancelled_half_open_probe_releases_the_slot() {
 }
 
 #[tokio::test]
-async fn open_circuit_still_uses_a_closed_fallback() {
-    let dir = temp_dir("circuit-fb");
+async fn a_successful_provider_sticks_until_it_fails() {
+    let dir = temp_dir("route-pin");
     let (app, fake) = m4b_gateway(&dir, true).await;
-    fake.queue("upstream-model", &[500; 5]);
+    fake.queue("upstream-model", &[500, 200]);
+    fake.queue("fallback-model", &[200, 500]);
 
-    // Five requests: primary fails, the fallback answers.
-    for _ in 0..5 {
-        let response = app
-            .clone()
-            .oneshot(chat_model("upstream-model", false))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(
-            !response.headers().contains_key("x-umsp-provider"),
-            "provider header must not leak to clients"
-        );
-    }
-    let health = body_json(app.clone().oneshot(healthz_request()).await.unwrap()).await;
-    assert_eq!(health["providers"]["od"]["circuit"], "open");
-    assert_eq!(fake.hits_of("upstream-model"), 5);
-
-    // Sixth request: the circuit rejects the primary before any call; the
-    // fallback still serves it, and only one hop is allowed.
+    // Primary fails, fallback answers, and the model pins the fallback.
     let response = app
+        .clone()
         .oneshot(chat_model("upstream-model", false))
         .await
         .unwrap();
@@ -3441,15 +3465,158 @@ async fn open_circuit_still_uses_a_closed_fallback() {
         !response.headers().contains_key("x-umsp-provider"),
         "provider header must not leak to clients"
     );
+
+    // The pin fails, so the request selects again and the primary answers.
+    let response = app
+        .clone()
+        .oneshot(chat_model("upstream-model", false))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // The new pin is the primary. The fallback is not called.
+    let response = app
+        .oneshot(chat_model("upstream-model", false))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        fake.hits(),
+        vec![
+            "upstream-model".to_string(),
+            "fallback-model".to_string(),
+            "fallback-model".to_string(),
+            "upstream-model".to_string(),
+            "upstream-model".to_string(),
+        ]
+    );
+    let records = wait_records(&dir, 3).await;
+    assert_eq!(records[0].provider, "deepseek");
+    assert_eq!(records[0].fallbacks, 1);
+    assert!(
+        records[0]
+            .quirks
+            .iter()
+            .any(|quirk| quirk == "fallback_from:od")
+    );
+    assert_eq!(records[1].provider, "od");
+    assert_eq!(records[1].fallbacks, 1);
+    assert!(
+        records[1]
+            .quirks
+            .iter()
+            .any(|quirk| quirk == "fallback_from:deepseek")
+    );
+    assert_eq!(records[2].provider, "od");
+    assert_eq!(records[2].fallbacks, 0);
+}
+
+#[tokio::test]
+async fn open_circuit_still_uses_a_closed_fallback() {
+    let dir = temp_dir("circuit-fb");
+    let (root, fake) = start_scripted().await;
+    let cfg = m4b_config(&dir, format!("{root}/v1"), root, true);
+    let state = AppState::new(cfg, env_file(&dir)).unwrap();
+    assert!(
+        state
+            .circuits()
+            .force_open("od", "test", Duration::from_secs(60))
+    );
+    let app = build_router(state);
+    fake.queue("fallback-model", &[200, 200]);
+
+    let response = app
+        .clone()
+        .oneshot(chat_model("upstream-model", false))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         fake.hits_of("upstream-model"),
-        5,
-        "an open circuit must not be retried"
+        0,
+        "an open circuit must not be called"
     );
-    let records = wait_records(&dir, 6).await;
-    assert_eq!(records.len(), 6);
-    assert_eq!(records[5].fallbacks, 1);
-    assert_eq!(records[5].provider, "deepseek");
+
+    // The fallback is now pinned, so the next request skips the open provider again.
+    let response = app
+        .oneshot(chat_model("upstream-model", false))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(fake.hits_of("upstream-model"), 0);
+    assert_eq!(fake.hits_of("fallback-model"), 2);
+}
+
+#[tokio::test]
+async fn a_stream_that_dies_after_200_unpins_the_provider() {
+    let dir = temp_dir("route-stream-unpin");
+    let (app, fake) = m4b_gateway(&dir, true).await;
+
+    // First request: primary fails, fallback succeeds, so the model pins deepseek.
+    fake.queue("upstream-model", &[500]);
+    fake.queue("fallback-model", &[200]);
+    let response = app
+        .clone()
+        .oneshot(chat_model("upstream-model", false))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // The pinned stream starts with 200 and then dies: the pump must unpin it.
+    fake.die_in_stream();
+    let response = app
+        .clone()
+        .oneshot(chat_model("upstream-model", true))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    fake.heal_stream();
+
+    // With the pin gone, selection falls back to configuration order (od first).
+    fake.queue("upstream-model", &[200]);
+    let response = app
+        .oneshot(chat_model("upstream-model", false))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        fake.hits(),
+        vec![
+            "upstream-model".to_string(),
+            "fallback-model".to_string(),
+            "fallback-model".to_string(),
+            "upstream-model".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_retryable_failure_tries_the_same_providers_next_upstream() {
+    let dir = temp_dir("route-second-upstream");
+    let (root, fake) = start_scripted().await;
+    let mut cfg = m4b_config(&dir, format!("{root}/v1"), root, false);
+    cfg.models[0].backends.push(Backend {
+        provider: "od".into(),
+        upstream: "second-model".into(),
+    });
+    let state = AppState::new(cfg, env_file(&dir)).unwrap();
+    let app = build_router(state);
+    fake.queue("upstream-model", &[503]);
+    fake.queue("second-model", &[200]);
+
+    let response = app
+        .oneshot(chat_model("upstream-model", false))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        fake.hits(),
+        vec!["upstream-model".to_string(), "second-model".to_string()]
+    );
 }
 
 #[tokio::test]
@@ -3971,4 +4138,116 @@ fn responses_named(model: &str) -> Request<Body> {
             .unwrap(),
         ))
         .unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// Grok weekly billing producer
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+struct BillingCall {
+    path: String,
+    authorization: String,
+    user_id: Option<String>,
+}
+
+#[derive(Clone, Default)]
+struct BillingFake {
+    seen: Arc<Mutex<Vec<BillingCall>>>,
+}
+
+async fn billing_user(
+    State(fake): State<BillingFake>,
+    headers: axum::http::HeaderMap,
+) -> Json<Value> {
+    fake.seen.lock().unwrap().push(BillingCall {
+        path: "/v1/user".into(),
+        authorization: header(&headers, "authorization").unwrap_or_default(),
+        user_id: header(&headers, "x-userid"),
+    });
+    Json(json!({"xUserId": "2011310503512195073"}))
+}
+
+async fn billing_credits(
+    State(fake): State<BillingFake>,
+    headers: axum::http::HeaderMap,
+) -> Json<Value> {
+    fake.seen.lock().unwrap().push(BillingCall {
+        path: "/v1/billing".into(),
+        authorization: header(&headers, "authorization").unwrap_or_default(),
+        user_id: header(&headers, "x-userid"),
+    });
+    Json(json!({
+        "config": {
+            "currentPeriod": {
+                "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                "start": "2026-11-19T08:33:29.430+00:00",
+                "end": "2099-11-26T08:33:29.430+00:00"
+            },
+            "creditUsagePercent": 44.0,
+            "productUsage": [{"product": "GrokBuild", "usagePercent": 44.0}],
+            "isUnifiedBillingUser": true
+        }
+    }))
+}
+
+fn header(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+}
+
+#[tokio::test]
+async fn grok_billing_reads_the_weekly_pool_and_user_id() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let fake = BillingFake::default();
+    let app = Router::new()
+        .route("/v1/user", axum::routing::get(billing_user))
+        .route("/v1/billing", axum::routing::get(billing_credits))
+        .with_state(fake.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let dir = temp_dir("grok-billing");
+    let sessions_dir = dir.join("sessions");
+    std::fs::create_dir_all(&sessions_dir).unwrap();
+    umsp::sessions::write_session(
+        &sessions_dir,
+        "grok",
+        "session-token",
+        "refresh-token",
+        "2099-01-01T00:00:00Z",
+    )
+    .unwrap();
+    let store = umsp::sessions::SessionStore::new(sessions_dir, reqwest::Client::new());
+    let provider = Provider {
+        id: "grok".into(),
+        vendor: Some("grok".into()),
+        base_url: format!("http://{addr}/v1"),
+        anthropic_base_url: None,
+        api_key_env: String::new(),
+        auth: "oauth".into(),
+        protocols: vec!["responses".into()],
+        quirks: None,
+    };
+
+    let (usage, user_id) =
+        umsp::grok_billing::fetch_usage(&reqwest::Client::new(), &store, &provider, "1.0.46", None)
+            .await
+            .unwrap();
+    assert!((usage.remaining_fraction - 0.56).abs() < 1e-9);
+    assert_eq!(usage.used_percent, 44.0);
+    assert_eq!(user_id, "2011310503512195073");
+
+    let seen = fake.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].path, "/v1/user");
+    assert_eq!(seen[0].user_id, None);
+    assert_eq!(seen[1].path, "/v1/billing");
+    assert_eq!(seen[1].user_id.as_deref(), Some("2011310503512195073"));
+    assert_eq!(seen[1].authorization, "Bearer session-token");
 }
