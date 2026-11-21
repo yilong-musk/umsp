@@ -263,7 +263,7 @@ pub fn protocol_url(provider: &Provider, protocol: &str) -> Option<String> {
 
 /// First error-ish status we consider retryable (used by later milestones).
 pub fn status_is_retryable(status: u16) -> bool {
-    status == 429 || status == 402 || (500..=599).contains(&status)
+    status == 426 || status == 429 || status == 402 || (500..=599).contains(&status)
 }
 
 #[cfg(test)]
@@ -280,6 +280,12 @@ mod tests {
             join_url("https://x.test/v1", "chat/completions"),
             "https://x.test/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn client_version_errors_are_retryable() {
+        assert!(status_is_retryable(426));
+        assert!(!status_is_retryable(400));
     }
 
     #[test]

@@ -143,6 +143,8 @@ umsp model add --id grok-4.7 --backend grok:grok-4.7 --backend grok-2:grok-4.7
 # 实验性 / 账号风险：Grok 走公开 CLI OAuth client 与 `cli-chat-proxy` 订阅端点，不是 xAI 官方 API。
 # 接口可能随时变化，也可能违反 xAI 服务条款（包括封号）。只在你愿意承担风险的账号上使用。
 # session token 只存放在 sessions/<id>.json（0600），不会写入日志或配置。
+# 网关会发送必需的 x-grok-client-version；xAI 提高最低版本时，在 env 文件里
+# 设置 UMSP_GROK_CLI_VERSION 并重启。
 
 # 给已有模型补一个后端（插到最前 = 最高优先级）
 umsp model backend add claude-haiku-5.5 \

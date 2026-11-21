@@ -387,6 +387,12 @@ impl Upstream {
         Ok(response)
     }
 
+    fn grok_cli_version(&self) -> String {
+        self.env
+            .get("UMSP_GROK_CLI_VERSION")
+            .unwrap_or_else(|| sessions::GROK_CLI_VERSION.to_string())
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn send_with_token(
         &self,
@@ -405,7 +411,9 @@ impl Upstream {
             .header(reqwest::header::ACCEPT, accept)
             .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
         if provider.uses_oauth() {
-            req = req.header("X-XAI-Token-Auth", sessions::CLI_TOKEN_AUTH);
+            req = req
+                .header("X-XAI-Token-Auth", sessions::CLI_TOKEN_AUTH)
+                .header("x-grok-client-version", self.grok_cli_version());
             if let Some(model) = body.get("model").and_then(Value::as_str) {
                 let value = reqwest::header::HeaderValue::from_str(model).map_err(|_| {
                     ProxyError::Network(format!(
@@ -2040,7 +2048,7 @@ fn truncate_body(body: &[u8]) -> String {
 /// caller never mistakes an upstream problem for its own.
 fn mapped_upstream_status(status: u16) -> u16 {
     match status {
-        401..=403 | 500..=599 => 502,
+        401..=403 | 426 | 500..=599 => 502,
         other => other,
     }
 }
@@ -2054,6 +2062,15 @@ fn upstream_failure_response(
     request_id: &str,
     rewrite_error: bool,
 ) -> Response {
+    if status == 426 {
+        return protocol_gateway_error(
+            protocol,
+            StatusCode::BAD_GATEWAY,
+            "upstream_client_outdated",
+            "the upstream service requires a newer gateway client version",
+            request_id,
+        );
+    }
     if (400..500).contains(&status) && !matches!(status, 401..=403 | 429) {
         if rewrite_error {
             let message = crate::translate::error_message(body)
