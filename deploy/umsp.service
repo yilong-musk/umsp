@@ -15,7 +15,7 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=true
-ReadWritePaths=%h/.local/share/umsp
+ReadWritePaths=%h/.local/share/umsp %h/.config/umsp/sessions
 LimitNOFILE=8192
 
 [Install]

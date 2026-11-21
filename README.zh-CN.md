@@ -30,7 +30,10 @@ sha256sum -c umsp-<version>-x86_64-unknown-linux-musl.tar.gz.sha256
 file ~/.local/bin/umsp                   # 静态链接
 ```
 
-从源码构建静态 musl：
+推送带注释的 tag `vX.Y.Z`（版本号必须与 `Cargo.toml` 的 `version` 一致）会发布上面的归档，
+并安装到已配置的主机。见 [GitHub release deploy](docs/operations.md#github-release-deploy)。
+
+### 从源码构建
 
 ```bash
 sudo apt-get install -y musl-tools

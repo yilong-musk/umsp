@@ -51,8 +51,10 @@ English meaning, and never replaces the English entry point.
   `dist/` via `scripts/build-musl.sh`.
 - `make install` copies the binary to `$(PREFIX)/bin/umsp` (default
   `~/.local/bin`).
-- Version bumps are a single `Cargo.toml` change plus a signed tag
-  `v<version>`; the archive name embeds the version.
+- Version bumps are a single `Cargo.toml` change plus an annotated tag
+  `v<version>`. Pushing that tag runs `.github/workflows/release.yml`: it
+  publishes the musl archive and installs it on the configured host. The tag
+  number must equal `version`, and the tagged commit must already be on `main`.
 
 ## 3. Secrets
 
