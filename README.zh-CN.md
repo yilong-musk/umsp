@@ -175,6 +175,15 @@ Messages 用 `https://opencode.ai/inference/go/anthropic`。每个请求带 `Use
 和 `x-opencode-session`。客户端自己带了这个头就沿用，否则用模型和第一条消息算出一个稳定会话号。
 Go 没有余额或剩余额度接口，所以这家按「没有用量快照」排序。
 
+## Command Code
+
+`umsp provider add --vendor command-code` 走 Provider API
+`https://api.commandcode.ai/provider/v1`。每月 $1 的 Go 套餐没有这个 API。
+GOAT、Pro、Max、Team 和 Provider 套餐有。密钥在 Studio 里生成，变量名
+`COMMAND_CODE_API_KEY`。Chat、Responses、Messages 共用这个地址。模型列表里的
+`supported_endpoints` 决定这条后端能打哪种协议。Claude 只有 Messages，
+所以 Chat 客户端会被翻译到 `/messages`，而不是直接打 Chat 被上游拒绝。
+
 ## 文档
 
 | 文档 | 内容 |

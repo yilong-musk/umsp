@@ -196,6 +196,15 @@ hashes the model and the first message so one conversation stays on one session.
 Go does not publish a balance or remaining-quota snapshot, so the provider sorts as
 unmeasured.
 
+## Command Code
+
+`umsp provider add --vendor command-code` uses the Provider API at
+`https://api.commandcode.ai/provider/v1`. The $1 Go plan does not include this API.
+GOAT, Pro, Max, Team, and the Provider plan do. The key comes from Studio and is stored
+as `COMMAND_CODE_API_KEY`. Chat, Responses, and Messages share that base. Each model
+list row names `supported_endpoints`; a Claude model is Messages only, so a Chat client
+is translated onto `/messages` instead of being sent to Chat Completions.
+
 ## Documentation
 
 | Document | Contents |

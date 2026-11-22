@@ -128,7 +128,13 @@ api_key_env = "DEEPSEEK_API_KEY"
 protocols = ["chat", "responses", "messages"]
 quirks = "deepseek"                # also determines the count_tokens proxy
 
-# The vendor catalog lives in code (src/vendors.rs): open-design, deepseek, grok, chatgpt, qwen-token-plan, opencode-go.
+# The vendor catalog lives in code (src/vendors.rs): open-design, deepseek, grok, chatgpt, qwen-token-plan, opencode-go, command-code.
+# `command-code` is the Command Code Provider API (`https://api.commandcode.ai/provider/v1`).
+# The $1 Go plan has no API access. GOAT, Pro, Max, Team, and Provider do. The key is
+# the Studio API key (`COMMAND_CODE_API_KEY`). A model's `supported_endpoints` narrows
+# which of chat, responses, and messages that backend is called with. Claude rows are
+# Messages only, so a Chat client is translated onto `/messages` instead of being
+# rejected by the upstream.
 # `opencode-go` is the OpenCode Go subscription host (`https://opencode.ai/inference/go`),
 # not the pay-as-you-go host and not the free models. The key is a Console API key.
 # Requests send `User-Agent: umsp/<version>` and `x-opencode-session`. A client header
