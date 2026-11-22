@@ -53,6 +53,13 @@ umsp provider add --vendor grok
 umsp login grok-2
 umsp model add --id grok-4.7 --backend grok:grok-4.7 --backend grok-2:grok-4.7
 
+# ChatGPT subscription accounts use Sign in with ChatGPT, not the Grok device code.
+# The session file is still one per provider id. The data plane is Responses only,
+# with store=false and a required stream. On a headless host, forward the printed
+# 127.0.0.1 callback port and open the URL on a machine that has a browser.
+umsp provider add --vendor chatgpt
+umsp login chatgpt
+
 # Experimental / account risk: Grok support uses a public CLI OAuth client and the
 # `cli-chat-proxy` subscription endpoint. It is not an official xAI API integration: it can
 # break without notice and may violate xAI's terms of service, including account suspension.
@@ -121,7 +128,7 @@ api_key_env = "DEEPSEEK_API_KEY"
 protocols = ["chat", "responses", "messages"]
 quirks = "deepseek"                # also determines the count_tokens proxy
 
-# The vendor catalog lives in code (src/vendors.rs): open-design, deepseek, grok, qwen-token-plan.
+# The vendor catalog lives in code (src/vendors.rs): open-design, deepseek, grok, chatgpt, qwen-token-plan.
 # `qwen-token-plan` is the Qwen Token Plan console host, not pay-as-you-go DashScope
 # and not the international qwencloudapi.com host.
 # Chat: https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1

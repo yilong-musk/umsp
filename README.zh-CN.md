@@ -145,6 +145,7 @@ umsp doctor [--online]                  # 诊断；--online 会花少量 token
 
 `umsp provider add --vendor grok` 创建一个由设备码 OAuth 会话支撑的 provider，session 存在
 `~/.config/umsp/sessions/<id>.json`（0600），每个 provider id 一份；`umsp login <id>` 登录。
+`umsp provider add --vendor chatgpt` 走 Sign in with ChatGPT：浏览器回到 `127.0.0.1` 的 `/auth/callback`，用量打在 `https://api.openai.com/v1/responses`，每次请求 `store: false` 且必须流式。这台机器没有浏览器时，把回调端口用 SSH 转出去再打开登录链接。
 
 > **实验性 / 账号风险。** Grok 走公开 CLI OAuth client 与 `cli-chat-proxy` 订阅端点，不是 xAI
 > 官方 API 集成：接口可能随时变化，也可能违反 xAI 服务条款（包括封号）。只在你愿意承担风险的

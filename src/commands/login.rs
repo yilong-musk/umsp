@@ -34,7 +34,13 @@ pub fn login(config_path: &Path, args: LoginArgs, json: bool) -> Result<i32> {
         .enable_all()
         .build()
         .map_err(|err| UmspError::other("RUNTIME", format!("tokio: {err}")))?;
-    rt.block_on(store.login(&provider_id, !args.no_browser))?;
+    rt.block_on(async {
+        if provider.vendor.as_deref() == Some("chatgpt") {
+            store.login_chatgpt(&provider_id, !args.no_browser).await
+        } else {
+            store.login(&provider_id, !args.no_browser).await
+        }
+    })?;
     let session = dir.join(format!("{provider_id}.json"));
     crate::commands::emit(
         json,

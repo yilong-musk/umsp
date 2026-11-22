@@ -18,8 +18,9 @@ pub struct Vendor {
     pub protocols: &'static [&'static str],
     /// Request/response quirks preset (`opendesign`, `deepseek`, …).
     pub quirks: Option<&'static str>,
-    /// `api_key` reads `api_key_env`. `oauth` is a per-provider Grok subscription
-    /// session (`umsp login <id>`), independent of every other provider.
+    /// `api_key` reads `api_key_env`. `oauth` is one subscription session per
+    /// provider id (`umsp login <id>`): Grok uses its device-code grant, ChatGPT
+    /// uses Sign in with ChatGPT. The two never share a refresh token.
     pub auth: &'static str,
     /// Official documentation, when known.
     pub docs_url: Option<&'static str>,
@@ -55,6 +56,16 @@ pub const VENDORS: &[Vendor] = &[
         quirks: None,
         auth: "oauth",
         docs_url: None,
+    },
+    Vendor {
+        id: "chatgpt",
+        name: "ChatGPT",
+        base_url: "https://api.openai.com/v1",
+        anthropic_base_url: None,
+        protocols: &["responses"],
+        quirks: None,
+        auth: "oauth",
+        docs_url: Some("https://developers.openai.com/siwc/token-sharing-open-source"),
     },
     Vendor {
         id: "qwen-token-plan",

@@ -466,20 +466,23 @@ impl Config {
                     ),
                 ));
             }
-            if p.vendor.as_deref() == Some("grok") && !p.uses_oauth() {
+            if p.vendor.as_deref() == Some("grok") && !p.uses_oauth()
+                || p.vendor.as_deref() == Some("chatgpt") && !p.uses_oauth()
+            {
                 issues.push(err(
                     "provider_auth",
                     format!(
-                        "provider '{}' uses vendor grok and needs auth = \"oauth\"",
-                        p.id
+                        "provider '{}' uses vendor {} and needs auth = \"oauth\"",
+                        p.id,
+                        p.vendor.as_deref().unwrap_or("oauth")
                     ),
                 ));
             }
-            if p.uses_oauth() && p.vendor.as_deref() != Some("grok") {
+            if p.uses_oauth() && !matches!(p.vendor.as_deref(), Some("grok") | Some("chatgpt")) {
                 issues.push(err(
                     "provider_auth",
                     format!(
-                        "provider '{}' auth = \"oauth\" is only valid for vendor grok",
+                        "provider '{}' auth = \"oauth\" is only valid for vendor grok or chatgpt",
                         p.id
                     ),
                 ));

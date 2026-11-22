@@ -156,8 +156,11 @@ troubleshooting: [docs/operations.md](docs/operations.md).
 ## Grok subscriptions
 
 `umsp provider add --vendor grok` creates a provider backed by a device-code OAuth session at
-`~/.config/umsp/sessions/<id>.json` (0600), one file per provider id. `umsp login <id>` performs the
-sign-in.
+`{config_dir}/sessions/<id>.json`. `umsp provider add --vendor chatgpt` uses Sign in with
+ChatGPT (PKCE on `127.0.0.1`, plan usage on `https://api.openai.com/v1/responses` with
+`store: false` and a required stream). Neither grant is an API key, and the two sessions
+never share a refresh token. `umsp login <id>` signs one provider in; `umsp logout <id>`
+deletes only that file.
 
 > **Experimental / account risk.** Grok support uses a public CLI OAuth client and the
 > `cli-chat-proxy` subscription endpoint. It is not an official xAI API integration: it can break

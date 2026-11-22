@@ -225,7 +225,7 @@ fn provider_add_needs_a_known_vendor() {
     );
     assert!(text.contains("unknown vendor 'openrouter'"), "{text}");
     assert!(
-        text.contains("open-design, deepseek, grok, qwen-token-plan"),
+        text.contains("open-design, deepseek, grok, chatgpt, qwen-token-plan"),
         "{text}"
     );
     assert!(!sb.read_config().contains("openrouter"));

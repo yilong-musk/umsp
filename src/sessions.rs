@@ -76,6 +76,16 @@ struct Session {
     token_type: String,
     #[serde(default)]
     scope: String,
+    /// Issued ChatGPT client id. Empty for a Grok device-code session, which
+    /// keeps using the store's Grok client id.
+    #[serde(default)]
+    client_id: String,
+    /// Token endpoint for this grant. Empty means the store default (Grok).
+    #[serde(default)]
+    token_url: String,
+    /// OAuth resource indicator. Set for ChatGPT plan tokens.
+    #[serde(default)]
+    resource: String,
 }
 
 impl std::fmt::Debug for Session {
@@ -86,6 +96,7 @@ impl std::fmt::Debug for Session {
             .field("expires_at", &self.expires_at)
             .field("token_type", &self.token_type)
             .field("scope", &self.scope)
+            .field("client_id", &self.client_id)
             .finish()
     }
 }
@@ -192,7 +203,7 @@ impl SessionStore {
             eprintln!("Code: {user_code}");
         }
         if open_browser && !open_url.is_empty() {
-            try_open_browser(&open_url);
+            launch_browser(&open_url);
         }
         eprintln!("Waiting for approval...");
 
@@ -323,18 +334,36 @@ impl SessionStore {
         provider_id: &str,
         session: &Session,
     ) -> std::result::Result<Session, SessionError> {
-        let form = form_encode(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", session.refresh_token.as_str()),
-            ("client_id", self.inner.endpoints.client_id.as_str()),
-        ]);
-        let value = self
-            .post_form(&self.inner.endpoints.token_url, &form)
-            .await
-            .map_err(|reason| SessionError::Refresh {
-                provider: provider_id.to_string(),
-                reason,
-            })?;
+        let client_id = if session.client_id.is_empty() {
+            self.inner.endpoints.client_id.clone()
+        } else {
+            session.client_id.clone()
+        };
+        let token_url = if session.token_url.is_empty() {
+            self.inner.endpoints.token_url.clone()
+        } else {
+            session.token_url.clone()
+        };
+        let mut pairs = vec![
+            ("grant_type".to_string(), "refresh_token".to_string()),
+            ("refresh_token".to_string(), session.refresh_token.clone()),
+            ("client_id".to_string(), client_id),
+        ];
+        if !session.resource.is_empty() {
+            pairs.push(("resource".to_string(), session.resource.clone()));
+        }
+        let form = pairs
+            .iter()
+            .map(|(key, value)| format!("{}={}", encode(key), encode(value)))
+            .collect::<Vec<_>>()
+            .join("&");
+        let value =
+            self.post_form(&token_url, &form)
+                .await
+                .map_err(|reason| SessionError::Refresh {
+                    provider: provider_id.to_string(),
+                    reason,
+                })?;
         if let Some(mut fresh) = session_from_token(&value, Some(session)) {
             if fresh.refresh_token.is_empty() {
                 fresh.refresh_token = session.refresh_token.clone();
@@ -390,6 +419,37 @@ impl SessionStore {
 
     fn write(&self, path: &Path, session: &Session) -> Result<()> {
         persist(path, session)
+    }
+
+    pub(crate) async fn post_form_public(
+        &self,
+        url: &str,
+        form: &str,
+    ) -> std::result::Result<Value, String> {
+        self.post_form(url, form).await
+    }
+
+    pub(crate) fn save_chatgpt(
+        &self,
+        provider_id: &str,
+        token: &Value,
+        client_id: &str,
+    ) -> Result<()> {
+        let mut session = session_from_token(token, None).ok_or_else(|| {
+            UmspError::upstream(
+                "oauth_token",
+                format!("chatgpt token response for provider '{provider_id}' had no tokens"),
+            )
+        })?;
+        session.client_id = client_id.to_string();
+        session.token_url = crate::chatgpt_oauth::TOKEN_URL.to_string();
+        session.resource = crate::chatgpt_oauth::RESOURCE.to_string();
+        let path = session_path(&self.inner.dir, provider_id)?;
+        self.write(&path, &session)
+    }
+
+    pub async fn login_chatgpt(&self, provider_id: &str, open_browser: bool) -> Result<()> {
+        crate::chatgpt_oauth::login(self, provider_id, open_browser).await
     }
 }
 
@@ -463,6 +523,9 @@ pub fn write_session(
             expires_at: expires_at.to_string(),
             token_type: "Bearer".into(),
             scope: GROK_SCOPES.into(),
+            client_id: String::new(),
+            token_url: String::new(),
+            resource: String::new(),
         },
     )
 }
@@ -496,7 +559,18 @@ fn session_from_token(value: &Value, previous: Option<&Session>) -> Option<Sessi
         refresh_token,
         expires_at,
         token_type: json_str(value, "token_type").unwrap_or_else(|| "Bearer".into()),
-        scope: json_str(value, "scope").unwrap_or_default(),
+        scope: json_str(value, "scope")
+            .or_else(|| previous.map(|session| session.scope.clone()))
+            .unwrap_or_default(),
+        client_id: previous
+            .map(|session| session.client_id.clone())
+            .unwrap_or_default(),
+        token_url: previous
+            .map(|session| session.token_url.clone())
+            .unwrap_or_default(),
+        resource: previous
+            .map(|session| session.resource.clone())
+            .unwrap_or_default(),
     })
 }
 
@@ -529,7 +603,7 @@ fn encode(value: &str) -> String {
     out
 }
 
-fn try_open_browser(url: &str) {
+pub(crate) fn launch_browser(url: &str) {
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         return;
     }
@@ -559,6 +633,9 @@ mod tests {
             expires_at: "2026-11-20T00:00:00Z".into(),
             token_type: "Bearer".into(),
             scope: "cli".into(),
+            client_id: String::new(),
+            token_url: String::new(),
+            resource: String::new(),
         };
         let text = format!("{session:?}");
         assert!(!text.contains("secret-access"), "{text}");
