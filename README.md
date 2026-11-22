@@ -184,6 +184,18 @@ draw down this plan. Chat goes to
 interactive clients. The older regional host
 `token-plan.cn-beijing.maas.aliyuncs.com` still answers, but it is not the console URL.
 
+## OpenCode Go
+
+`umsp provider add --vendor opencode-go` uses the OpenCode Go subscription host
+`https://opencode.ai/inference/go`, not the pay-as-you-go host and not the free models
+(those return 403 outside OpenCode). The key is a Console API key, stored as
+`OPENCODE_GO_API_KEY`. Chat and Responses use the OpenAI base; Messages uses
+`https://opencode.ai/inference/go/anthropic`. Each request sends `User-Agent: umsp/<version>`
+and `x-opencode-session`. A client header with that name is kept; otherwise the gateway
+hashes the model and the first message so one conversation stays on one session.
+Go does not publish a balance or remaining-quota snapshot, so the provider sorts as
+unmeasured.
+
 ## Documentation
 
 | Document | Contents |

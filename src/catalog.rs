@@ -65,20 +65,34 @@ pub fn parse_models(body: &Value) -> Option<Vec<ListedModel>> {
         }
         let (reasoning, reasoning_known) = reasoning_state(row);
         let (capabilities, modalities_known) = capabilities_of(row, reasoning);
-        let context_length = first_u64(
-            row,
-            &["context_length", "context_window"],
-            &["context_limit"],
-        );
+        let context_length = {
+            let listed = first_u64(
+                row,
+                &["context_length", "context_window"],
+                &["context_limit"],
+            );
+            if listed > 0 {
+                listed
+            } else {
+                limit_u64(row, "context")
+            }
+        };
         models.push(ListedModel {
             id: id.to_string(),
             context_length,
             context_lengths: listed_tiers(row, context_length),
-            max_completion_tokens: first_u64(
-                row,
-                &["max_completion_tokens", "max_output_tokens"],
-                &["output_budget"],
-            ),
+            max_completion_tokens: {
+                let listed = first_u64(
+                    row,
+                    &["max_completion_tokens", "max_output_tokens"],
+                    &["output_budget"],
+                );
+                if listed > 0 {
+                    listed
+                } else {
+                    limit_u64(row, "output")
+                }
+            },
             capabilities,
             display_name: non_empty_str(row.get("name"))
                 .or_else(|| non_empty_str(row.get("display_name"))),
@@ -331,6 +345,10 @@ fn first_u64(row: &Value, top: &[&str], nested: &[&str]) -> u64 {
     0
 }
 
+fn limit_u64(row: &Value, key: &str) -> u64 {
+    number_of(row.get("limit").and_then(|limit| limit.get(key))).unwrap_or(0)
+}
+
 fn number_of(value: Option<&Value>) -> Option<u64> {
     let value = value?;
     value.as_u64().or_else(|| {
@@ -368,6 +386,9 @@ fn capabilities_of(row: &Value, reasoning: bool) -> (Vec<String>, bool) {
     if reasoning {
         caps.push("reasoning".to_string());
     }
+    if tools_supported(row) {
+        caps.push("tools".to_string());
+    }
     (caps, modalities_known)
 }
 
@@ -377,13 +398,41 @@ fn modalities(row: &Value, key: &str) -> Option<Vec<String>> {
         .and_then(|value| value.get(key))
         .and_then(Value::as_array);
     let from_top = row.get(key).and_then(Value::as_array);
-    from_architecture.or(from_top).map(|items| {
+    let object_key = key.strip_suffix("_modalities").unwrap_or(key);
+    let from_object = row
+        .get("modalities")
+        .and_then(|value| value.get(object_key))
+        .and_then(Value::as_array);
+    from_architecture.or(from_top).or(from_object).map(|items| {
         items
             .iter()
             .filter_map(Value::as_str)
-            .map(|mode| mode.to_string())
+            .map(normalize_modality)
             .collect()
     })
+}
+
+fn normalize_modality(mode: &str) -> String {
+    let mode = mode.trim().to_ascii_lowercase();
+    if mode == "text" || mode.starts_with("text/") {
+        "text".to_string()
+    } else if mode == "image" || mode.starts_with("image/") {
+        "image".to_string()
+    } else if mode == "video" || mode.starts_with("video/") {
+        "video".to_string()
+    } else if mode == "audio" || mode.starts_with("audio/") {
+        "audio".to_string()
+    } else {
+        mode
+    }
+}
+
+fn tools_supported(row: &Value) -> bool {
+    row.get("capabilities")
+        .and_then(|caps| caps.get("tools"))
+        .and_then(|tools| tools.get("supported"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn reasoning_state(row: &Value) -> (bool, bool) {
@@ -396,6 +445,19 @@ fn reasoning_state(row: &Value) -> (bool, bool) {
     if let Some(effort) = row.get("effort") {
         let supported = effort
             .get("supported_levels")
+            .and_then(Value::as_array)
+            .is_some_and(|levels| !levels.is_empty());
+        return (supported, true);
+    }
+    if let Some(reasoning) = row
+        .get("capabilities")
+        .and_then(|caps| caps.get("reasoning"))
+    {
+        if let Some(flag) = reasoning.get("supported").and_then(Value::as_bool) {
+            return (flag, true);
+        }
+        let supported = reasoning
+            .get("effort")
             .and_then(Value::as_array)
             .is_some_and(|levels| !levels.is_empty());
         return (supported, true);
@@ -533,6 +595,38 @@ mod tests {
         assert_eq!(parsed.context_length, 0);
         assert_eq!(parsed.capabilities, vec!["text".to_string()]);
         assert!(parsed.display_name.is_none());
+    }
+
+    #[test]
+    fn opencode_go_list_reads_limit_mime_modalities_and_tools() {
+        let body = json!({"data": [{
+            "id": "deepseek-v4.1-flash",
+            "name": "DeepSeek V4.1 Flash 1017",
+            "modalities": {
+                "input": ["text", "image/jpeg", "image/png"],
+                "output": ["text"]
+            },
+            "capabilities": {
+                "tools": {"supported": true},
+                "reasoning": {"supported": true, "effort": ["low", "high"]}
+            },
+            "limit": {"context": 1000000, "output": 384000}
+        }]});
+        let parsed = &parse_models(&body).unwrap()[0];
+        assert_eq!(parsed.context_length, 1_000_000);
+        assert_eq!(parsed.context_lengths, vec![1_000_000]);
+        assert_eq!(parsed.max_completion_tokens, 384_000);
+        assert_eq!(
+            parsed.capabilities,
+            vec![
+                "text".to_string(),
+                "vision".to_string(),
+                "reasoning".to_string(),
+                "tools".to_string()
+            ]
+        );
+        assert!(parsed.modalities_known);
+        assert!(parsed.reasoning_known);
     }
 
     #[test]

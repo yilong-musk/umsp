@@ -596,9 +596,27 @@ impl Upstream {
                 req = req.header("x-grok-model-override", value);
             }
         }
+        if provider.vendor.as_deref() == Some("opencode-go") {
+            let session = upstream::opencode_session(client_headers, body);
+            let session = reqwest::header::HeaderValue::from_str(&session).map_err(|_| {
+                ProxyError::Network(format!(
+                    "opencode session for provider '{}' is not a valid header value",
+                    provider.id
+                ))
+            })?;
+            req = req
+                .header(reqwest::header::USER_AGENT, upstream::OPENCODE_USER_AGENT)
+                .header("x-opencode-session", session);
+        }
         for (name, value) in forward_request_headers(client_headers) {
             if provider.vendor.as_deref() == Some("grok")
                 && sessions::is_cli_session_header(name.as_str())
+            {
+                continue;
+            }
+            if provider.vendor.as_deref() == Some("opencode-go")
+                && (name.as_str().eq_ignore_ascii_case("user-agent")
+                    || name.as_str().eq_ignore_ascii_case("x-opencode-session"))
             {
                 continue;
             }
@@ -4104,6 +4122,9 @@ async fn fetch_model_ids(
         request = request
             .header("X-XAI-Token-Auth", sessions::CLI_TOKEN_AUTH)
             .header("x-grok-client-version", version);
+    }
+    if provider.vendor.as_deref() == Some("opencode-go") {
+        request = request.header(reqwest::header::USER_AGENT, upstream::OPENCODE_USER_AGENT);
     }
     let response = request
         .send()

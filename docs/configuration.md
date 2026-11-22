@@ -128,7 +128,11 @@ api_key_env = "DEEPSEEK_API_KEY"
 protocols = ["chat", "responses", "messages"]
 quirks = "deepseek"                # also determines the count_tokens proxy
 
-# The vendor catalog lives in code (src/vendors.rs): open-design, deepseek, grok, chatgpt, qwen-token-plan.
+# The vendor catalog lives in code (src/vendors.rs): open-design, deepseek, grok, chatgpt, qwen-token-plan, opencode-go.
+# `opencode-go` is the OpenCode Go subscription host (`https://opencode.ai/inference/go`),
+# not the pay-as-you-go host and not the free models. The key is a Console API key.
+# Requests send `User-Agent: umsp/<version>` and `x-opencode-session`. A client header
+# with that name is kept; otherwise the gateway hashes the model and the first message.
 # `qwen-token-plan` is the Qwen Token Plan console host, not pay-as-you-go DashScope
 # and not the international qwencloudapi.com host.
 # Chat: https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1
