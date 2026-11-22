@@ -582,7 +582,7 @@ impl Upstream {
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(reqwest::header::ACCEPT, accept)
             .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
-        if provider.uses_oauth() {
+        if provider.vendor.as_deref() == Some("grok") {
             req = req
                 .header("X-XAI-Token-Auth", sessions::CLI_TOKEN_AUTH)
                 .header("x-grok-client-version", self.grok_cli_version());
@@ -597,7 +597,9 @@ impl Upstream {
             }
         }
         for (name, value) in forward_request_headers(client_headers) {
-            if provider.uses_oauth() && sessions::is_cli_session_header(name.as_str()) {
+            if provider.vendor.as_deref() == Some("grok")
+                && sessions::is_cli_session_header(name.as_str())
+            {
                 continue;
             }
             req = req.header(name, value);
@@ -728,6 +730,15 @@ impl Upstream {
             .bytes()
             .await
             .map_err(|e| ProxyError::Network(format!("cannot read upstream response body: {e}")))?;
+        let bytes = if provider.vendor.as_deref() == Some("chatgpt") {
+            if let Some(completed) = crate::chatgpt_oauth::collapse_responses_stream(&bytes) {
+                serde_json::to_vec(&completed).unwrap_or_else(|_| bytes.to_vec())
+            } else {
+                bytes.to_vec()
+            }
+        } else {
+            bytes.to_vec()
+        };
 
         let mut quirks_applied = Vec::new();
         let mut usage = None;
@@ -1913,6 +1924,15 @@ fn prepare_attempt(
             _ => {}
         }
     }
+    if target.provider.vendor.as_deref() == Some("chatgpt")
+        && target.upstream_protocol == "responses"
+    {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("store".to_string(), Value::Bool(false));
+            obj.insert("stream".to_string(), Value::Bool(true));
+            notes.push("chatgpt_plan_stream".to_string());
+        }
+    }
     Ok((body, notes))
 }
 
@@ -1975,6 +1995,13 @@ fn attempt_payload(
                 client_name,
             )),
             _ => {}
+        }
+    }
+    if target.provider.vendor.as_deref() == Some("chatgpt") && protocol == "responses" {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("store".to_string(), Value::Bool(false));
+            obj.insert("stream".to_string(), Value::Bool(true));
+            applied.push("chatgpt_plan_stream".to_string());
         }
     }
     (payload, applied)
@@ -4069,7 +4096,7 @@ async fn fetch_model_ids(
         .get(&url)
         .timeout(Duration::from_secs(15))
         .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
-    if provider.uses_oauth() {
+    if provider.vendor.as_deref() == Some("grok") {
         let version = state
             .env()
             .get("UMSP_GROK_CLI_VERSION")

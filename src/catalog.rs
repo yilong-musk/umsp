@@ -41,10 +41,22 @@ pub struct ListedModel {
 /// `None` means the body is not a list, so the caller should keep the previous
 /// snapshot. An empty `data` array is a real empty catalog.
 pub fn parse_models(body: &Value) -> Option<Vec<ListedModel>> {
-    let rows = body.get("data")?.as_array()?;
+    let rows = body
+        .get("data")
+        .and_then(Value::as_array)
+        .or_else(|| body.get("models").and_then(Value::as_array))?;
     let mut models: Vec<ListedModel> = Vec::new();
     for row in rows {
-        let Some(id) = row.get("id").and_then(Value::as_str) else {
+        if let Some(visibility) = row.get("visibility").and_then(Value::as_str) {
+            if visibility != "list" {
+                continue;
+            }
+        }
+        let Some(id) = row
+            .get("id")
+            .or_else(|| row.get("slug"))
+            .and_then(Value::as_str)
+        else {
             continue;
         };
         let id = id.trim();
@@ -68,7 +80,8 @@ pub fn parse_models(body: &Value) -> Option<Vec<ListedModel>> {
                 &["output_budget"],
             ),
             capabilities,
-            display_name: non_empty_str(row.get("name")),
+            display_name: non_empty_str(row.get("name"))
+                .or_else(|| non_empty_str(row.get("display_name"))),
             description: non_empty_str(row.get("description")),
             created: row
                 .get("created")
@@ -444,7 +457,16 @@ mod tests {
             .map(|model| model.id)
             .collect();
         assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
-        assert!(parse_models(&json!({"models": []})).is_none());
+        assert!(parse_models(&json!({"catalog": []})).is_none());
+        assert!(parse_models(&json!({"models": []})).unwrap().is_empty());
+        let plan = json!({"models": [
+            {"slug": "gpt-6.1-sol", "display_name": "GPT 6.1 Sol", "visibility": "list"},
+            {"slug": "hidden", "visibility": "hidden"}
+        ]});
+        let parsed = parse_models(&plan).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id, "gpt-6.1-sol");
+        assert_eq!(parsed[0].display_name.as_deref(), Some("GPT 6.1 Sol"));
         assert_eq!(parse_models(&json!({"data": []})).unwrap(), Vec::new());
     }
 
