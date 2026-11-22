@@ -14,7 +14,7 @@ Responses 和 Anthropic Messages；上游支持同一协议就原样转发，不
   JSONL 请求账本 `~/.local/share/umsp/`
 - 逻辑模型：调用方只认一个模型 id；每个模型有一组有序 `backends`
 - 容量感知选路：有 fresh 用量（U）优先，其次无数据（X），最后只有余额（B）；成功服务后 pin 5 小时
-- 按 provider 熔断、DeepSeek 余额健康检查、Grok 周额度轮询
+- 按 provider 熔断、DeepSeek 余额健康检查、Grok 周额度轮询。千问 Token Plan 两者都没有，归入 X。
 - 对客户端隐藏 provider；上游错误统一映射为中性网关错误
 
 ## 快速开始

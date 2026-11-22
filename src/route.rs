@@ -469,6 +469,29 @@ mod tests {
     }
 
     #[test]
+    fn an_unmeasured_provider_sorts_as_neither_usage_nor_balance() {
+        // Qwen Token Plan has no usage producer and no balance producer, so it
+        // stays in X without a vendor special case.
+        let now = now();
+        let mut table = RouteTable::default();
+        table.note_usage("measured", vec![window(now, 7 * 86400, 0.4)]);
+        table.note_balance("funded", true, Some(3.0), now);
+        let plan = table.plan(
+            "m",
+            &ids(&["funded", "qwen-token-plan", "measured"]),
+            &HashSet::new(),
+            &all_closed(&["funded", "qwen-token-plan", "measured"]),
+            now,
+            true,
+        );
+        assert_eq!(plan.kind, PlanKind::Ranked);
+        assert_eq!(
+            plan.provider_ids,
+            ids(&["measured", "qwen-token-plan", "funded"])
+        );
+    }
+
+    #[test]
     fn the_tightest_remaining_fraction_is_compared_first() {
         let now = now();
         let mut table = RouteTable::default();

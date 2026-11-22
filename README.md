@@ -16,6 +16,7 @@ protocol — or translates it when the backend cannot. No UI, database, Redis, o
 - Capacity-aware selection: fresh usage first (U), then no data (X), then balance-only (B);
   a successful provider stays pinned for five hours.
 - Per-provider circuit breaking, DeepSeek balance health, Grok weekly-quota polling.
+  Qwen Token Plan has neither, so it stays in X.
 - Client requests are provider-invisible; upstream errors are mapped to neutral gateway errors.
 
 ## Quick start
