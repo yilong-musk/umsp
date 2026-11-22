@@ -109,7 +109,10 @@ allowed_protocols = ["chat", "responses", "messages"]
   `$UMSP_LISTEN`, `$UMSP_STATE_DIR`, `$UMSP_ENV_FILE` override individual paths.
 - `/v1/models` contains one entry per logical model and never exposes providers.
   Every 12 hours the gateway reads each provider's model list and deduplicates
-  by id. `umsp catalog refresh` reads immediately. `allowed_models = ["*"]` (or an empty list) shows that full catalog.
+  by id. Context, output limit, display name, and capabilities come from that
+  list when the provider sends them; a handwritten `[[models]]` entry only fills
+  a gap and never overwrites an upstream value. `umsp catalog refresh` reads
+  immediately. `allowed_models = ["*"]` (or an empty list) shows that full catalog.
 - `provider add --vendor ID` takes only the vendor id and key; every add gets its own id.
 
 Full schema, provider/model/client management, and all CLI examples:
