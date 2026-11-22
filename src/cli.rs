@@ -304,6 +304,8 @@ pub enum ClientCmd {
     Remove { name: String },
     /// Replace a client's key and print the new key once
     Rotate { name: String },
+    /// Clear a client's device binding (next request re-binds, TOFU)
+    Unbind { name: String },
 }
 
 #[derive(Debug, clap::Args)]
@@ -326,6 +328,8 @@ pub enum KeyCmd {
     Add(ClientAddArgs),
     /// Alias of `client remove`
     Revoke { name: String },
+    /// Alias of `client unbind`
+    Unbind { name: String },
 }
 
 #[derive(Debug, Subcommand)]

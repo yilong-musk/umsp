@@ -71,13 +71,15 @@ only 4xx caused by the client itself keep their status code and (redacted) body.
 One line of JSON per request, written to `state_dir/logs/YYYY-MM-DD.jsonl`:
 
 ```
-ts, request_id, client, protocol, requested_model, provider, upstream_model, stream,
-status, upstream_status, prompt_tokens, completion_tokens, cached_tokens,
+ts, request_id, client, client_ip, protocol, requested_model, provider, upstream_model,
+stream, status, upstream_status, prompt_tokens, completion_tokens, cached_tokens,
 reasoning_tokens, ttft_ms, duration_ms, bytes_in, bytes_out, error_code,
 upstream_request_id, client_disconnected, fallbacks, quirks
 ```
 
 - No prompt/body is recorded by default.
+- `client_ip` is the effective source IP resolved at auth time (proxy-aware);
+  absent on pre-routing error rows and on rows written before device binding.
 - Each line is a single `write_all` (single-line atomic); under 50-way concurrent load no lines are
   lost or interleaved (M5 regression test `concurrent_appends_never_merge_or_drop_lines`).
 
@@ -146,7 +148,8 @@ journalctl --user -u umsp -f
 
 `EnvironmentFile=%h/.config/umsp/env` injects upstream keys via systemd. `ProtectHome=read-only`
 and `ReadWritePaths=%h/.local/share/umsp %h/.config/umsp/sessions` leave the rest of the home
-directory read-only: the process may write the ledger and OAuth session files, nothing else.
+directory read-only: the process may write the ledger, the device-binding file
+(`client-bindings.json`) and OAuth session files, nothing else.
 
 Hardening already baked into the unit (`deploy/umsp.service`, passes `systemd-analyze verify`):
 
@@ -155,7 +158,7 @@ Hardening already baked into the unit (`deploy/umsp.service`, passes `systemd-an
 | `MemoryMax` | `256M` | If exceeded, the process is OOM-killed by the cgroup and restarted via `Restart=on-failure` (measured peak 14 MB, ample headroom) |
 | `TasksMax` | `256` | Thread/task limit |
 | `LimitNOFILE` | `8192` | Concurrent connection fd limit |
-| `NoNewPrivileges` / `ProtectSystem=strict` / `ProtectHome=read-only` | — | Read-only system and home directories; only the ledger directory and `sessions/` are writable |
+| `NoNewPrivileges` / `ProtectSystem=strict` / `ProtectHome=read-only` | — | Read-only system and home directories; only the state directory (ledger, device bindings) and `sessions/` are writable |
 | `PrivateTmp` | `true` | Private /tmp |
 
 Prerequisites: `~/.local/bin/umsp` exists, `umsp init` has generated
