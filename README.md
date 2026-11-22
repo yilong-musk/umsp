@@ -66,7 +66,24 @@ curl -s http://127.0.0.1:3460/v1/chat/completions \
   -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"Reply with only: OK"}]}' | jq
 ```
 
-`Authorization: Bearer $UMSP_API_KEY` is equivalent to `x-api-key`.
+`Authorization: Bearer *** is equivalent to `x-api-key`.
+
+### Device binding (one key, one device)
+
+Client keys use trust-on-first-use (TOFU) device binding: a new key is unbound,
+and the **first authenticated request** binds it to that request's source IP.
+Every later request with that key must come from the same IP or it is rejected
+with `403 device_mismatch` (the error body never reveals the bound IP).
+Bindings persist in `state_dir/client-bindings.json` and survive restarts.
+
+- Behind a reverse proxy the real client IP is the rightmost `X-Forwarded-For`
+  entry written by the trusted loopback proxy; client-supplied entries are
+  ignored. Local (loopback) callers bind to `127.0.0.1`.
+- `umsp client list` shows each key's bound IP. `umsp client unbind <name>`
+  clears a binding (the next request re-binds — use it when a device's IP
+  changes); `rotate` and `remove` clear it automatically.
+- Devices behind the same NAT share one public IP and are indistinguishable;
+  issue one key per device for attribution and per-device revocation.
 
 ## Configuration
 
@@ -128,7 +145,7 @@ umsp provider list|add|remove|test      # upstream instances; add uses the built
 umsp login|logout grok                  # per-provider Grok device-code session
 umsp model list|add|remove              # logical models and aliases
 umsp model backend add|remove           # attach/detach a backend (--first = higher priority)
-umsp client list|add|remove|rotate      # client keys (only SHA-256 stored)
+umsp client list|add|remove|rotate|unbind # client keys (SHA-256 stored) + TOFU device binding
 umsp env list|set|unset                 # upstream keys, masked
 umsp usage summary|by-model|prune       # query the request ledger
 umsp doctor [--online]                  # diagnostics; --online spends a few tokens

@@ -73,6 +73,9 @@ struct Inner {
     logs: LogStore,
     metrics: Metrics,
     sessions: SessionStore,
+    /// TOFU device bindings (client name -> source IP). Reloaded from disk on
+    /// SIGHUP so CLI `client unbind` / `rotate` edits reach the data plane.
+    bindings: RwLock<Arc<crate::bindings::BindingStore>>,
 }
 
 impl Clone for AppState {
@@ -109,6 +112,7 @@ impl AppState {
     ) -> Result<Self> {
         let http_stream = upstream::build_stream_client()?;
         let logs = LogStore::new(&cfg.server.state_path());
+        let bindings = crate::bindings::BindingStore::load(&cfg.server.state_path());
         Ok(Self {
             inner: Arc::new(Inner {
                 cfg: RwLock::new(Arc::new(cfg)),
@@ -125,6 +129,7 @@ impl AppState {
                 logs,
                 metrics: Metrics::new(),
                 sessions,
+                bindings: RwLock::new(Arc::new(bindings)),
             }),
         })
     }
@@ -358,6 +363,24 @@ impl AppState {
     pub fn replace_config(&self, cfg: Config) -> Arc<Config> {
         let mut guard = self.inner.cfg.write().expect("config lock poisoned");
         std::mem::replace(&mut *guard, Arc::new(cfg))
+    }
+
+    /// Current device-binding store (cheap Arc clone under a read lock).
+    pub fn bindings(&self) -> Arc<crate::bindings::BindingStore> {
+        self.inner
+            .bindings
+            .read()
+            .expect("bindings lock poisoned")
+            .clone()
+    }
+
+    /// Re-read bindings from disk. Called on SIGHUP after a config swap so
+    /// CLI edits (`client unbind`, `rotate`, `remove`) reach the data plane,
+    /// and so a changed `state_dir` points at the right file.
+    pub fn reload_bindings(&self, state_dir: &std::path::Path) {
+        let store = crate::bindings::BindingStore::load(state_dir);
+        let mut guard = self.inner.bindings.write().expect("bindings lock poisoned");
+        *guard = Arc::new(store);
     }
 
     pub fn note_health(&self, provider: &str, status: u16, latency_ms: u64, error: Option<String>) {
@@ -972,14 +995,82 @@ pub fn build_router(state: AppState) -> Router {
 #[derive(Clone)]
 struct AuthedClient(Client);
 
+/// Effective source IP resolved at auth time; carried into the ledger row.
+#[derive(Clone)]
+struct ClientIp(String);
+
 async fn auth_middleware(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
     let presented = keys::extract_presented_key(req.headers());
     let cfg = state.cfg();
     let matched = presented.and_then(|key| keys::authenticate(&cfg.clients, &key).cloned());
     match matched {
         Some(client) => {
-            req.extensions_mut().insert(AuthedClient(client));
-            next.run(req).await
+            // TOFU device binding: the first authenticated request binds the
+            // key to its effective source IP; later requests must match.
+            let peer = req
+                .extensions()
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|c| c.0.ip());
+            let xff = req
+                .headers()
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok());
+            let ip = crate::bindings::effective_client_ip(peer, xff).to_string();
+            match state.bindings().check_or_bind(&client.name, &ip) {
+                crate::bindings::BindOutcome::Allowed { first_use } => {
+                    if first_use {
+                        plog_binding("client_bound", &client.name, &ip, Some(&ip), "-");
+                    }
+                    req.extensions_mut().insert(AuthedClient(client));
+                    req.extensions_mut().insert(ClientIp(ip));
+                    next.run(req).await
+                }
+                crate::bindings::BindOutcome::Mismatch { bound_ip } => {
+                    let request_id = util::new_request_id();
+                    plog_binding(
+                        "device_mismatch",
+                        &client.name,
+                        &ip,
+                        Some(&bound_ip),
+                        &request_id,
+                    );
+                    // The caller may hold a leaked key: never echo the bound
+                    // IP (or any device detail) back in the error body.
+                    let message = "this key is bound to another device; the gateway admin can clear the binding with `umsp client unbind`";
+                    if req.uri().path().starts_with("/v1/messages") {
+                        messages_error(
+                            StatusCode::FORBIDDEN,
+                            "permission_error",
+                            "device_mismatch",
+                            message,
+                            &request_id,
+                        )
+                    } else {
+                        gateway_error(
+                            StatusCode::FORBIDDEN,
+                            "device_mismatch",
+                            message,
+                            &request_id,
+                        )
+                    }
+                }
+                crate::bindings::BindOutcome::PersistFailed => {
+                    let request_id = util::new_request_id();
+                    plog_binding(
+                        "binding_persist_failed",
+                        &client.name,
+                        &ip,
+                        None,
+                        &request_id,
+                    );
+                    gateway_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "binding_persist_failed",
+                        "device binding could not be persisted; request rejected",
+                        &request_id,
+                    )
+                }
+            }
         }
         None => {
             let request_id = util::new_request_id();
@@ -1374,6 +1465,8 @@ async fn probe_provider(state: &AppState, cfg: &Config, provider: &Provider) -> 
 struct Prepared {
     cfg: Arc<Config>,
     client: Client,
+    /// Effective source IP resolved by the auth layer (device binding).
+    client_ip: String,
     request_id: String,
     started: Instant,
     bytes_in: u64,
@@ -1412,6 +1505,13 @@ async fn prepare_request(
             ));
         }
     };
+    // Resolved by the auth layer; the fallback only fires for in-process
+    // callers that bypass the middleware (tests).
+    let req_ip = req
+        .extensions()
+        .get::<ClientIp>()
+        .map(|c| c.0.clone())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
 
     let cfg = state.cfg();
     let (parts, body) = req.into_parts();
@@ -1662,6 +1762,7 @@ async fn prepare_request(
     Ok(Prepared {
         cfg,
         client,
+        client_ip: req_ip,
         request_id,
         started,
         bytes_in,
@@ -1677,6 +1778,7 @@ async fn chat_handler(State(state): State<AppState>, req: Request) -> Response {
     let Prepared {
         cfg,
         client,
+        client_ip,
         request_id,
         started,
         bytes_in,
@@ -1721,6 +1823,7 @@ async fn chat_handler(State(state): State<AppState>, req: Request) -> Response {
             state,
             cfg,
             client,
+            client_ip,
             request_id,
             started,
             bytes_in,
@@ -1739,6 +1842,7 @@ async fn chat_handler(State(state): State<AppState>, req: Request) -> Response {
         state,
         cfg,
         client,
+        client_ip,
         request_id,
         started,
         bytes_in,
@@ -2565,6 +2669,7 @@ async fn proxy_non_stream(
     state: AppState,
     cfg: Arc<Config>,
     client: Client,
+    client_ip: String,
     request_id: String,
     started: Instant,
     bytes_in: u64,
@@ -2772,6 +2877,7 @@ async fn proxy_non_stream(
     let mut record = request_record(
         &request_id,
         &client.name,
+        &client_ip,
         protocol,
         &target.model.id,
         &target.provider.id,
@@ -2930,6 +3036,7 @@ async fn responses_handler(State(state): State<AppState>, req: Request) -> Respo
     let Prepared {
         cfg,
         client,
+        client_ip,
         request_id,
         started,
         bytes_in,
@@ -2957,6 +3064,7 @@ async fn responses_handler(State(state): State<AppState>, req: Request) -> Respo
             state,
             cfg,
             client,
+            client_ip,
             request_id,
             started,
             bytes_in,
@@ -2975,6 +3083,7 @@ async fn responses_handler(State(state): State<AppState>, req: Request) -> Respo
         state,
         cfg,
         client,
+        client_ip,
         request_id,
         started,
         bytes_in,
@@ -3009,6 +3118,7 @@ async fn messages_handler(State(state): State<AppState>, req: Request) -> Respon
     let Prepared {
         cfg,
         client,
+        client_ip,
         request_id,
         started,
         bytes_in,
@@ -3033,6 +3143,7 @@ async fn messages_handler(State(state): State<AppState>, req: Request) -> Respon
             state,
             cfg,
             client,
+            client_ip,
             request_id,
             started,
             bytes_in,
@@ -3051,6 +3162,7 @@ async fn messages_handler(State(state): State<AppState>, req: Request) -> Respon
         state,
         cfg,
         client,
+        client_ip,
         request_id,
         started,
         bytes_in,
@@ -3075,6 +3187,7 @@ async fn messages_count_tokens_handler(State(state): State<AppState>, req: Reque
     let Prepared {
         cfg,
         client,
+        client_ip,
         request_id,
         started,
         bytes_in,
@@ -3107,6 +3220,7 @@ async fn messages_count_tokens_handler(State(state): State<AppState>, req: Reque
         state,
         cfg,
         client,
+        client_ip,
         request_id,
         started,
         bytes_in,
@@ -3174,6 +3288,7 @@ fn inject_stream_include_usage(payload: &mut Value) -> bool {
 fn request_record(
     request_id: &str,
     client: &str,
+    client_ip: &str,
     protocol: &str,
     requested_model: &str,
     provider: &str,
@@ -3187,6 +3302,7 @@ fn request_record(
         ts: util::now_rfc3339(),
         request_id: request_id.to_string(),
         client: client.to_string(),
+        client_ip: Some(client_ip.to_string()),
         protocol: protocol.to_string(),
         requested_model: requested_model.to_string(),
         provider: provider.to_string(),
@@ -3293,6 +3409,7 @@ async fn proxy_stream(
     state: AppState,
     cfg: Arc<Config>,
     client: Client,
+    client_ip: String,
     request_id: String,
     started: Instant,
     bytes_in: u64,
@@ -3331,6 +3448,7 @@ async fn proxy_stream(
         request_record(
             &request_id,
             &client.name,
+            &client_ip,
             protocol_name,
             &first.model.id,
             &first.provider.id,
@@ -3999,6 +4117,7 @@ fn log_gateway_error(
         ts: util::now_rfc3339(),
         request_id: request_id.to_string(),
         client: client.to_string(),
+        client_ip: None,
         protocol: protocol.to_string(),
         requested_model: requested_model.to_string(),
         provider: provider.to_string(),
@@ -4044,6 +4163,27 @@ pub fn plog(
         "client": client,
         "provider": provider,
         "code": code,
+    });
+    eprintln!("{line}");
+}
+
+/// Operational log for device-binding events. Server-side only: the bound IP
+/// never appears in client-facing responses.
+fn plog_binding(
+    event: &str,
+    client: &str,
+    presented_ip: &str,
+    bound_ip: Option<&str>,
+    request_id: &str,
+) {
+    let line = json!({
+        "ts": util::now_rfc3339(),
+        "level": if event == "client_bound" { "info" } else { "warn" },
+        "event": event,
+        "request_id": request_id,
+        "client": client,
+        "presented_ip": presented_ip,
+        "bound_ip": bound_ip,
     });
     eprintln!("{line}");
 }
@@ -4437,7 +4577,9 @@ pub async fn serve(config_path: &std::path::Path, listen_override: Option<String
                     let issues = cfg.validate();
                     let errors = issues.iter().filter(|i| i.level == "error").count();
                     if errors == 0 {
+                        let state_dir = cfg.server.state_path();
                         reload_state.replace_config(cfg);
+                        reload_state.reload_bindings(&state_dir);
                         plog("info", "config_reloaded", "-", None, None, None);
                     } else {
                         plog(

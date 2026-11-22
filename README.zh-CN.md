@@ -63,7 +63,15 @@ curl -s http://127.0.0.1:3460/v1/chat/completions \
   -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"Reply with only: OK"}]}' | jq
 ```
 
-`Authorization: Bearer $UMSP_API_KEY` 与 `x-api-key` 等价。
+`Authorization: Bearer *** 与 `x-api-key` 等价。
+
+### 设备绑定（一 key 一设备）
+
+客户端 key 采用首次使用信任（TOFU）设备绑定：新建的 key 未绑定，**第一个鉴权成功的请求**把它绑定到该请求的来源 IP。此后这把 key 的请求必须来自同一 IP，否则拒绝 `403 device_mismatch`（错误体不泄露已绑 IP）。绑定持久化在 `state_dir/client-bindings.json`，重启不丢。
+
+- 经反向代理时，真实客户端 IP 取可信回环代理写入的 `X-Forwarded-For` 最右一条，客户端伪造的条目被忽略；本机（回环）调用方绑定到 `127.0.0.1`。
+- `umsp client list` 显示每把 key 的绑定 IP；`umsp client unbind <名字>` 清除绑定（下次请求重新绑定——设备 IP 变化时用）；`rotate` 与 `remove` 自动清除。
+- 同一 NAT 后的设备共享一个公网 IP，无法互相区分；按设备各发一把 key 用于审计与单独吊销。
 
 ## 配置
 
@@ -117,7 +125,7 @@ umsp provider list|add|remove|test      # 上游实例；add 使用内置厂商�
 umsp login|logout grok                  # 每个 provider 独立的 Grok 设备码登录
 umsp model list|add|remove              # 逻辑模型与别名
 umsp model backend add|remove           # 增删后端（--first 提到最前）
-umsp client list|add|remove|rotate      # 客户端 key（只存 SHA-256）
+umsp client list|add|remove|rotate|unbind # 客户端 key（只存 SHA-256）+ TOFU 设备绑定
 umsp env list|set|unset                 # 上游密钥，掩码显示
 umsp usage summary|by-model|prune       # 查询请求账本
 umsp doctor [--online]                  # 诊断；--online 会花少量 token

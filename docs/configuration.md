@@ -21,8 +21,8 @@ config path globally.
 | `umsp env list\|set\|unset` | Manage upstream keys in the env file (masked display only; `set` hides input on a TTY) |
 | `umsp model list [--aliases]\|add\|remove` | Manage the local model registry (logical id + aliases) |
 | `umsp model backend add\|remove` | Attach/detach a backend for an existing model (`--first` inserts at the front of the tie-break order) |
-| `umsp client list\|add\|remove\|rotate` | Manage client keys (only SHA-256 stored) |
-| `umsp key list\|add\|revoke` | Compatibility alias for `client` |
+| `umsp client list\|add\|remove\|rotate\|unbind` | Manage client keys (only SHA-256 stored); `list` shows the TOFU device binding, `unbind` clears it |
+| `umsp key list\|add\|revoke\|unbind` | Compatibility alias for `client` |
 | `umsp usage summary\|by-client\|by-model\|by-protocol\|prune` | Aggregate the JSONL ledger |
 | `umsp probe --provider ID [--model ID]` | Send one minimal request (chat) to a provider |
 | `umsp call --model ID --prompt TEXT` | Call the upstream once directly (chat, non-streaming) |
@@ -182,3 +182,39 @@ Conventions:
   overrides the env file path.
 - `/v1/models` shows exactly one entry per logical model, with no provider / upstream fields; view
   aliases with `umsp model list --aliases`.
+
+## Device binding (TOFU)
+
+Every client key is bound to one device by trust-on-first-use: the key starts
+unbound, the first authenticated request binds it to the effective source IP,
+and later requests from any other IP get `403 device_mismatch`. The error body
+never reveals the bound IP. Bindings live in `state_dir/client-bindings.json`
+(written atomically by the data plane, never in config.toml) and survive
+restarts; a corrupt file starts empty with an operational warning.
+
+Effective IP resolution:
+
+- The socket peer is used directly for non-loopback peers.
+- UMSP listens on loopback, so proxied requests arrive with peer `127.0.0.1`;
+  the real client IP is the **rightmost** `X-Forwarded-For` entry — the one the
+  trusted proxy wrote. Entries left of it are client-supplied and ignored, and
+  a non-parsing rightmost entry falls back to the peer address. Configure the
+  proxy to overwrite the header (Caddy: `header_up X-Forwarded-For {remote_host}`).
+- In-process requests without a socket peer (tests) are treated as loopback.
+
+Lifecycle:
+
+- `umsp client list` shows `bound_ip` per client (`-` when unbound).
+- `umsp client unbind <name>` clears the binding; the next request re-binds.
+  Use it when the bound device's IP changes (dynamic broadband, travel).
+- `umsp client rotate <name>` issues a new key and clears the binding;
+  `remove` clears it too, so a re-added name never inherits an old binding.
+- The server re-reads the binding file on SIGHUP, so CLI edits reach the
+  running data plane without a restart.
+- A first-use binding that cannot be persisted fails the request closed
+  (`500 binding_persist_failed`) instead of silently resetting TOFU.
+
+Limits: devices behind one NAT share a public IP and cannot be told apart;
+binding is per key, so issue one key per device. Binding events (`client_bound`,
+`device_mismatch`) go to the operational log with both IPs; ledger rows carry
+`client_ip` for attribution.

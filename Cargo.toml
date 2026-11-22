@@ -1,6 +1,6 @@
 [package]
 name = "umsp"
-version = "0.1.9"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 # Never published to crates.io: install via the release archive or `make install`.

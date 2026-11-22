@@ -222,6 +222,7 @@ mod tests {
             ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             request_id: "req".into(),
             client: client.into(),
+            client_ip: None,
             protocol: protocol.into(),
             requested_model: model.into(),
             provider: provider.into(),

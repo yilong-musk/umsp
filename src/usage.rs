@@ -205,6 +205,10 @@ pub struct RequestRecord {
     pub ts: String,
     pub request_id: String,
     pub client: String,
+    /// Effective source IP of the client (proxy-resolved). Absent on rows
+    /// written before device binding existed, and on pre-routing error rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_ip: Option<String>,
     pub protocol: String,
     pub requested_model: String,
     pub provider: String,
@@ -594,6 +598,7 @@ mod tests {
                 .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             request_id: "x".into(),
             client: "c".into(),
+            client_ip: None,
             protocol: "chat".into(),
             requested_model: "od/m".into(),
             provider: "od".into(),

@@ -907,6 +907,7 @@ pub fn run_client(path: &Path, cmd: ClientCmd, json: bool, no_reload: bool) -> R
         ClientCmd::Add(args) => client_add(path, args, json, no_reload),
         ClientCmd::Remove { name } => client_remove(path, &name, json, no_reload),
         ClientCmd::Rotate { name } => client_rotate(path, &name, json, no_reload),
+        ClientCmd::Unbind { name } => client_unbind(path, &name, json, no_reload),
     }
 }
 
@@ -915,11 +916,13 @@ pub fn run_key(path: &Path, cmd: KeyCmd, json: bool, no_reload: bool) -> Result<
         KeyCmd::List => client_list(path, json),
         KeyCmd::Add(args) => client_add(path, args, json, no_reload),
         KeyCmd::Revoke { name } => client_remove(path, &name, json, no_reload),
+        KeyCmd::Unbind { name } => client_unbind(path, &name, json, no_reload),
     }
 }
 
 fn client_list(path: &Path, json: bool) -> Result<i32> {
     let cfg = crate::commands::load_config(path)?;
+    let bindings = crate::bindings::BindingStore::load(&cfg.server.state_path());
     let rows: Vec<Value> = cfg
         .clients
         .iter()
@@ -927,6 +930,7 @@ fn client_list(path: &Path, json: bool) -> Result<i32> {
             json!({
                 "name": c.name,
                 "key_prefix": c.key_prefix,
+                "bound_ip": bindings.bound_ip(&c.name),
                 "allowed_models": if c.allowed_models.is_empty() { vec!["*".to_string()] } else { c.allowed_models.clone() },
                 "allowed_protocols": c.allowed_protocols,
             })
@@ -939,9 +943,10 @@ fn client_list(path: &Path, json: bool) -> Result<i32> {
     } else {
         for row in &rows {
             println!(
-                "{:<16} {:<20} models:{:<24} protocols:{}",
+                "{:<16} {:<20} bound:{:<16} models:{:<24} protocols:{}",
                 row["name"].as_str().unwrap_or("-"),
                 row["key_prefix"].as_str().unwrap_or("-"),
+                row["bound_ip"].as_str().unwrap_or("-"),
                 row["allowed_models"]
                     .as_array()
                     .map(|a| a
@@ -1034,6 +1039,11 @@ fn client_remove(path: &Path, name: &str, json: bool, no_reload: bool) -> Result
         return Err(UmspError::not_found(format!("client '{name}' not found")));
     }
     doc.save()?;
+    // A re-added client with the same name must not inherit the old binding.
+    let cfg = Config::load(path)?;
+    crate::bindings::BindingStore::load(&cfg.server.state_path())
+        .unbind(name)
+        .map_err(|e| UmspError::other("BINDING", format!("could not clear device binding: {e}")))?;
     after_edit(path, no_reload)?;
     crate::commands::emit(json, json!({"removed": name}), || {
         format!("revoked client {name}")
@@ -1073,6 +1083,10 @@ fn client_rotate(path: &Path, name: &str, json: bool, no_reload: bool) -> Result
         ));
     }
     doc.save()?;
+    // New key, new identity: the old device binding must not carry over.
+    crate::bindings::BindingStore::load(&existing.server.state_path())
+        .unbind(name)
+        .map_err(|e| UmspError::other("BINDING", format!("could not clear device binding: {e}")))?;
     after_edit(path, no_reload)?;
 
     let value = json!({"client": {"name": name, "key": plaintext, "key_prefix": prefix}});
@@ -1083,6 +1097,29 @@ fn client_rotate(path: &Path, name: &str, json: bool, no_reload: bool) -> Result
         println!("new key (shown once): {plaintext}");
     }
     Ok(0)
+}
+
+fn client_unbind(path: &Path, name: &str, json: bool, no_reload: bool) -> Result<i32> {
+    let cfg = Config::load(path)?;
+    if cfg.client(name).is_none() {
+        return Err(UmspError::not_found(format!("client '{name}' not found")));
+    }
+    let store = crate::bindings::BindingStore::load(&cfg.server.state_path());
+    let was_bound = store
+        .unbind(name)
+        .map_err(|e| UmspError::other("BINDING", format!("could not clear device binding: {e}")))?;
+    after_edit(path, no_reload)?;
+    crate::commands::emit(
+        json,
+        json!({"unbound": name, "was_bound": was_bound}),
+        || {
+            if was_bound {
+                format!("cleared device binding for {name}; the next request re-binds")
+            } else {
+                format!("client {name} was not bound")
+            }
+        },
+    )
 }
 
 #[cfg(test)]

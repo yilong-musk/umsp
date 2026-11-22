@@ -365,6 +365,7 @@ mod tests {
             ts: "2026-11-19T00:00:00Z".to_string(),
             request_id: "req_1".to_string(),
             client: "secret-client".to_string(),
+            client_ip: None,
             protocol: "chat".to_string(),
             requested_model: model.to_string(),
             provider: provider.to_string(),
