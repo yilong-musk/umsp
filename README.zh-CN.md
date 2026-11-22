@@ -104,7 +104,7 @@ allowed_protocols = ["chat", "responses", "messages"]
 - 上游密钥只放 `env`，`config.toml` 只写 `api_key_env` 变量名
 - 优先级：`--config` > `$UMSP_CONFIG` > `~/.config/umsp/config.toml`；
   `$UMSP_LISTEN`、`$UMSP_STATE_DIR`、`$UMSP_ENV_FILE` 可覆盖单项
-- `/v1/models` 一个逻辑模型一条，不暴露 provider。网关每 12 小时读取各 provider 的模型列表并按 id 去重。列表里带的上下文、输出上限、显示名和能力（文本 / 视觉 / 推理）直接采用；上游没给的字段才用手写 `[[models]]` 补，而且不会盖掉上游已经给的值。`umsp catalog refresh` 立刻重读。`allowed_models = ["*"]`（或留空）才会把这份完整列表给调用方。
+- `/v1/models` 一个逻辑模型一条，不暴露 provider。网关每 12 小时读取各 provider 的模型列表并按 id 去重。列表里带的上下文、输出上限、显示名和能力直接采用。上游没给的字段先用文档里的缺省值补，缺省值不会盖掉上游已经给的值；手写 `[[models]]` 只补这之后仍空着的字段。`umsp catalog refresh` 立刻重读。`allowed_models = ["*"]`（或留空）才会把这份完整列表给调用方。
 - `provider add --vendor ID` 只收厂商 id 与 key；每次添加分配独立 id
 
 完整 schema、provider/model/client 管理与全部 CLI 示例见
