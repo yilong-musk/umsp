@@ -166,6 +166,15 @@ Messages 走 `https://token-plan.maas.qianwenaiapi.com/apps/anthropic`。
 密钥变量是 `QWEN_TOKEN_PLAN_API_KEY`。该套餐限定在交互式客户端。
 旧的华北 2 域名 `token-plan.cn-beijing.maas.aliyuncs.com` 目前仍可应答，但不是后台给出的地址。
 
+## OpenCode Go
+
+`umsp provider add --vendor opencode-go` 走 OpenCode Go 订阅地址
+`https://opencode.ai/inference/go`，不是按量地址，也没有免费模型（免费模型在 OpenCode 外面会 403）。
+密钥是控制台的 API key，变量名 `OPENCODE_GO_API_KEY`。Chat 和 Responses 用 OpenAI 那条，
+Messages 用 `https://opencode.ai/inference/go/anthropic`。每个请求带 `User-Agent: umsp/<版本>`
+和 `x-opencode-session`。客户端自己带了这个头就沿用，否则用模型和第一条消息算出一个稳定会话号。
+Go 没有余额或剩余额度接口，所以这家按「没有用量快照」排序。
+
 ## 文档
 
 | 文档 | 内容 |

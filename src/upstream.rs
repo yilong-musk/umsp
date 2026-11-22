@@ -5,6 +5,9 @@ use std::sync::Arc;
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::redirect::Policy;
 
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+
 use crate::config::{Config, Provider};
 use crate::error::{Result, UmspError};
 
@@ -197,6 +200,85 @@ pub fn join_url(base: &str, path: &str) -> String {
     )
 }
 
+/// User-Agent OpenCode Go asks other clients to send. A generic HTTP library
+/// name is treated as unidentified traffic.
+pub const OPENCODE_USER_AGENT: &str = concat!("umsp/", env!("CARGO_PKG_VERSION"));
+
+/// Session id for one OpenCode Go conversation. A client-supplied
+/// `x-opencode-session` wins. Otherwise the id is a hash of the model and the
+/// first message, so the same opening turn keeps one session across requests.
+pub fn opencode_session(headers: &HeaderMap, body: &Value) -> String {
+    if let Some(given) = headers
+        .get("x-opencode-session")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| acceptable_session(value))
+    {
+        return given.to_string();
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"umsp-opencode-go\0");
+    if let Some(model) = body.get("model").and_then(Value::as_str) {
+        hasher.update(model.as_bytes());
+    }
+    hasher.update(b"\0");
+    if let Some(text) = first_turn_text(body) {
+        let bytes = text.as_bytes();
+        hasher.update(&bytes[..bytes.len().min(4096)]);
+    }
+    format!("umsp-{}", crate::util::hex_encode(&hasher.finalize()[..16]))
+}
+
+fn acceptable_session(value: &str) -> bool {
+    (8..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
+fn first_turn_text(body: &Value) -> Option<String> {
+    if let Some(messages) = body.get("messages").and_then(Value::as_array) {
+        for message in messages {
+            if let Some(text) = content_text(message.get("content")) {
+                return Some(text);
+            }
+        }
+    }
+    content_text(body.get("input")).or_else(|| {
+        body.get("input")
+            .and_then(Value::as_array)
+            .and_then(|items| {
+                items.iter().find_map(|item| {
+                    content_text(item.get("content")).or_else(|| content_text(Some(item)))
+                })
+            })
+    })
+}
+
+fn content_text(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    if let Some(text) = value.as_str() {
+        let text = text.trim();
+        if !text.is_empty() {
+            return Some(text.to_string());
+        }
+    }
+    let parts = value.as_array()?;
+    for part in parts {
+        if let Some(text) = part.get("text").and_then(Value::as_str).map(str::trim) {
+            if !text.is_empty() {
+                return Some(text.to_string());
+            }
+        }
+        if let Some(text) = part.as_str().map(str::trim) {
+            if !text.is_empty() {
+                return Some(text.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Append the client's raw query string to an upstream URL (Claude Code sends
 /// `/v1/messages?beta=true`; spec 2.0 says keep query parameters as-is).
 pub fn append_query(url: String, query: Option<&str>) -> String {
@@ -286,6 +368,28 @@ mod tests {
     fn client_version_errors_are_retryable() {
         assert!(status_is_retryable(426));
         assert!(!status_is_retryable(400));
+    }
+
+    #[test]
+    fn opencode_session_keeps_a_client_id_and_hashes_the_opening_turn() {
+        let body = serde_json::json!({
+            "model": "glm-5.3",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let mut headers = HeaderMap::new();
+        let derived = opencode_session(&headers, &body);
+        assert!(derived.starts_with("umsp-"));
+        assert_eq!(derived, opencode_session(&headers, &body));
+        let other = serde_json::json!({
+            "model": "glm-5.3",
+            "messages": [{"role": "user", "content": "other chat"}]
+        });
+        assert_ne!(derived, opencode_session(&headers, &other));
+        headers.insert(
+            "x-opencode-session",
+            HeaderValue::from_static("ses_client_chat"),
+        );
+        assert_eq!(opencode_session(&headers, &body), "ses_client_chat");
     }
 
     #[test]

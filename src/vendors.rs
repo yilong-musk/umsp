@@ -77,6 +77,16 @@ pub const VENDORS: &[Vendor] = &[
         auth: "api_key",
         docs_url: Some("https://help.aliyun.com/zh/model-studio/base-url"),
     },
+    Vendor {
+        id: "opencode-go",
+        name: "OpenCode Go",
+        base_url: "https://opencode.ai/inference/go/openai/v1",
+        anthropic_base_url: Some("https://opencode.ai/inference/go/anthropic"),
+        protocols: &["chat", "responses", "messages"],
+        quirks: None,
+        auth: "api_key",
+        docs_url: Some("https://opencode.ai/docs/console/go"),
+    },
 ];
 
 pub fn find(id: &str) -> Option<&'static Vendor> {
@@ -127,6 +137,21 @@ mod tests {
         );
         assert_eq!(vendor.protocols, &["chat", "responses", "messages"]);
         assert!(vendor.quirks.is_none());
+        assert_eq!(vendor.auth, "api_key");
+    }
+
+    #[test]
+    fn opencode_go_uses_the_subscription_host_not_payg() {
+        let vendor = find("opencode-go").expect("catalog entry");
+        assert_eq!(
+            vendor.base_url,
+            "https://opencode.ai/inference/go/openai/v1"
+        );
+        assert_eq!(
+            vendor.anthropic_base_url,
+            Some("https://opencode.ai/inference/go/anthropic")
+        );
+        assert_eq!(vendor.protocols, &["chat", "responses", "messages"]);
         assert_eq!(vendor.auth, "api_key");
     }
 }
