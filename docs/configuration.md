@@ -200,6 +200,29 @@ Effective IP resolution:
   trusted proxy wrote. Entries left of it are client-supplied and ignored, and
   a non-parsing rightmost entry falls back to the peer address. Configure the
   proxy to overwrite the header (Caddy: `header_up X-Forwarded-For {remote_host}`).
+- **TCP passthrough edges need PROXY protocol.** A layer-4 proxy (e.g. haproxy
+  in `mode tcp`) re-originates the connection, so the TLS terminator sees the
+  proxy's address, not the client's — every public key would bind to one shared
+  loopback identity. The real IP only survives if the proxy emits PROXY
+  protocol (haproxy: `send-proxy-v2`, plus `check-send-proxy` on health checks)
+  and the TLS terminator parses it **before** the handshake. In Caddy (>= 2.7)
+  that is a dedicated listener with an explicit `tls` marker after the wrapper:
+
+  ```
+  servers 127.0.0.1:8445 {
+      listener_wrappers {
+          proxy_protocol {
+              allow 127.0.0.1/32 ::1/128
+              fallback_policy reject
+          }
+          tls
+      }
+  }
+  ```
+
+  Without the `tls` marker the handshake receives the raw PROXY bytes and
+  fails. Use a TLS-level health check (`check-ssl` in haproxy) so probes do not
+  abort mid-handshake.
 - In-process requests without a socket peer (tests) are treated as loopback.
 
 Lifecycle:
