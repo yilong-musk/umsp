@@ -66,8 +66,8 @@ struct Inner {
     probe_cache: Mutex<HashMap<String, ProbeCacheEntry>>,
     circuits: CircuitBreaker,
     routes: Mutex<RouteTable>,
-    /// Last successful upstream model-id list, keyed by provider id.
-    catalog: RwLock<HashMap<String, Vec<String>>>,
+    /// Last successful upstream model list, keyed by provider id.
+    catalog: RwLock<HashMap<String, Vec<crate::catalog::ListedModel>>>,
     /// When the catalog was last refreshed, automatic or manual.
     catalog_refreshed_at: Mutex<Option<Instant>>,
     logs: LogStore,
@@ -253,7 +253,8 @@ impl AppState {
 
     /// Logical models callers can request. Before any upstream list has been
     /// read this is the configured set. After that it is the deduplicated
-    /// union, with configured metadata and unlisted models kept.
+    /// union. Metadata comes from the upstream list when that list carries it;
+    /// configured entries fill only the gaps and keep unlisted models.
     pub fn models(&self) -> Vec<Model> {
         let cfg = self.cfg();
         let listings = self
@@ -273,12 +274,12 @@ impl AppState {
         crate::catalog::merge(&cfg.models, &provider_ids, &listings)
     }
 
-    fn note_catalog(&self, provider: &str, ids: Vec<String>) {
+    fn note_catalog(&self, provider: &str, models: Vec<crate::catalog::ListedModel>) {
         self.inner
             .catalog
             .write()
             .expect("catalog lock poisoned")
-            .insert(provider.to_string(), ids);
+            .insert(provider.to_string(), models);
     }
 
     fn catalog_due(&self) -> bool {
@@ -4021,9 +4022,9 @@ async fn refresh_catalog(state: &AppState) -> Vec<Value> {
     let mut rows = Vec::new();
     for provider in &cfg.providers {
         match fetch_model_ids(state, provider).await {
-            Ok(ids) => {
-                let count = ids.len();
-                state.note_catalog(&provider.id, ids);
+            Ok(models) => {
+                let count = models.len();
+                state.note_catalog(&provider.id, models);
                 plog_health("catalog", &provider.id, "", &format!("models_{count}"));
                 rows.push(json!({"id": provider.id, "models": count}));
             }
@@ -4049,7 +4050,7 @@ async fn catalog_refresh_handler(State(state): State<AppState>) -> Response {
 async fn fetch_model_ids(
     state: &AppState,
     provider: &Provider,
-) -> std::result::Result<Vec<String>, String> {
+) -> std::result::Result<Vec<crate::catalog::ListedModel>, String> {
     let token = if provider.uses_oauth() {
         state
             .sessions()
@@ -4089,7 +4090,7 @@ async fn fetch_model_ids(
         .json()
         .await
         .map_err(|err| format!("invalid json: {err}"))?;
-    crate::catalog::parse_model_ids(&body).ok_or_else(|| "unrecognized model list".to_string())
+    crate::catalog::parse_models(&body).ok_or_else(|| "unrecognized model list".to_string())
 }
 
 /// Background circuit recovery and provider health (spec 3.4). DeepSeek gets a
