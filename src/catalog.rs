@@ -22,6 +22,9 @@ use crate::config::{Backend, DEFAULT_CREATED, Model};
 pub struct ListedModel {
     pub id: String,
     pub context_length: u64,
+    /// Every tier from `context_windows` / `context_lengths`, plus the singular
+    /// window. Empty only when the list gave no number at all.
+    pub context_lengths: Vec<u64>,
     pub max_completion_tokens: u64,
     pub capabilities: Vec<String>,
     pub display_name: Option<String>,
@@ -50,13 +53,15 @@ pub fn parse_models(body: &Value) -> Option<Vec<ListedModel>> {
         }
         let (reasoning, reasoning_known) = reasoning_state(row);
         let (capabilities, modalities_known) = capabilities_of(row, reasoning);
+        let context_length = first_u64(
+            row,
+            &["context_length", "context_window"],
+            &["context_limit"],
+        );
         models.push(ListedModel {
             id: id.to_string(),
-            context_length: first_u64(
-                row,
-                &["context_length", "context_window"],
-                &["context_limit"],
-            ),
+            context_length,
+            context_lengths: listed_tiers(row, context_length),
             max_completion_tokens: first_u64(
                 row,
                 &["max_completion_tokens", "max_output_tokens"],
@@ -119,6 +124,7 @@ pub fn merge(
     for model in &mut models {
         let flags = gaps.get(&model.id).copied().unwrap_or_default();
         crate::model_defaults::apply(model, flags.modalities_known, flags.reasoning_known);
+        normalize_context(model);
     }
 
     let mut configured_only = Vec::new();
@@ -130,6 +136,7 @@ pub fn merge(
                 id: configured.id.clone(),
                 aliases: Vec::new(),
                 context_length: 0,
+                context_lengths: Vec::new(),
                 max_completion_tokens: 0,
                 capabilities: Vec::new(),
                 display_name: None,
@@ -147,10 +154,11 @@ pub fn merge(
 }
 
 fn from_listed(entry: &ListedModel, provider: &str) -> Model {
-    Model {
+    let mut model = Model {
         id: entry.id.clone(),
         aliases: Vec::new(),
         context_length: entry.context_length,
+        context_lengths: entry.context_lengths.clone(),
         max_completion_tokens: entry.max_completion_tokens,
         capabilities: if entry.capabilities.is_empty() {
             vec!["text".to_string()]
@@ -164,13 +172,25 @@ fn from_listed(entry: &ListedModel, provider: &str) -> Model {
             upstream: entry.id.clone(),
         }],
         description: entry.description.clone(),
-    }
+    };
+    normalize_context(&mut model);
+    model
 }
 
 fn fill_gaps(model: &mut Model, entry: &ListedModel) {
+    if model.context_lengths.is_empty() {
+        model.context_lengths.clone_from(&entry.context_lengths);
+    } else {
+        for tier in &entry.context_lengths {
+            if *tier > 0 && !model.context_lengths.contains(tier) {
+                model.context_lengths.push(*tier);
+            }
+        }
+    }
     if model.context_length == 0 {
         model.context_length = entry.context_length;
     }
+    normalize_context(model);
     if model.max_completion_tokens == 0 {
         model.max_completion_tokens = entry.max_completion_tokens;
     }
@@ -192,9 +212,15 @@ fn fill_from_static(model: &mut Model, configured: &Model) {
     if !configured.aliases.is_empty() {
         model.aliases = configured.aliases.clone();
     }
+    if model.context_lengths.is_empty() {
+        model
+            .context_lengths
+            .clone_from(&configured.context_lengths);
+    }
     if model.context_length == 0 {
         model.context_length = configured.context_length;
     }
+    normalize_context(model);
     if model.max_completion_tokens == 0 {
         model.max_completion_tokens = configured.max_completion_tokens;
     }
@@ -228,6 +254,53 @@ fn push_backend(model: &mut Model, backend: Backend) {
         return;
     }
     model.backends.push(backend);
+}
+
+fn listed_tiers(row: &Value, singular: u64) -> Vec<u64> {
+    let mut tiers = Vec::new();
+    for key in ["context_lengths", "context_windows"] {
+        let Some(items) = row.get(key).and_then(Value::as_array) else {
+            continue;
+        };
+        for item in items {
+            if let Some(tier) = number_of(Some(item)) {
+                if !tiers.contains(&tier) {
+                    tiers.push(tier);
+                }
+            }
+        }
+    }
+    if singular > 0 && !tiers.contains(&singular) {
+        tiers.push(singular);
+    }
+    tiers.sort_unstable();
+    tiers
+}
+
+/// One tier stays as the singular window. Several tiers keep every value, and
+/// `context_length` becomes the largest so a single-field client can use it.
+pub fn normalize_context(model: &mut Model) {
+    let mut tiers: Vec<u64> = model
+        .context_lengths
+        .iter()
+        .copied()
+        .filter(|tier| *tier > 0)
+        .collect();
+    if model.context_length > 0 && !tiers.contains(&model.context_length) {
+        tiers.push(model.context_length);
+    }
+    tiers.sort_unstable();
+    tiers.dedup();
+    if tiers.len() > 1 {
+        if let Some(largest) = tiers.iter().copied().max() {
+            model.context_length = largest;
+        }
+    } else if model.context_length == 0 {
+        if let Some(only) = tiers.first().copied() {
+            model.context_length = only;
+        }
+    }
+    model.context_lengths = tiers;
 }
 
 fn first_u64(row: &Value, top: &[&str], nested: &[&str]) -> u64 {
@@ -332,6 +405,7 @@ mod tests {
         ListedModel {
             id: id.into(),
             context_length: 0,
+            context_lengths: Vec::new(),
             max_completion_tokens: 0,
             capabilities: vec!["text".into()],
             display_name: None,
@@ -347,6 +421,7 @@ mod tests {
             id: id.into(),
             aliases: vec!["alias".into()],
             context_length: 1000,
+            context_lengths: Vec::new(),
             max_completion_tokens: 100,
             capabilities: vec!["text".into(), "tools".into()],
             display_name: Some(format!("Name {id}")),
@@ -419,6 +494,7 @@ mod tests {
         }]});
         let parsed = &parse_models(&grok).unwrap()[0];
         assert_eq!(parsed.context_length, 256_000);
+        assert_eq!(parsed.context_lengths, vec![256_000]);
         assert_eq!(parsed.display_name.as_deref(), Some("Grok 4.7"));
         assert_eq!(parsed.description.as_deref(), Some("frontier"));
         assert_eq!(
@@ -533,5 +609,22 @@ mod tests {
         assert_eq!(merged[0].context_length, 1_000_000);
         assert_eq!(merged[0].max_completion_tokens, 64 * 1024);
         assert_eq!(merged[0].aliases, vec!["alias".to_string()]);
+    }
+
+    #[test]
+    fn several_context_tiers_are_kept_and_the_largest_is_the_single_window() {
+        let body = json!({"data": [{
+            "id": "grok-4.7",
+            "context_window": 256000,
+            "context_windows": [500000, 256000, 256000]
+        }]});
+        let parsed = &parse_models(&body).unwrap()[0];
+        assert_eq!(parsed.context_length, 256_000);
+        assert_eq!(parsed.context_lengths, vec![256_000, 500_000]);
+        let mut listings = HashMap::new();
+        listings.insert("grok".into(), parse_models(&body).unwrap());
+        let merged = merge(&[], &["grok".into()], &listings);
+        assert_eq!(merged[0].context_lengths, vec![256_000, 500_000]);
+        assert_eq!(merged[0].context_length, 500_000);
     }
 }
