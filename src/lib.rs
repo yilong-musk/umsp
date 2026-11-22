@@ -16,6 +16,7 @@ pub mod grok_billing;
 pub mod health;
 pub mod keys;
 pub mod metrics;
+pub mod model_defaults;
 pub mod quirks;
 pub mod registry;
 pub mod route;

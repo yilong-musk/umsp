@@ -27,6 +27,11 @@ pub struct ListedModel {
     pub display_name: Option<String>,
     pub description: Option<String>,
     pub created: i64,
+    /// True when the list included input or output modalities. Absent modalities
+    /// are not a claim that the model is text-only.
+    pub modalities_known: bool,
+    /// True when the list included a reasoning flag or effort list, either way.
+    pub reasoning_known: bool,
 }
 
 /// Model rows from an OpenAI-style `{ "data": [ { "id", ... } ] }` body.
@@ -43,6 +48,8 @@ pub fn parse_models(body: &Value) -> Option<Vec<ListedModel>> {
         if id.is_empty() || models.iter().any(|seen| seen.id == id) {
             continue;
         }
+        let (reasoning, reasoning_known) = reasoning_state(row);
+        let (capabilities, modalities_known) = capabilities_of(row, reasoning);
         models.push(ListedModel {
             id: id.to_string(),
             context_length: first_u64(
@@ -55,7 +62,7 @@ pub fn parse_models(body: &Value) -> Option<Vec<ListedModel>> {
                 &["max_completion_tokens", "max_output_tokens"],
                 &["output_budget"],
             ),
-            capabilities: capabilities_of(row),
+            capabilities,
             display_name: non_empty_str(row.get("name")),
             description: non_empty_str(row.get("description")),
             created: row
@@ -63,6 +70,8 @@ pub fn parse_models(body: &Value) -> Option<Vec<ListedModel>> {
                 .and_then(Value::as_i64)
                 .filter(|created| *created > 0)
                 .unwrap_or(DEFAULT_CREATED),
+            modalities_known,
+            reasoning_known,
         });
     }
     Some(models)
@@ -76,6 +85,7 @@ pub fn merge(
     listings: &HashMap<String, Vec<ListedModel>>,
 ) -> Vec<Model> {
     let mut models: Vec<Model> = Vec::new();
+    let mut gaps: HashMap<String, GapFlags> = HashMap::new();
     for provider in provider_ids {
         let Some(listed) = listings.get(provider) else {
             continue;
@@ -83,6 +93,9 @@ pub fn merge(
         for entry in listed {
             if let Some(existing) = models.iter_mut().find(|model| model.id == entry.id) {
                 fill_gaps(existing, entry);
+                let flags = gaps.entry(entry.id.clone()).or_default();
+                flags.modalities_known |= entry.modalities_known;
+                flags.reasoning_known |= entry.reasoning_known;
                 push_backend(
                     existing,
                     Backend {
@@ -91,9 +104,21 @@ pub fn merge(
                     },
                 );
             } else {
+                gaps.insert(
+                    entry.id.clone(),
+                    GapFlags {
+                        modalities_known: entry.modalities_known,
+                        reasoning_known: entry.reasoning_known,
+                    },
+                );
                 models.push(from_listed(entry, provider));
             }
         }
+    }
+
+    for model in &mut models {
+        let flags = gaps.get(&model.id).copied().unwrap_or_default();
+        crate::model_defaults::apply(model, flags.modalities_known, flags.reasoning_known);
     }
 
     let mut configured_only = Vec::new();
@@ -101,7 +126,20 @@ pub fn merge(
         if let Some(existing) = models.iter_mut().find(|model| model.id == configured.id) {
             fill_from_static(existing, configured);
         } else {
-            configured_only.push(configured.clone());
+            let mut created = Model {
+                id: configured.id.clone(),
+                aliases: Vec::new(),
+                context_length: 0,
+                max_completion_tokens: 0,
+                capabilities: Vec::new(),
+                display_name: None,
+                created: DEFAULT_CREATED,
+                backends: Vec::new(),
+                description: None,
+            };
+            crate::model_defaults::apply(&mut created, false, false);
+            fill_from_static(&mut created, configured);
+            configured_only.push(created);
         }
     }
     models.extend(configured_only);
@@ -225,12 +263,14 @@ fn non_empty_str(value: Option<&Value>) -> Option<String> {
         .map(str::to_string)
 }
 
-fn capabilities_of(row: &Value) -> Vec<String> {
+fn capabilities_of(row: &Value, reasoning: bool) -> (Vec<String>, bool) {
     let inputs = modalities(row, "input_modalities");
     let outputs = modalities(row, "output_modalities");
+    let modalities_known = inputs.is_some() || outputs.is_some();
+    let inputs = inputs.unwrap_or_default();
+    let outputs = outputs.unwrap_or_default();
     let mut caps = Vec::new();
-    let saw_modality = !inputs.is_empty() || !outputs.is_empty();
-    if !saw_modality
+    if !modalities_known
         || inputs.iter().any(|mode| mode == "text")
         || outputs.iter().any(|mode| mode == "text")
     {
@@ -239,42 +279,48 @@ fn capabilities_of(row: &Value) -> Vec<String> {
     if inputs.iter().any(|mode| mode == "image" || mode == "video") {
         caps.push("vision".to_string());
     }
-    if supports_reasoning(row) {
+    if reasoning {
         caps.push("reasoning".to_string());
     }
-    caps
+    (caps, modalities_known)
 }
 
-fn modalities(row: &Value, key: &str) -> Vec<String> {
+fn modalities(row: &Value, key: &str) -> Option<Vec<String>> {
     let from_architecture = row
         .get("architecture")
         .and_then(|value| value.get(key))
         .and_then(Value::as_array);
     let from_top = row.get(key).and_then(Value::as_array);
-    from_architecture
-        .or(from_top)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(|mode| mode.to_string())
-                .collect()
-        })
-        .unwrap_or_default()
+    from_architecture.or(from_top).map(|items| {
+        items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|mode| mode.to_string())
+            .collect()
+    })
 }
 
-fn supports_reasoning(row: &Value) -> bool {
-    if row
+fn reasoning_state(row: &Value) -> (bool, bool) {
+    if let Some(flag) = row
         .get("supports_reasoning_effort")
         .and_then(Value::as_bool)
-        == Some(true)
     {
-        return true;
+        return (flag, true);
     }
-    row.get("effort")
-        .and_then(|effort| effort.get("supported_levels"))
-        .and_then(Value::as_array)
-        .is_some_and(|levels| !levels.is_empty())
+    if let Some(effort) = row.get("effort") {
+        let supported = effort
+            .get("supported_levels")
+            .and_then(Value::as_array)
+            .is_some_and(|levels| !levels.is_empty());
+        return (supported, true);
+    }
+    (false, false)
+}
+
+#[derive(Clone, Copy, Default)]
+struct GapFlags {
+    modalities_known: bool,
+    reasoning_known: bool,
 }
 
 #[cfg(test)]
@@ -291,6 +337,8 @@ mod tests {
             display_name: None,
             description: None,
             created: DEFAULT_CREATED,
+            modalities_known: false,
+            reasoning_known: false,
         }
     }
 
@@ -427,10 +475,10 @@ mod tests {
     #[test]
     fn static_metadata_fills_gaps_and_a_differently_named_backend_is_kept() {
         let mut listings = HashMap::new();
-        let mut upstream = listed("deepseek-v4.1-flash");
+        let mut upstream = listed("gap-model");
         upstream.context_length = 1_048_000;
         listings.insert("open-design".into(), vec![upstream]);
-        let configured = static_model("deepseek-v4.1-flash", "deepseek", "deepseek-flash");
+        let configured = static_model("gap-model", "deepseek", "deepseek-flash");
         let merged = merge(
             &[configured],
             &["open-design".into(), "deepseek".into()],
@@ -454,5 +502,36 @@ mod tests {
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].id, "qwen3.6-flash");
         assert_eq!(merged[1].id, "grok-4.7");
+    }
+
+    #[test]
+    fn a_documented_default_fills_an_empty_upstream_field_and_does_not_replace_one() {
+        let mut bare = listed("qwen3.6-flash");
+        bare.modalities_known = false;
+        bare.reasoning_known = false;
+        let mut known = listed("qwen3.6-flash");
+        known.context_length = 999;
+        known.modalities_known = true;
+        known.capabilities = vec!["text".into()];
+        let mut listings = HashMap::new();
+        listings.insert("qwen".into(), vec![bare]);
+        let filled = merge(&[], &["qwen".into()], &listings);
+        assert_eq!(filled[0].context_length, 1_000_000);
+        assert_eq!(filled[0].max_completion_tokens, 64 * 1024);
+        assert!(filled[0].capabilities.iter().any(|cap| cap == "vision"));
+        assert!(filled[0].capabilities.iter().any(|cap| cap == "tools"));
+
+        listings.insert("qwen".into(), vec![known]);
+        let kept = merge(&[], &["qwen".into()], &listings);
+        assert_eq!(kept[0].context_length, 999);
+        assert!(!kept[0].capabilities.iter().any(|cap| cap == "vision"));
+        assert!(kept[0].capabilities.iter().any(|cap| cap == "tools"));
+
+        let handwritten = static_model("qwen3.6-flash", "qwen", "qwen3.6-flash");
+        listings.insert("qwen".into(), vec![listed("qwen3.6-flash")]);
+        let merged = merge(&[handwritten], &["qwen".into()], &listings);
+        assert_eq!(merged[0].context_length, 1_000_000);
+        assert_eq!(merged[0].max_completion_tokens, 64 * 1024);
+        assert_eq!(merged[0].aliases, vec!["alias".to_string()]);
     }
 }
