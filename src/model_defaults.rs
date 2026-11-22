@@ -26,7 +26,7 @@ const MILLION: u64 = 1_000_000;
 /// - Qwen text limits: QwenCloud "Text generation and visual understanding"
 ///   (`qwen4-max` output 131,072; `qwen4-max-preview` Token Plan output 393,216;
 ///   Qwen3.8 output 128K; Qwen3.7 / Qwen3.6 output 64K; DeepSeek V4 output 384K).
-/// - Token Plan capabilities (vision or text-only): Alibaba Cloud "Token Plan（团队版）".
+/// - Token Plan capabilities (vision or text-only): Alibaba Cloud Token Plan team overview.
 /// - GLM-5.3 / GLM-5.2: Z.ai model cards, text only, 1M context, 128K output.
 /// - `decision-model-preview`: Model Studio card, context 65,536, max output 0, text only.
 /// - Image, video, and audio cards publish no token context. Capabilities name the
