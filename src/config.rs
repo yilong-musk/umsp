@@ -217,6 +217,11 @@ pub struct Model {
     pub aliases: Vec<String>,
     #[serde(default)]
     pub context_length: u64,
+    /// Every context tier an upstream published, ascending and without duplicates.
+    /// `context_length` is the largest of these when more than one is present,
+    /// so a caller that reads only one number can use the full window.
+    #[serde(default)]
+    pub context_lengths: Vec<u64>,
     #[serde(default)]
     pub max_completion_tokens: u64,
     #[serde(default)]
@@ -805,6 +810,7 @@ mod tests {
                 }],
                 aliases: vec!["m1".into()],
                 context_length: 1000,
+                context_lengths: Vec::new(),
                 max_completion_tokens: 100,
                 capabilities: vec!["text".into()],
                 display_name: None,
@@ -839,6 +845,7 @@ mod tests {
             }],
             aliases: vec!["m1".into()],
             context_length: 1000,
+            context_lengths: Vec::new(),
             max_completion_tokens: 100,
             capabilities: vec![],
             display_name: None,
@@ -858,6 +865,7 @@ mod tests {
             }],
             aliases: aliases.iter().map(|a| (*a).to_string()).collect(),
             context_length: 1000,
+            context_lengths: Vec::new(),
             max_completion_tokens: 100,
             capabilities: vec![],
             display_name: None,
@@ -965,6 +973,7 @@ mod tests {
             }],
             aliases: vec![],
             context_length: 1000,
+            context_lengths: Vec::new(),
             max_completion_tokens: 100,
             capabilities: vec![],
             display_name: None,

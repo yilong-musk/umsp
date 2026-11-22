@@ -43,12 +43,15 @@ pub fn alias_table(cfg: &Config) -> Vec<(String, String)> {
 /// this payload on purpose: a model is one logical entry, and callers should
 /// not have to care which backend serves it.
 pub fn model_payload(m: &Model) -> Value {
+    let mut view = m.clone();
+    crate::catalog::normalize_context(&mut view);
     json!({
         "id": m.id,
         "object": "model",
         "owned_by": "umsp",
         "created": m.created,
-        "context_length": m.context_length,
+        "context_length": view.context_length,
+        "context_lengths": view.context_lengths,
         "max_completion_tokens": m.max_completion_tokens,
         "capabilities": capabilities_object(&m.capabilities),
         "display_name": m.display_name(),
@@ -109,6 +112,7 @@ mod tests {
                 }],
                 aliases: vec!["m1".into()],
                 context_length: 1000,
+                context_lengths: Vec::new(),
                 max_completion_tokens: 100,
                 capabilities: vec!["text".into(), "tools".into()],
                 display_name: Some("Model One".into()),
@@ -133,6 +137,7 @@ mod tests {
         let payload = models_payload(&c);
         let model = &payload["data"][0];
         assert_eq!(model["context_length"], 1000);
+        assert_eq!(model["context_lengths"], json!([1000]));
         assert_eq!(model["max_completion_tokens"], 100);
         assert_eq!(model["capabilities"]["tools"], true);
         assert_eq!(model["capabilities"]["vision"], false);

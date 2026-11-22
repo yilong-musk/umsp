@@ -112,7 +112,7 @@ The data plane speaks Responses only for this vendor and adds the Grok CLI proxy
 
 ## Observability
 
-- `/v1/models`: one model = one object, with fields `id / object / owned_by="umsp" / created / context_length / max_completion_tokens / capabilities / display_name / description`; no provider, upstream, or backends.
+- `/v1/models`: one model = one object, with fields `id / object / owned_by="umsp" / created / context_length / context_lengths / max_completion_tokens / capabilities / display_name / description`; no provider, upstream, or backends. `context_lengths` lists every tier the upstream published, ascending. `context_length` is that only tier, or the largest when the upstream publishes more than one (Grok's `context_window` plus `context_windows`).
 - `/metrics`: the `model` label is the logical model id, `provider` is the backend that actually serves.
 - Ledger: `requested_model` stores the logical model id, `provider` / `upstream_model` store the actual backend, `fallbacks` is the number of switches, and `quirks` carries `fallback_from:<preferred provider>`.
 - Response headers: the client only ever sees `x-umsp-request-id`; provider, upstream model name, and upstream headers never leave the gateway.
