@@ -35,6 +35,9 @@ pub struct ListedModel {
     pub modalities_known: bool,
     /// True when the list included a reasoning flag or effort list, either way.
     pub reasoning_known: bool,
+    /// Protocols this row can actually be called on. Empty means the list did
+    /// not say, so the provider's own protocol list still applies.
+    pub supported_protocols: Vec<String>,
 }
 
 /// Model rows from an OpenAI-style `{ "data": [ { "id", ... } ] }` body.
@@ -104,6 +107,7 @@ pub fn parse_models(body: &Value) -> Option<Vec<ListedModel>> {
                 .unwrap_or(DEFAULT_CREATED),
             modalities_known,
             reasoning_known,
+            supported_protocols: supported_protocols(row),
         });
     }
     Some(models)
@@ -427,6 +431,52 @@ fn normalize_modality(mode: &str) -> String {
     }
 }
 
+fn supported_protocols(row: &Value) -> Vec<String> {
+    let Some(items) = row.get("supported_endpoints").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut protocols = Vec::new();
+    for item in items {
+        let Some(text) = item.as_str() else {
+            continue;
+        };
+        let protocol = match text.trim().trim_start_matches('/') {
+            "messages" => "messages",
+            "chat" | "chat/completions" => "chat",
+            "responses" => "responses",
+            _ => continue,
+        };
+        if !protocols.iter().any(|have: &String| have == protocol) {
+            protocols.push(protocol.to_string());
+        }
+    }
+    protocols
+}
+
+/// Protocols a backend may be called with. A listing that names endpoints
+/// narrows the provider list and keeps the provider's order. An empty or
+/// missing listing leaves the provider list unchanged.
+pub fn protocols_for(
+    listings: &HashMap<String, Vec<ListedModel>>,
+    provider_id: &str,
+    upstream: &str,
+    provider_protocols: &[String],
+) -> Vec<String> {
+    let Some(allowed) = listings
+        .get(provider_id)
+        .and_then(|rows| rows.iter().find(|row| row.id == upstream))
+        .map(|row| &row.supported_protocols)
+        .filter(|protocols| !protocols.is_empty())
+    else {
+        return provider_protocols.to_vec();
+    };
+    provider_protocols
+        .iter()
+        .filter(|protocol| allowed.iter().any(|have| have == *protocol))
+        .cloned()
+        .collect()
+}
+
 fn tools_supported(row: &Value) -> bool {
     row.get("capabilities")
         .and_then(|caps| caps.get("tools"))
@@ -488,6 +538,7 @@ mod tests {
             created: DEFAULT_CREATED,
             modalities_known: false,
             reasoning_known: false,
+            supported_protocols: Vec::new(),
         }
     }
 
@@ -627,6 +678,41 @@ mod tests {
         );
         assert!(parsed.modalities_known);
         assert!(parsed.reasoning_known);
+        assert_eq!(parsed.supported_protocols, Vec::<String>::new());
+    }
+
+    #[test]
+    fn command_code_endpoints_narrow_the_provider_protocols() {
+        let body = json!({"data": [
+            {"id": "claude-sonnet-5-5", "context_length": 1000000, "supported_endpoints": ["/messages"]},
+            {"id": "glm-5.3", "context_length": 200000, "supported_endpoints": ["/chat/completions", "/responses"]}
+        ]});
+        let parsed = parse_models(&body).unwrap();
+        assert_eq!(parsed[0].supported_protocols, vec!["messages".to_string()]);
+        assert_eq!(parsed[0].context_length, 1_000_000);
+        assert_eq!(
+            parsed[1].supported_protocols,
+            vec!["chat".to_string(), "responses".to_string()]
+        );
+        let mut listings = HashMap::new();
+        listings.insert("command-code".to_string(), parsed);
+        let provider = vec![
+            "chat".to_string(),
+            "responses".to_string(),
+            "messages".to_string(),
+        ];
+        assert_eq!(
+            protocols_for(&listings, "command-code", "claude-sonnet-5-5", &provider),
+            vec!["messages".to_string()]
+        );
+        assert_eq!(
+            protocols_for(&listings, "command-code", "glm-5.3", &provider),
+            vec!["chat".to_string(), "responses".to_string()]
+        );
+        assert_eq!(
+            protocols_for(&listings, "command-code", "not-listed", &provider),
+            provider
+        );
     }
 
     #[test]

@@ -274,6 +274,14 @@ impl AppState {
         crate::catalog::merge(&cfg.models, &provider_ids, &listings)
     }
 
+    fn catalog_snapshot(&self) -> HashMap<String, Vec<crate::catalog::ListedModel>> {
+        self.inner
+            .catalog
+            .read()
+            .expect("catalog lock poisoned")
+            .clone()
+    }
+
     fn note_catalog(&self, provider: &str, models: Vec<crate::catalog::ListedModel>) {
         self.inner
             .catalog
@@ -1874,19 +1882,28 @@ fn attempt_candidates(
     model: &Model,
     protocol: &str,
     count_tokens: bool,
+    listings: &HashMap<String, Vec<crate::catalog::ListedModel>>,
 ) -> Vec<AttemptTarget> {
     model
         .backends
         .iter()
         .filter_map(|backend| {
             let provider = cfg.providers.iter().find(|p| p.id == backend.provider)?;
+            let protocols = crate::catalog::protocols_for(
+                listings,
+                &provider.id,
+                &backend.upstream,
+                &provider.protocols,
+            );
             let upstream_protocol = if count_tokens {
-                if !provider.supports(protocol) || !provider.supports_count_tokens() {
+                if !protocols.iter().any(|item| item == protocol)
+                    || !provider.supports_count_tokens()
+                {
                     return None;
                 }
                 protocol
             } else {
-                crate::translate::select_upstream_protocol(&provider.protocols, protocol)?
+                crate::translate::select_upstream_protocol(&protocols, protocol)?
             };
             Some(AttemptTarget {
                 model: model.clone(),
@@ -2568,7 +2585,13 @@ async fn proxy_non_stream(
     let protocol = call.protocol();
     let count_tokens = matches!(call, NonStreamCall::MessagesCountTokens);
 
-    let candidates = attempt_candidates(&cfg, &model, protocol, count_tokens);
+    let candidates = attempt_candidates(
+        &cfg,
+        &model,
+        protocol,
+        count_tokens,
+        &state.catalog_snapshot(),
+    );
     if candidates.is_empty() {
         return no_backend_response(protocol, &model.id, &request_id);
     }
@@ -3065,7 +3088,7 @@ async fn messages_count_tokens_handler(State(state): State<AppState>, req: Reque
         Err(response) => return response,
     };
 
-    if attempt_candidates(&cfg, &model, "messages", true).is_empty() {
+    if attempt_candidates(&cfg, &model, "messages", true, &state.catalog_snapshot()).is_empty() {
         let message = format!(
             "count_tokens is not supported by any backend of model '{}'",
             model.id
@@ -3291,7 +3314,13 @@ async fn proxy_stream(
     let header_timeout = Duration::from_secs(cfg.server.stream_header_timeout_s.max(1));
     let protocol_name = protocol.name();
 
-    let candidates = attempt_candidates(&cfg, &model, protocol_name, false);
+    let candidates = attempt_candidates(
+        &cfg,
+        &model,
+        protocol_name,
+        false,
+        &state.catalog_snapshot(),
+    );
     if candidates.is_empty() {
         return no_backend_response(protocol_name, &model.id, &request_id);
     }

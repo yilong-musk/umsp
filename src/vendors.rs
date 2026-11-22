@@ -87,6 +87,16 @@ pub const VENDORS: &[Vendor] = &[
         auth: "api_key",
         docs_url: Some("https://opencode.ai/docs/console/go"),
     },
+    Vendor {
+        id: "command-code",
+        name: "Command Code",
+        base_url: "https://api.commandcode.ai/provider/v1",
+        anthropic_base_url: None,
+        protocols: &["chat", "responses", "messages"],
+        quirks: None,
+        auth: "api_key",
+        docs_url: Some("https://commandcode.ai/docs/provider"),
+    },
 ];
 
 pub fn find(id: &str) -> Option<&'static Vendor> {
@@ -151,6 +161,15 @@ mod tests {
             vendor.anthropic_base_url,
             Some("https://opencode.ai/inference/go/anthropic")
         );
+        assert_eq!(vendor.protocols, &["chat", "responses", "messages"]);
+        assert_eq!(vendor.auth, "api_key");
+    }
+
+    #[test]
+    fn command_code_uses_the_provider_api() {
+        let vendor = find("command-code").expect("catalog entry");
+        assert_eq!(vendor.base_url, "https://api.commandcode.ai/provider/v1");
+        assert!(vendor.anthropic_base_url.is_none());
         assert_eq!(vendor.protocols, &["chat", "responses", "messages"]);
         assert_eq!(vendor.auth, "api_key");
     }
