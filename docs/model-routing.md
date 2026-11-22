@@ -22,6 +22,8 @@ A fresh window was observed within five minutes and, when it has a reset time, s
 
 Grok's four `x-ratelimit-*` response headers are short-lived throttles (they refill within minutes), **not** the weekly subscription pool. The health loop polls `GET {base_url}/billing?format=credits` every four minutes using the provider's session token and the numeric `x-userid` from `GET {base_url}/v1/user`. It converts `creditUsagePercent` to `remaining_fraction = 1 - used / 100` and `currentPeriod.end` to the reset time. The pool is unified across Grok products (`isUnifiedBillingUser`). If billing cannot be read, the provider has no fresh usage and falls to X or B by its balance data.
 
+Qwen Token Plan stays in **X**. Its subscription quota is not on the model host: the `sk-sp-` key cannot read plan usage or a balance, and this gateway does not keep a console sign-in. Per-request token counts in a completion are ledger fields, not a usage window. With no snapshot, the provider is healthy while its circuit is closed and sorts after every provider that has fresh usage, ahead of balance-only providers.
+
 ## Configuration
 
 ```toml
