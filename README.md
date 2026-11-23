@@ -160,7 +160,7 @@ table of subcommands and flags.
 |---|---|---|---|
 | GET | `/healthz` | No | Curl-able status: circuit, failures, last result, fresh `usage` |
 | GET | `/metrics` | No | Prometheus text, in-memory, loopback only |
-| GET | `/v1/models` | Yes | Logical model registry |
+| GET | `/v1/models` | Yes | Logical model registry (flat metadata + `meta` envelope) |
 | POST | `/v1/chat/completions` | Yes | Chat Completions, streaming and non-streaming |
 | POST | `/v1/responses` | Yes | Responses, streaming and non-streaming |
 | POST | `/v1/messages` | Yes | Anthropic Messages, streaming and non-streaming |
