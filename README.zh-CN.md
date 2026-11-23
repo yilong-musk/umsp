@@ -112,7 +112,7 @@ allowed_protocols = ["chat", "responses", "messages"]
 - 上游密钥只放 `env`，`config.toml` 只写 `api_key_env` 变量名
 - 优先级：`--config` > `$UMSP_CONFIG` > `~/.config/umsp/config.toml`；
   `$UMSP_LISTEN`、`$UMSP_STATE_DIR`、`$UMSP_ENV_FILE` 可覆盖单项
-- `/v1/models` 一个逻辑模型一条，不暴露 provider。网关每 12 小时读取各 provider 的模型列表并按 id 去重。列表里带的上下文、输出上限、显示名和能力直接采用。上游给了多档上下文时，`context_lengths` 保留每一档，`context_length` 取最大的那档。上游没给的字段先用文档里的缺省值补，缺省值不会盖掉上游已经给的值；手写 `[[models]]` 只补这之后仍空着的字段。`umsp catalog refresh` 立刻重读。`allowed_models = ["*"]`（或留空）才会把这份完整列表给调用方。
+- `/v1/models` 一个逻辑模型一条，不暴露 provider。网关每 12 小时读取各 provider 的模型列表并按 id 去重。列表里带的上下文、输出上限、显示名和能力直接采用。上游给了多档上下文时，`context_lengths` 保留每一档，`context_length` 取最大的那档。上游没给的字段先用文档里的缺省值补，缺省值不会盖掉上游已经给的值；手写 `[[models]]` 只补这之后仍空着的字段。`umsp catalog refresh` 立刻重读。`allowed_models = ["*"]`（或留空）才会把这份完整列表给调用方。每个条目另带 `meta` 信封（cc-switch 等按列表自动补全参数的消费方读取）：同一份模型卡数据换成那些解析器认的字段名（`context_length`/`max_output_tokens`/模态/推理/工具），不含任何 provider 信息；平铺字段保持不变。
 - `provider add --vendor ID` 只收厂商 id 与 key；每次添加分配独立 id
 
 完整 schema、provider/model/client 管理与全部 CLI 示例见
@@ -139,7 +139,7 @@ umsp doctor [--online]                  # 诊断；--online 会花少量 token
 |---|---|---|---|
 | GET | `/healthz` | 否 | 熔断、失败、最近状态与 fresh `usage` 快照 |
 | GET | `/metrics` | 否 | Prometheus 文本，内存聚合，仅回环 |
-| GET | `/v1/models` | 是 | 逻辑模型注册表 |
+| GET | `/v1/models` | 是 | 逻辑模型注册表（平铺元数据 + `meta` 信封） |
 | POST | `/v1/chat/completions` | 是 | Chat Completions，流式/非流式 |
 | POST | `/v1/responses` | 是 | Responses，流式/非流式 |
 | POST | `/v1/messages` | 是 | Anthropic Messages，流式/非流式 |

@@ -1171,6 +1171,22 @@ async fn models_list_is_flat_and_filtered_by_alias_resolution() {
     assert_eq!(model["capabilities"]["vision"], false);
     assert!(model.get("metadata").is_none());
 
+    // Gateway metadata envelope (cc-switch style consumers): same card data
+    // under the names those parsers read, no provider data, flat fields intact.
+    let meta = &model["meta"];
+    assert_eq!(meta["context_length"], 1048000);
+    assert_eq!(meta["max_output_tokens"], 128000);
+    assert_eq!(meta["display_name"], "Test Model");
+    assert_eq!(meta["tool_call"], true);
+    assert_eq!(meta["reasoning"], true);
+    assert_eq!(meta["capabilities"]["vision"], false);
+    assert!(meta["capabilities"].get("vision_source").is_none());
+    assert_eq!(meta["input_modalities"], json!(["text"]));
+    assert_eq!(meta["output_modalities"], json!(["text"]));
+    for key in ["provider", "upstream", "upstream_model", "backends"] {
+        assert!(meta.get(key).is_none(), "meta must not expose {key}");
+    }
+
     // Alias also resolves through the chat endpoint.
     let body = json!({"model": "short", "messages": []});
     let request = Request::builder()

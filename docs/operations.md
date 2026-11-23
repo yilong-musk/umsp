@@ -9,7 +9,7 @@ Day-two operations: HTTP surface, metrics, ledger, systemd, and diagnostics. For
 | GET | `/healthz` | No | Gateway and provider status, including `circuit`/`failures`/`opened_at`/`reason` and a fresh `usage` snapshot (`remaining_fraction`, `windows`, `reset_in_s`); `?probe=1` performs a real probe (cached 30s; DS checks balance first so no tokens are spent) |
 | GET | `/metrics` | No | Prometheus text (`text/plain; version=0.0.4`), aggregated in memory, does not hit upstreams; loopback only (non-loopback sources get 403 `loopback_only`) |
 | HEAD | `/api/hello` | No | 204, Claude Code connection warm-up |
-| GET | `/v1/models` | Yes | Local registry, with flattened `context_length` / `max_completion_tokens` / `capabilities` / `display_name` |
+| GET | `/v1/models` | Yes | Local registry, with flattened `context_length` / `max_completion_tokens` / `capabilities` / `display_name` plus a `meta` envelope for gateway-metadata consumers |
 | POST | `/v1/chat/completions` | Yes | Non-streaming forwarding + streaming SSE pass-through (`stream: true`, OD / DS) |
 | POST | `/v1/responses` | Yes | OpenAI Responses non-streaming + streaming (M2 OD, M4a DS) |
 | POST | `/v1/messages` | Yes | Anthropic Messages non-streaming + streaming (M3 OD, M4a DS; preserves `?beta=true`) |
