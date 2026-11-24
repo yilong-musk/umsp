@@ -3866,6 +3866,50 @@ async fn success_resets_the_failure_window() {
     assert_eq!(health["providers"]["od"]["failures"], 0);
 }
 
+#[tokio::test]
+async fn mid_stream_failures_open_the_circuit() {
+    let dir = temp_dir("circuit-midstream");
+    let (app, _, rec) = gateway(&dir, 50 * 1024 * 1024).await;
+
+    // Every attempt gets a 200 and then the upstream connection dies.
+    for _ in 0..5 {
+        let response = app
+            .clone()
+            .oneshot(stream_request("sse-error"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // Reading to the end waits for the pump, which records the outcome.
+        let text = String::from_utf8(body_bytes(response).await).unwrap();
+        assert!(text.contains("upstream_stream_error"), "{text:?}");
+    }
+    let health = body_json(app.clone().oneshot(healthz_request()).await.unwrap()).await;
+    assert_eq!(health["providers"]["od"]["circuit"], "open", "{health}");
+
+    let calls = rec.seen.lock().unwrap().len();
+    let response = app.oneshot(stream_request("sse-error")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        rec.seen.lock().unwrap().len(),
+        calls,
+        "an open circuit must not reach the upstream"
+    );
+}
+
+#[tokio::test]
+async fn completed_streams_keep_the_circuit_closed() {
+    let dir = temp_dir("circuit-stream-ok");
+    let (app, _, _) = gateway(&dir, 50 * 1024 * 1024).await;
+    for _ in 0..6 {
+        let response = app.clone().oneshot(stream_request("sse")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        body_bytes(response).await;
+    }
+    let health = body_json(app.oneshot(healthz_request()).await.unwrap()).await;
+    assert_eq!(health["providers"]["od"]["circuit"], "closed");
+    assert_eq!(health["providers"]["od"]["failures"], 0);
+}
+
 // ---------------------------------------------------------------------------
 // M5: Prometheus /metrics
 // ---------------------------------------------------------------------------
