@@ -474,6 +474,27 @@ impl ProxyError {
             ProxyError::Network(_) => "upstream_unreachable",
         }
     }
+
+    pub fn status(&self) -> StatusCode {
+        match self {
+            ProxyError::MissingKey { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            ProxyError::Auth(_) | ProxyError::Network(_) => StatusCode::BAD_GATEWAY,
+            ProxyError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
+        }
+    }
+
+    /// Message safe to show an API client: no provider ids, env names or
+    /// upstream detail.
+    pub fn client_message(&self) -> &'static str {
+        match self {
+            ProxyError::MissingKey { .. } => {
+                "the gateway is missing credentials for an upstream service"
+            }
+            ProxyError::Auth(_) => "the gateway could not authenticate with the upstream service",
+            ProxyError::Timeout(_) => "the upstream service did not respond in time",
+            ProxyError::Network(_) => "the upstream service could not be reached",
+        }
+    }
 }
 
 /// Minimal upstream client shared by `serve` and `umsp call`.
@@ -2964,28 +2985,7 @@ async fn proxy_non_stream(
                 })
         }
         AttemptResult::Error(err) => {
-            let (status, code, message) = match &err {
-                ProxyError::MissingKey { .. } => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "upstream_key_missing",
-                    "the gateway is missing credentials for an upstream service".to_string(),
-                ),
-                ProxyError::Auth(_) => (
-                    StatusCode::BAD_GATEWAY,
-                    "upstream_auth_failed",
-                    "the gateway could not authenticate with the upstream service".to_string(),
-                ),
-                ProxyError::Timeout(_) => (
-                    StatusCode::GATEWAY_TIMEOUT,
-                    "upstream_timeout",
-                    "the upstream service did not respond in time".to_string(),
-                ),
-                ProxyError::Network(_) => (
-                    StatusCode::BAD_GATEWAY,
-                    "upstream_unreachable",
-                    "the upstream service could not be reached".to_string(),
-                ),
-            };
+            let (status, code, message) = (err.status(), err.code(), err.client_message());
             record.status = status.as_u16();
             record.error_code = Some(code.to_string());
             state.finish_request(&record);
@@ -2997,7 +2997,7 @@ async fn proxy_non_stream(
                 Some(&target.provider.id),
                 Some(code),
             );
-            gateway_error(status, code, &message, &request_id)
+            protocol_gateway_error(protocol, status, code, message, &request_id)
         }
         AttemptResult::CircuitOpen { reason } => {
             record.status = StatusCode::SERVICE_UNAVAILABLE.as_u16();
@@ -3636,28 +3636,7 @@ async fn proxy_stream(
     let stream = match result {
         AttemptResult::Stream(stream) => stream,
         AttemptResult::Error(err) => {
-            let (status, code, message) = match &err {
-                ProxyError::MissingKey { .. } => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "upstream_key_missing",
-                    "the gateway is missing credentials for an upstream service".to_string(),
-                ),
-                ProxyError::Auth(_) => (
-                    StatusCode::BAD_GATEWAY,
-                    "upstream_auth_failed",
-                    "the gateway could not authenticate with the upstream service".to_string(),
-                ),
-                ProxyError::Timeout(_) => (
-                    StatusCode::GATEWAY_TIMEOUT,
-                    "upstream_timeout",
-                    "the upstream service did not respond in time".to_string(),
-                ),
-                ProxyError::Network(_) => (
-                    StatusCode::BAD_GATEWAY,
-                    "upstream_unreachable",
-                    "the upstream service could not be reached".to_string(),
-                ),
-            };
+            let (status, code, message) = (err.status(), err.code(), err.client_message());
             {
                 let record = guard.record_mut();
                 record.status = status.as_u16();
@@ -3673,7 +3652,7 @@ async fn proxy_stream(
                 Some(&target.provider.id),
                 Some(code),
             );
-            return gateway_error(status, code, &message, &request_id);
+            return protocol_gateway_error(protocol_name, status, code, message, &request_id);
         }
         AttemptResult::CircuitOpen { reason } => {
             {
@@ -3731,7 +3710,8 @@ async fn proxy_stream(
                     record.duration_ms = started.elapsed().as_millis() as u64;
                 }
                 guard.commit();
-                return gateway_error(
+                return protocol_gateway_error(
+                    protocol_name,
                     StatusCode::BAD_GATEWAY,
                     "upstream_unreachable",
                     &format!("cannot read upstream response body: {err}"),
@@ -4684,12 +4664,7 @@ pub fn success_json(value: Value) -> Value {
 
 impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
-        let status = match &self {
-            ProxyError::MissingKey { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-            ProxyError::Auth(_) => StatusCode::BAD_GATEWAY,
-            ProxyError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
-            ProxyError::Network(_) => StatusCode::BAD_GATEWAY,
-        };
+        let status = self.status();
         let message = match &self {
             ProxyError::MissingKey { provider, env } => {
                 format!("upstream key for provider '{provider}' is missing; set {env}")
