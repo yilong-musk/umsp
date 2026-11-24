@@ -367,9 +367,9 @@ pub struct UsageFilterArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct PruneArgs {
-    /// Delete files older than this (e.g. 30d)
-    #[arg(long, default_value = "30d", conflicts_with = "days")]
-    pub before: String,
+    /// Delete files older than this (e.g. 30d); defaults to server.log_retention_days
+    #[arg(long, conflicts_with = "days")]
+    pub before: Option<String>,
     /// Keep the last N days (same as --before Nd); today's file is never removed
     #[arg(long, value_name = "N", conflicts_with = "before")]
     pub days: Option<u32>,
