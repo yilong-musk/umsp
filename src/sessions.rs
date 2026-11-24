@@ -7,9 +7,15 @@
 //! access token plus the CLI proxy headers.
 
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
+
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -112,6 +118,93 @@ impl Session {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    modified: Option<SystemTime>,
+    len: u64,
+    #[cfg(unix)]
+    ino: u64,
+}
+
+#[derive(Clone)]
+struct CachedSession {
+    stamp: FileStamp,
+    session: Session,
+}
+
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some(FileStamp {
+        modified: meta.modified().ok(),
+        len: meta.len(),
+        #[cfg(unix)]
+        ino: meta.ino(),
+    })
+}
+
+fn lock_path_for(session_file: &Path) -> PathBuf {
+    let mut os = session_file.as_os_str().to_os_string();
+    os.push(".lock");
+    PathBuf::from(os)
+}
+
+/// Cross-process exclusive advisory lock on `<provider>.json.lock`.
+///
+/// The lock file itself is intentionally kept on disk after drop so concurrent
+/// waiters always lock the same inode (unlinking while another process waits
+/// would split lockers across two inodes).
+struct SessionFileLock {
+    /// Kept open solely to hold the advisory flock until dropped.
+    _file: File,
+}
+
+impl SessionFileLock {
+    fn acquire(lock_path: &Path) -> std::io::Result<Self> {
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent)?;
+            #[cfg(unix)]
+            {
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        let file = opts.open(lock_path)?;
+        #[cfg(unix)]
+        loop {
+            // SAFETY: `file` owns a valid descriptor for the duration of the call.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                break;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                return Err(err);
+            }
+        }
+        Ok(Self { _file: file })
+    }
+}
+
+async fn acquire_file_lock(
+    provider_id: &str,
+    session_file: &Path,
+) -> std::result::Result<SessionFileLock, SessionError> {
+    let lock_path = lock_path_for(session_file);
+    let provider = provider_id.to_string();
+    tokio::task::spawn_blocking(move || SessionFileLock::acquire(&lock_path))
+        .await
+        .map_err(|err| SessionError::Refresh {
+            provider: provider.clone(),
+            reason: format!("session lock task failed: {err}"),
+        })?
+        .map_err(|err| SessionError::Refresh {
+            provider,
+            reason: format!("cannot lock session file: {err}"),
+        })
+}
+
 #[derive(Clone)]
 pub struct SessionStore {
     inner: Arc<StoreInner>,
@@ -122,6 +215,7 @@ struct StoreInner {
     http: reqwest::Client,
     endpoints: Endpoints,
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    cache: Mutex<HashMap<String, CachedSession>>,
 }
 
 impl SessionStore {
@@ -152,6 +246,7 @@ impl SessionStore {
                     client_id: client_id.to_string(),
                 },
                 locks: Mutex::new(HashMap::new()),
+                cache: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -264,30 +359,55 @@ impl SessionStore {
         }
     }
 
-    /// Access token for `provider_id`, refreshing under that provider's lock
-    /// when the stored token is inside the skew window.
+    /// Access token for `provider_id`, serving from an mtime/inode-validated
+    /// cache on the steady-state path and serializing refreshes across both
+    /// in-process tasks and external processes (e.g. CLI vs daemon) via flock.
     pub async fn access_token(
         &self,
         provider_id: &str,
     ) -> std::result::Result<String, SessionError> {
-        let lock = self.lock_for(provider_id);
-        let _guard = lock.lock().await;
         let path =
             session_path(&self.inner.dir, provider_id).map_err(|_| SessionError::Missing {
                 provider: provider_id.to_string(),
             })?;
-        let session = self.read(&path).map_err(|_| SessionError::Missing {
-            provider: provider_id.to_string(),
-        })?;
+        if let Some(token) = self.cached_fresh_token(provider_id, &path) {
+            return Ok(token);
+        }
+
+        let lock = self.lock_for(provider_id);
+        let _guard = lock.lock().await;
+        let (session, stamp) = self
+            .read_stamped(&path)
+            .map_err(|_| SessionError::Missing {
+                provider: provider_id.to_string(),
+            })?;
         if !session.expires_soon() {
+            self.store_cache(provider_id, stamp, &session);
+            return Ok(session.access_token);
+        }
+
+        // Cross-process lock: re-read after acquiring so a concurrent refresh
+        // in another process (CLI vs daemon) is reused instead of double-rotating.
+        let _flock = acquire_file_lock(provider_id, &path).await?;
+        let (session, stamp) = self
+            .read_stamped(&path)
+            .map_err(|_| SessionError::Missing {
+                provider: provider_id.to_string(),
+            })?;
+        if !session.expires_soon() {
+            self.store_cache(provider_id, stamp, &session);
             return Ok(session.access_token);
         }
         let updated = self.refresh_and_store(provider_id, &path, &session).await?;
+        if let Some(new_stamp) = file_stamp(&path) {
+            self.store_cache(provider_id, new_stamp, &updated);
+        }
         Ok(updated.access_token)
     }
 
     /// After the proxy rejected `rejected`, return a token that is not that
-    /// one. A concurrent refresh that already rotated the file is reused.
+    /// one. A concurrent refresh in this process or another process that
+    /// already rotated the file is reused.
     pub async fn refresh_rejected(
         &self,
         provider_id: &str,
@@ -299,14 +419,49 @@ impl SessionStore {
             session_path(&self.inner.dir, provider_id).map_err(|_| SessionError::Missing {
                 provider: provider_id.to_string(),
             })?;
-        let session = self.read(&path).map_err(|_| SessionError::Missing {
-            provider: provider_id.to_string(),
-        })?;
+        let _flock = acquire_file_lock(provider_id, &path).await?;
+        let (session, stamp) = self
+            .read_stamped(&path)
+            .map_err(|_| SessionError::Missing {
+                provider: provider_id.to_string(),
+            })?;
         if session.access_token != rejected && !session.expires_soon() {
+            self.store_cache(provider_id, stamp, &session);
             return Ok(session.access_token);
         }
         let updated = self.refresh_and_store(provider_id, &path, &session).await?;
+        if let Some(new_stamp) = file_stamp(&path) {
+            self.store_cache(provider_id, new_stamp, &updated);
+        }
         Ok(updated.access_token)
+    }
+
+    fn cached_fresh_token(&self, provider_id: &str, path: &Path) -> Option<String> {
+        let stamp = file_stamp(path)?;
+        let cache = self.inner.cache.lock().expect("session cache poisoned");
+        let entry = cache.get(provider_id)?;
+        if entry.stamp == stamp && !entry.session.expires_soon() {
+            Some(entry.session.access_token.clone())
+        } else {
+            None
+        }
+    }
+
+    fn store_cache(&self, provider_id: &str, stamp: FileStamp, session: &Session) {
+        let mut cache = self.inner.cache.lock().expect("session cache poisoned");
+        cache.insert(
+            provider_id.to_string(),
+            CachedSession {
+                stamp,
+                session: session.clone(),
+            },
+        );
+    }
+
+    fn read_stamped(&self, path: &Path) -> std::result::Result<(Session, FileStamp), ()> {
+        let stamp = file_stamp(path).ok_or(())?;
+        let session = self.read(path)?;
+        Ok((session, stamp))
     }
 
     async fn refresh_and_store(
@@ -822,6 +977,101 @@ mod tests {
             .unwrap();
         assert_eq!(kept.access_token, "login-access");
         assert_eq!(kept.refresh_token, "login-refresh");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cross_process_flock_serializes_concurrent_refreshes_across_stores() {
+        let dir = temp_dir("cross-proc-flock");
+        let hits = Arc::new(AtomicU64::new(0));
+        let hits_for_app = Arc::clone(&hits);
+        let app = Router::new().route(
+            "/oauth2/token",
+            post(move |_body: String| {
+                let hits = Arc::clone(&hits_for_app);
+                async move {
+                    // Hold the first refresh open long enough for the second
+                    // store to reach the flock and wait behind it.
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    let n = hits.fetch_add(1, Ordering::SeqCst);
+                    format!(
+                        r#"{{"access_token":"fresh-{n}","refresh_token":"rot-{n}","expires_in":3600,"token_type":"Bearer"}}"#
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base = format!("http://{addr}");
+
+        write_session(
+            &dir,
+            "grok",
+            "expired-access",
+            "old-refresh",
+            "2000-01-01T00:00:00Z",
+        )
+        .unwrap();
+
+        // Two independent SessionStore instances do not share an in-process
+        // tokio::Mutex (simulating daemon + CLI racing on the same file).
+        let store_a = SessionStore::with_endpoints(
+            dir.clone(),
+            http_client(),
+            &format!("{base}/oauth2/device/code"),
+            &format!("{base}/oauth2/token"),
+            "test-client",
+        );
+        let store_b = SessionStore::with_endpoints(
+            dir.clone(),
+            http_client(),
+            &format!("{base}/oauth2/device/code"),
+            &format!("{base}/oauth2/token"),
+            "test-client",
+        );
+
+        let (tok_a, tok_b) =
+            tokio::join!(store_a.access_token("grok"), store_b.access_token("grok"),);
+        let tok_a = tok_a.unwrap();
+        let tok_b = tok_b.unwrap();
+        assert_eq!(tok_a, "fresh-0");
+        assert_eq!(tok_b, "fresh-0");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "second store must reuse the rotated session after acquiring flock"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cached_session_reuses_token_and_reloads_on_external_update() {
+        let dir = temp_dir("cache-reload");
+        let store = SessionStore::new(dir.clone(), http_client());
+        write_session(
+            &dir,
+            "grok",
+            "token-v1",
+            "refresh-v1",
+            "2099-01-01T00:00:00Z",
+        )
+        .unwrap();
+        assert_eq!(store.access_token("grok").await.unwrap(), "token-v1");
+        assert_eq!(store.access_token("grok").await.unwrap(), "token-v1");
+
+        // External atomic update (e.g. `umsp login`) replaces the file inode.
+        write_session(
+            &dir,
+            "grok",
+            "token-v2",
+            "refresh-v2",
+            "2099-01-01T00:00:00Z",
+        )
+        .unwrap();
+        assert_eq!(store.access_token("grok").await.unwrap(), "token-v2");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
