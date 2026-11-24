@@ -3567,12 +3567,20 @@ async fn proxy_stream(
                                         (stream.status >= 400)
                                             .then(|| format!("http_{}", stream.status)),
                                     );
-                                    note_circuit_result(
-                                        &state,
-                                        &target,
-                                        stream.status,
-                                        _probe.is_some(),
-                                    );
+                                    // A 2xx stream is judged when it ends (in
+                                    // `pump_stream`): recording success at the
+                                    // headers would reset the failure window,
+                                    // so a provider that always dies mid-stream
+                                    // could never trip the circuit. A half-open
+                                    // probe still closes on the headers.
+                                    if stream.status >= 400 || _probe.is_some() {
+                                        note_circuit_result(
+                                            &state,
+                                            &target,
+                                            stream.status,
+                                            _probe.is_some(),
+                                        );
+                                    }
                                     AttemptResult::Stream(stream)
                                 }
                                 Err(err) => {
@@ -4032,11 +4040,28 @@ async fn pump_stream(
     }
 
     // A stream that failed after its 200 is evidence against the provider:
-    // drop the five-hour pin so the next request can select again.
+    // count it toward the circuit and drop the five-hour pin so the next
+    // request can select again. A clean end is the stream's success. A client
+    // disconnect says nothing about the provider and records neither.
     if !disconnected {
-        if let Some(code) = record.error_code.clone() {
-            if state.forget_route(&record.requested_model, &provider_id) {
-                plog_route("route_unpin", &record.requested_model, &provider_id, &code);
+        match record.error_code.clone() {
+            Some(code) => {
+                if state.circuits().record_failure(&provider_id, &code) {
+                    plog_health("circuit_open", &provider_id, &record.upstream_model, &code);
+                }
+                if state.forget_route(&record.requested_model, &provider_id) {
+                    plog_route("route_unpin", &record.requested_model, &provider_id, &code);
+                }
+            }
+            None => {
+                if state.circuits().record_success(&provider_id).is_some() {
+                    plog_health(
+                        "circuit_close",
+                        &provider_id,
+                        &record.upstream_model,
+                        "success",
+                    );
+                }
             }
         }
     }

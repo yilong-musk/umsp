@@ -72,7 +72,9 @@ these routes stay same-protocol passthrough.
   failure returns to `open`. DS `402` → `open` for 10 minutes, with a background check of
   `GET /user/balance` every 5 minutes, automatically returning to `closed` when quota recovers; OD
   `401/402` → `open` for 5 minutes, recovering via a background reasoning probe with `max_tokens=1` +
-  `reasoning_effort=none`. `400/404/422` do not count as failures.
+  `reasoning_effort=none`. `400/404/422` do not count as failures. A stream that already returned
+  200 is judged when it ends: an upstream break or idle timeout after the headers counts as a
+  retryable failure, a clean end counts as the success (a client disconnect counts as neither).
 - **Half-open probe slot**: the probe slot is held by an RAII guard — if the request is cancelled
   (client disconnects) or the probe gets a non-retryable 4xx, it **only releases the slot and does
   not count a failure**, so the next request can continue probing; a 4xx on the probe means the
