@@ -2681,6 +2681,64 @@ fn note_route_failure(state: &AppState, model: &str, provider: &str) {
     }
 }
 
+/// Writes a 499 ledger row when a buffered request is dropped (the client went
+/// away) while an attempt is in flight. The normal path disarms it and writes
+/// its own row, so every request ends with exactly one row and one metric.
+struct BufferedCancelGuard<'a> {
+    state: &'a AppState,
+    request_id: &'a str,
+    client: &'a str,
+    client_ip: &'a str,
+    protocol: &'a str,
+    bytes_in: u64,
+    started: Instant,
+    quirks: &'a [String],
+    /// `(model id, provider id, upstream model)` of the attempt in flight.
+    target: Option<(String, String, String)>,
+    fallbacks: u32,
+}
+
+impl BufferedCancelGuard<'_> {
+    fn attempting(&mut self, target: &AttemptTarget, fallbacks: u32) {
+        self.target = Some((
+            target.model.id.clone(),
+            target.provider.id.clone(),
+            target.upstream.clone(),
+        ));
+        self.fallbacks = fallbacks;
+    }
+
+    fn disarm(&mut self) {
+        self.target = None;
+    }
+}
+
+impl Drop for BufferedCancelGuard<'_> {
+    fn drop(&mut self) {
+        let Some((model, provider, upstream)) = self.target.take() else {
+            return;
+        };
+        let mut record = request_record(
+            self.request_id,
+            self.client,
+            self.client_ip,
+            self.protocol,
+            &model,
+            &provider,
+            &upstream,
+            false,
+            self.bytes_in,
+            self.started.elapsed().as_millis() as u64,
+            self.quirks.to_vec(),
+        );
+        record.status = 499;
+        record.client_disconnected = true;
+        record.error_code = Some("client_disconnected".to_string());
+        record.fallbacks = self.fallbacks;
+        self.state.finish_request(&record);
+    }
+}
+
 /// Shared non-streaming proxy path: one upstream call, one ledger row.
 ///
 /// A provider that speaks the client protocol relays the body. A mismatch
@@ -2737,6 +2795,18 @@ async fn proxy_non_stream(
     let mut first_provider: Option<String> = None;
     let mut translation_error: Option<String> = None;
     let mut last: Option<(AttemptResult, AttemptTarget, Vec<String>)> = None;
+    let mut cancel_guard = BufferedCancelGuard {
+        state: &state,
+        request_id: &request_id,
+        client: &client.name,
+        client_ip: &client_ip,
+        protocol,
+        bytes_in,
+        started,
+        quirks: &request_quirks,
+        target: None,
+        fallbacks: 0,
+    };
 
     while let Some(target) = cursor.next(&state, &model.id, &candidates) {
         if let Some(prev) = &previous {
@@ -2751,6 +2821,7 @@ async fn proxy_non_stream(
                 previous_reason.as_deref().unwrap_or("retryable"),
             );
         }
+        cancel_guard.attempting(&target, fallbacks_used);
         first_provider.get_or_insert_with(|| target.provider.id.clone());
         let (mut result, attempt_quirks) =
             match prepare_attempt(&payload, &target, protocol, &client.name) {
@@ -2887,6 +2958,10 @@ async fn proxy_non_stream(
         }
         break;
     }
+    // From here on the request runs to completion synchronously and writes its
+    // own row.
+    cancel_guard.disarm();
+    drop(cancel_guard);
 
     let Some((result, target, attempt_quirks)) = last else {
         if cursor.exhausted {
