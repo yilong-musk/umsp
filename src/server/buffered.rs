@@ -194,7 +194,7 @@ pub(super) async fn proxy_non_stream(
         },
         &candidates,
         |target, fallbacks| cancel_guard.attempting(target, fallbacks),
-        |target, attempt_body, attempt_headers, is_probe| {
+        |target, attempt_body, attempt_headers, probe_gen| {
             let state = &state;
             let up = &up;
             let call = &call;
@@ -235,7 +235,7 @@ pub(super) async fn proxy_non_stream(
                             outcome.duration_ms,
                             (outcome.status >= 400).then(|| format!("http_{}", outcome.status)),
                         );
-                        note_circuit_result(state, &target, outcome.status, is_probe);
+                        note_circuit_result(state, &target, outcome.status, probe_gen);
                         AttemptResult::Response(outcome)
                     }
                     Err(err) => {

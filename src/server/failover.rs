@@ -272,19 +272,23 @@ pub(super) fn attempt_payload(
 
 /// Feed one upstream status into the provider's circuit (spec 3.4).
 ///
-/// `probe` is `true` when this attempt held the single half-open probe slot. A
-/// non-retryable client error on a probe proves the provider is reachable, so
-/// it closes the circuit instead of leaving it stuck in `half_open`; the probe
-/// guard would release the slot either way.
+/// `probe_gen` is `Some(generation)` when this attempt held the single
+/// half-open probe slot. A non-retryable client error on a probe proves the
+/// provider is reachable, so it closes the circuit instead of leaving it stuck
+/// in `half_open`; the probe guard would release the slot either way.
 pub(super) fn note_circuit_result(
     state: &AppState,
     target: &AttemptTarget,
     status: u16,
-    probe: bool,
+    probe_gen: Option<u64>,
 ) {
     let circuits = state.circuits();
     if status < 400 {
-        if circuits.record_success(&target.provider.id).is_some() {
+        let closed = match probe_gen {
+            Some(generation) => circuits.record_probe_success(&target.provider.id, generation),
+            None => circuits.record_success(&target.provider.id),
+        };
+        if closed.is_some() {
             plog_health(
                 "circuit_close",
                 &target.provider.id,
@@ -337,13 +341,18 @@ pub(super) fn note_circuit_result(
             // 400/403/404/422 and friends: never a circuit failure. A probe that
             // got an answer at all closes the circuit (the provider is reachable
             // and the key works).
-            if probe && circuits.close(&target.provider.id) {
-                plog_health(
-                    "circuit_close",
-                    &target.provider.id,
-                    &target.upstream,
-                    &format!("probe_reachable:http_{status}"),
-                );
+            if let Some(generation) = probe_gen {
+                if circuits
+                    .record_probe_success(&target.provider.id, generation)
+                    .is_some()
+                {
+                    plog_health(
+                        "circuit_close",
+                        &target.provider.id,
+                        &target.upstream,
+                        &format!("probe_reachable:http_{status}"),
+                    );
+                }
             }
         }
     }
@@ -568,7 +577,7 @@ pub(super) async fn run_attempts<F, Fut>(
     mut send: F,
 ) -> AttemptsOutcome
 where
-    F: FnMut(AttemptTarget, Value, HeaderMap, bool) -> Fut,
+    F: FnMut(AttemptTarget, Value, HeaderMap, Option<u64>) -> Fut,
     Fut: Future<Output = AttemptResult>,
 {
     let protocol_name = ctx.protocol.as_str();
@@ -639,7 +648,7 @@ where
                                 target.clone(),
                                 attempt_body,
                                 attempt_headers,
-                                _probe.is_some(),
+                                _probe.map(|guard| guard.generation()),
                             )
                             .await
                         }
