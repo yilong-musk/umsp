@@ -5,7 +5,9 @@
 //! with `event:` line patching) against OpenDesign. The library target exists so
 //! integration tests can drive the real router.
 
+pub mod adapter;
 pub mod bindings;
+pub mod capacity;
 pub mod catalog;
 pub mod chatgpt_oauth;
 pub mod circuit;

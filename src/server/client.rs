@@ -1,14 +1,15 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use axum::body::Bytes;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use serde_json::Value;
 
+use crate::adapter;
 use crate::config::{Config, Provider};
 use crate::envfile::EnvFile;
 use crate::error::Result;
-use crate::quirks;
-use crate::sessions::{self, SessionError, SessionStore};
+use crate::sessions::{SessionError, SessionStore};
 use crate::upstream::{self, forward_request_headers, relay_response_headers};
 use crate::usage::Usage;
 
@@ -157,7 +158,7 @@ impl Upstream {
         url: &str,
         provider: &Provider,
         body: &Value,
-        payload: &[u8],
+        payload: Bytes,
         client_headers: &HeaderMap,
         accept: &'static str,
     ) -> std::result::Result<reqwest::Response, ProxyError> {
@@ -168,7 +169,7 @@ impl Upstream {
                 url,
                 provider,
                 body,
-                payload,
+                payload.clone(),
                 client_headers,
                 accept,
                 &token,
@@ -197,12 +198,6 @@ impl Upstream {
         Ok(response)
     }
 
-    fn grok_cli_version(&self) -> String {
-        self.env
-            .get("UMSP_GROK_CLI_VERSION")
-            .unwrap_or_else(|| sessions::GROK_CLI_VERSION.to_string())
-    }
-
     #[allow(clippy::too_many_arguments)]
     async fn send_with_token(
         &self,
@@ -210,57 +205,30 @@ impl Upstream {
         url: &str,
         provider: &Provider,
         body: &Value,
-        payload: &[u8],
+        payload: Bytes,
         client_headers: &HeaderMap,
         accept: &'static str,
         token: &str,
     ) -> std::result::Result<reqwest::Response, ProxyError> {
+        let adapter = adapter::for_provider(provider);
         let mut req = http
             .post(url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(reqwest::header::ACCEPT, accept)
             .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
-        if provider.vendor.as_deref() == Some("grok") {
-            req = req
-                .header("X-XAI-Token-Auth", sessions::CLI_TOKEN_AUTH)
-                .header("x-grok-client-version", self.grok_cli_version());
-            if let Some(model) = body.get("model").and_then(Value::as_str) {
-                let value = reqwest::header::HeaderValue::from_str(model).map_err(|_| {
-                    ProxyError::Network(format!(
-                        "upstream model id for provider '{}' is not a valid header value",
-                        provider.id
-                    ))
-                })?;
-                req = req.header("x-grok-model-override", value);
-            }
-        }
-        if provider.vendor.as_deref() == Some("opencode-go") {
-            let session = upstream::opencode_session(client_headers, body);
-            let session = reqwest::header::HeaderValue::from_str(&session).map_err(|_| {
-                ProxyError::Network(format!(
-                    "opencode session for provider '{}' is not a valid header value",
-                    provider.id
-                ))
-            })?;
-            req = req
-                .header(reqwest::header::USER_AGENT, upstream::OPENCODE_USER_AGENT)
-                .header("x-opencode-session", session);
+        let extra = adapter
+            .inference_headers(provider, &self.env, body, client_headers)
+            .map_err(ProxyError::Network)?;
+        for (name, value) in extra {
+            req = req.header(name, value);
         }
         for (name, value) in forward_request_headers(client_headers) {
-            if provider.vendor.as_deref() == Some("grok")
-                && sessions::is_cli_session_header(name.as_str())
-            {
-                continue;
-            }
-            if provider.vendor.as_deref() == Some("opencode-go")
-                && (name.as_str().eq_ignore_ascii_case("user-agent")
-                    || name.as_str().eq_ignore_ascii_case("x-opencode-session"))
-            {
+            if adapter.strips_client_header(name.as_str()) {
                 continue;
             }
             req = req.header(name, value);
         }
-        req.body(payload.to_vec()).send().await.map_err(|e| {
+        req.body(payload).send().await.map_err(|e| {
             if e.is_timeout() {
                 ProxyError::Timeout(format!("upstream request to {url} timed out: {e}"))
             } else {
@@ -357,15 +325,17 @@ impl Upstream {
                 ))
             })?;
         let started = Instant::now();
-        let payload = serde_json::to_vec(body)
-            .map_err(|e| ProxyError::Network(format!("cannot serialize request: {e}")))?;
+        let payload = Bytes::from(
+            serde_json::to_vec(body)
+                .map_err(|e| ProxyError::Network(format!("cannot serialize request: {e}")))?,
+        );
         let resp = self
             .send(
                 &self.http.clone(),
                 &url,
                 provider,
                 body,
-                &payload,
+                payload,
                 client_headers,
                 "application/json",
             )
@@ -382,19 +352,12 @@ impl Upstream {
             .or_else(|| resp.headers().get("x-ds-trace-id"))
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
-        let bytes = resp
+        let raw_bytes = resp
             .bytes()
             .await
             .map_err(|e| ProxyError::Network(format!("cannot read upstream response body: {e}")))?;
-        let bytes = if provider.vendor.as_deref() == Some("chatgpt") {
-            if let Some(completed) = crate::chatgpt_oauth::collapse_responses_stream(&bytes) {
-                serde_json::to_vec(&completed).unwrap_or_else(|_| bytes.to_vec())
-            } else {
-                bytes.to_vec()
-            }
-        } else {
-            bytes.to_vec()
-        };
+        let adapter = adapter::for_provider(provider);
+        let bytes = adapter.normalize_response_bytes(raw_bytes.to_vec());
 
         let mut quirks_applied = Vec::new();
         let mut usage = None;
@@ -410,25 +373,20 @@ impl Upstream {
                     } else {
                         Usage::from_chat(&value)
                     };
-                    if protocol == "chat" {
-                        if provider.quirks.as_deref() == Some("opendesign") {
-                            quirks_applied = quirks::apply_chat_response_quirks(
-                                &mut value,
-                                effective_budget(body),
-                            );
-                        }
-                        serde_json::to_vec(&value).unwrap_or_else(|_| bytes.to_vec())
+                    quirks_applied = adapter.patch_response(&mut value, protocol, body);
+                    if !quirks_applied.is_empty() {
+                        serde_json::to_vec(&value).unwrap_or(bytes)
                     } else {
-                        // Only `model` may change on the way up; the response is
-                        // passed through untouched (spec 2.0 / 2.2).
-                        bytes.to_vec()
+                        // Only `model` may change on the way up; unpatched
+                        // responses pass through byte-for-byte (spec 2.0 / 2.2).
+                        bytes
                     }
                 }
-                _ => bytes.to_vec(),
+                _ => bytes,
             }
         } else {
             // Upstream errors pass through byte-for-byte.
-            bytes.to_vec()
+            bytes
         };
 
         Ok(ChatOutcome {
@@ -512,8 +470,10 @@ impl Upstream {
                     provider.id
                 ))
             })?;
-        let payload = serde_json::to_vec(body)
-            .map_err(|e| ProxyError::Network(format!("cannot serialize request: {e}")))?;
+        let payload = Bytes::from(
+            serde_json::to_vec(body)
+                .map_err(|e| ProxyError::Network(format!("cannot serialize request: {e}")))?,
+        );
         let http_stream = self.http_stream.clone();
         let resp = match tokio::time::timeout(
             header_timeout,
@@ -522,7 +482,7 @@ impl Upstream {
                 &url,
                 provider,
                 body,
-                &payload,
+                payload,
                 client_headers,
                 "text/event-stream",
             ),
@@ -557,8 +517,4 @@ impl Upstream {
             response: resp,
         })
     }
-}
-
-fn effective_budget(body: &Value) -> Option<u64> {
-    quirks::effective_max_tokens(body)
 }
