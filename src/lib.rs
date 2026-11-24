@@ -19,6 +19,7 @@ pub mod health;
 pub mod keys;
 pub mod metrics;
 pub mod model_defaults;
+pub mod pidfile;
 pub mod quirks;
 pub mod registry;
 pub mod route;

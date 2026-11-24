@@ -4535,11 +4535,8 @@ pub async fn serve(config_path: &std::path::Path, listen_override: Option<String
         .map(|a| a.to_string())
         .unwrap_or_else(|_| listen.clone());
 
-    let pid_file = state.cfg().server.pid_file();
-    if let Some(parent) = pid_file.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(&pid_file, format!("{}\n", std::process::id()));
+    // Held until `serve` returns; dropping it removes the pid file.
+    let pid_lock = crate::pidfile::PidLock::acquire(&state.cfg().server.pid_file())?;
 
     println!(
         "{}",
@@ -4603,7 +4600,7 @@ pub async fn serve(config_path: &std::path::Path, listen_override: Option<String
     .with_graceful_shutdown(shutdown)
     .await;
     health_task.abort();
-    let _ = std::fs::remove_file(&pid_file);
+    drop(pid_lock);
     result.map_err(|e| UmspError::other("SERVE", format!("server error: {e}")))
 }
 
@@ -4625,25 +4622,15 @@ async fn shutdown_signal() {
 }
 
 /// Best-effort SIGHUP to a running `umsp serve` so CLI edits take effect.
+///
+/// Only a server that still holds the pid-file lock is signalled, so a stale
+/// pid file can never deliver SIGHUP (whose default action is to terminate)
+/// to an unrelated process that reused the pid.
 pub fn reload_running_server(cfg: &Config) {
-    let pid_file = cfg.server.pid_file();
-    let Ok(raw) = std::fs::read_to_string(&pid_file) else {
+    let Some(pid) = crate::pidfile::locked_pid(&cfg.server.pid_file()) else {
         return;
     };
-    let Ok(pid) = raw.trim().parse::<i32>() else {
-        return;
-    };
-    let alive = std::path::Path::new(&format!("/proc/{pid}")).exists();
-    if !alive {
-        return;
-    }
-    let Ok(kill) = std::process::Command::new("kill")
-        .args(["-HUP", &pid.to_string()])
-        .status()
-    else {
-        return;
-    };
-    if kill.success() {
+    if crate::pidfile::send_hangup(pid) {
         plog("info", "reload_signalled", "-", None, None, None);
     }
 }
