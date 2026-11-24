@@ -36,7 +36,7 @@ pub fn run(cli: Cli) -> Result<i32> {
         }
         Command::Init(args) => init::run(&config_path, args, json),
         Command::Config { cmd } => config_cmd::run(&config_path, cmd, json),
-        Command::Env { cmd } => env_cmd::run(cmd, json),
+        Command::Env { cmd } => env_cmd::run(&config_path, cmd, json, no_reload),
         Command::Check(_) => check::run_check(&config_path, json),
         Command::Doctor(args) => check::run_doctor(&config_path, args, json),
         Command::Provider { cmd } => {

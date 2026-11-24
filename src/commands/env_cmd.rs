@@ -13,12 +13,21 @@ use crate::config::Config;
 use crate::envfile::EnvFile;
 use crate::error::{Result, UmspError};
 
-pub fn run(cmd: EnvCmd, json: bool) -> Result<i32> {
+pub fn run(config_path: &Path, cmd: EnvCmd, json: bool, no_reload: bool) -> Result<i32> {
     let path = Config::resolve_env_path();
     match cmd {
         EnvCmd::List => list(&path, json),
-        EnvCmd::Set { name, stdin } => set(&path, &name, stdin, json),
-        EnvCmd::Unset { name } => unset(&path, &name, json),
+        EnvCmd::Set { name, stdin } => set(config_path, &path, &name, stdin, json, no_reload),
+        EnvCmd::Unset { name } => unset(config_path, &path, &name, json, no_reload),
+    }
+}
+
+fn maybe_reload(config_path: &Path, no_reload: bool) {
+    if no_reload {
+        return;
+    }
+    if let Ok(cfg) = Config::load(config_path) {
+        crate::server::reload_running_server(&cfg);
     }
 }
 
@@ -90,7 +99,14 @@ fn list(path: &Path, json: bool) -> Result<i32> {
     })
 }
 
-fn set(path: &Path, name: &str, from_stdin: bool, json: bool) -> Result<i32> {
+fn set(
+    config_path: &Path,
+    path: &Path,
+    name: &str,
+    from_stdin: bool,
+    json: bool,
+    no_reload: bool,
+) -> Result<i32> {
     if !valid_name(name) {
         return Err(UmspError::usage(format!(
             "invalid variable name '{name}' (use letters, digits and _)"
@@ -106,6 +122,7 @@ fn set(path: &Path, name: &str, from_stdin: bool, json: bool) -> Result<i32> {
         return Err(UmspError::usage("the value must not be empty"));
     }
     EnvFile::set(path, name, &value)?;
+    maybe_reload(config_path, no_reload);
     let masked = mask(&value);
     crate::commands::emit(
         json,
@@ -114,13 +131,14 @@ fn set(path: &Path, name: &str, from_stdin: bool, json: bool) -> Result<i32> {
     )
 }
 
-fn unset(path: &Path, name: &str, json: bool) -> Result<i32> {
+fn unset(config_path: &Path, path: &Path, name: &str, json: bool, no_reload: bool) -> Result<i32> {
     if !EnvFile::unset(path, name)? {
         return Err(UmspError::not_found(format!(
             "{name} is not set in {}",
             path.display()
         )));
     }
+    maybe_reload(config_path, no_reload);
     crate::commands::emit(json, json!({"name": name, "removed": true}), || {
         format!("removed {name} from {}", path.display())
     })
