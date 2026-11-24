@@ -1,17 +1,17 @@
-//! SSE side-scanning for streaming Chat Completions.
+//! SSE side-scanning for streaming Chat Completions, Responses, and Messages.
 //!
 //! The gateway forwards upstream bytes verbatim (spec 2.0: no buffering, no
 //! aggregation). This module only *observes* a copy of those bytes so the
 //! request ledger can record usage and so the gateway knows whether the
-//! upstream already sent the terminal `data: [DONE]` event.
+//! upstream already sent the terminal marker.
 //!
-//! Scanning is byte-oriented on purpose: an SSE event may be split in the
-//! middle of a multi-byte UTF-8 character, and a lossy string conversion would
-//! corrupt that event (losing its usage / TTFT). Forwarding is unaffected
-//! either way — only the observation copy is at stake.
+//! Framing delegates to [`crate::sse::LineFramer`] so multi-byte UTF-8
+//! characters and CRLF/CR/LF line endings split across chunk boundaries are
+//! handled consistently everywhere.
 
 use serde_json::json;
 
+use crate::sse::{self, LineFramer, LinePiece, MAX_EVENT_BYTES, MAX_OBSERVER_LINE_BYTES};
 use crate::usage::Usage;
 
 /// SSE comment sent while the upstream is quiet (spec 2.0, idle keep-alive).
@@ -22,17 +22,6 @@ pub const MESSAGES_PING_EVENT: &[u8] = b"event: ping\ndata: {\"type\":\"ping\"}\
 
 /// Terminal event of an OpenAI Chat Completions stream.
 pub const DONE_EVENT: &[u8] = b"data: [DONE]\n\n";
-
-/// Upper bound on the buffered partial line. Real events are small; a blob
-/// with no newline is not something we can learn from, so drop it rather than
-/// grow without bound.
-const MAX_CARRY: usize = 64 * 1024;
-
-/// Upper bound on a single line buffered for event-line patching. Responses
-/// events can be large (`response.output_item.done` may carry base64 image or
-/// encrypted reasoning payloads); past this size the line is passed through
-/// untouched instead of held in memory.
-const MAX_PATCH_LINE: usize = 8 * 1024 * 1024;
 
 /// Build a protocol-native Chat error event for a stream that broke after the
 /// 200 was already sent (spec 2.1 / 8.3).
@@ -87,12 +76,10 @@ pub fn messages_error_event(message: &str) -> Vec<u8> {
     format!("event: error\ndata: {body}\n\n").into_bytes()
 }
 
-/// Incremental SSE observer. Feed it every chunk; it keeps the trailing
-/// partial line in a carry buffer so events split across chunk boundaries are
-/// still understood.
-#[derive(Debug, Default)]
+/// Incremental SSE observer for Chat Completions streams.
+#[derive(Debug)]
 pub struct SseScanner {
-    carry: Vec<u8>,
+    framer: LineFramer,
     saw_data: bool,
     /// Upstream sent `data: [DONE]`.
     pub done: bool,
@@ -100,46 +87,67 @@ pub struct SseScanner {
     pub usage: Option<Usage>,
 }
 
+impl Default for SseScanner {
+    fn default() -> Self {
+        Self {
+            framer: LineFramer::new(MAX_OBSERVER_LINE_BYTES),
+            saw_data: false,
+            done: false,
+            usage: None,
+        }
+    }
+}
+
 impl SseScanner {
     /// Feed one raw chunk. Returns `true` exactly once: on the first chunk that
     /// carries a JSON `data:` event (the caller uses that moment as TTFT).
     pub fn feed(&mut self, chunk: &[u8]) -> bool {
-        self.carry.extend_from_slice(chunk);
         let mut first_data = false;
-        while let Some(pos) = self.carry.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = self.carry.drain(..=pos).collect();
-            if self.handle_line(&line) && !self.saw_data {
-                self.saw_data = true;
-                first_data = true;
+        let saw_data = &mut self.saw_data;
+        let done = &mut self.done;
+        let usage = &mut self.usage;
+        self.framer.push(chunk, |piece| {
+            if let LinePiece::Line(line) = piece {
+                if handle_chat_line(line, *saw_data, done, usage) && !*saw_data {
+                    *saw_data = true;
+                    first_data = true;
+                }
             }
-        }
-        if self.carry.len() > MAX_CARRY {
-            self.carry.clear();
-        }
+        });
         first_data
     }
+}
 
-    fn handle_line(&mut self, line: &[u8]) -> bool {
-        let line = trim_eol(line);
-        let Some(rest) = line.strip_prefix(b"data:") else {
-            return false;
-        };
-        let payload = trim_ascii(rest);
-        if payload.is_empty() {
-            return false;
-        }
-        if payload == b"[DONE]" {
-            self.done = true;
-            return false;
-        }
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) else {
-            return false;
-        };
-        if let Some(usage) = Usage::from_chat(&value) {
-            self.usage = Some(usage);
-        }
-        true
+fn handle_chat_line(
+    line: &[u8],
+    saw_data: bool,
+    done: &mut bool,
+    usage: &mut Option<Usage>,
+) -> bool {
+    let content = sse::trim_eol(line);
+    let Some((b"data", val)) = sse::parse_field(content) else {
+        return false;
+    };
+    let payload = trim_ascii(val);
+    if payload.is_empty() {
+        return false;
     }
+    if payload == b"[DONE]" {
+        *done = true;
+        return false;
+    }
+    // After TTFT is recorded, only events mentioning `"usage"` (or a JSON
+    // unicode escape that could spell it) can update scanner state.
+    if saw_data && !contains_bytes(payload, b"\"usage\"") && !contains_bytes(payload, b"\\u") {
+        return true;
+    }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) else {
+        return false;
+    };
+    if let Some(found) = Usage::from_chat(&value) {
+        *usage = Some(found);
+    }
+    true
 }
 
 /// OpenAI Responses stream patcher (spec 2.2).
@@ -157,9 +165,7 @@ impl SseScanner {
 #[derive(Debug)]
 pub struct ResponsesPatcher {
     emit_event_lines: bool,
-    carry: Vec<u8>,
-    /// A line over `MAX_PATCH_LINE` is being passed through as raw bytes.
-    raw_until_newline: bool,
+    framer: LineFramer,
     /// Seen an `event:` line in the current event block (reset by a blank line).
     saw_event_line: bool,
     saw_data: bool,
@@ -176,8 +182,7 @@ impl ResponsesPatcher {
     pub fn new(emit_event_lines: bool) -> Self {
         Self {
             emit_event_lines,
-            carry: Vec::new(),
-            raw_until_newline: false,
+            framer: LineFramer::new(MAX_EVENT_BYTES),
             saw_event_line: false,
             saw_data: false,
             done: false,
@@ -190,99 +195,145 @@ impl ResponsesPatcher {
     /// returns `true` exactly once: on the first JSON `data:` event (TTFT).
     pub fn feed(&mut self, chunk: &[u8], out: &mut Vec<u8>) -> bool {
         let mut first_data = false;
-        let mut rest = chunk;
-
-        if self.raw_until_newline {
-            match rest.iter().position(|&b| b == b'\n') {
-                Some(pos) => {
-                    out.extend_from_slice(&rest[..=pos]);
-                    rest = &rest[pos + 1..];
-                    self.raw_until_newline = false;
-                    self.saw_event_line = false;
-                }
-                None => {
-                    out.extend_from_slice(rest);
-                    return false;
+        let emit_event_lines = self.emit_event_lines;
+        let saw_event_line = &mut self.saw_event_line;
+        let saw_data = &mut self.saw_data;
+        let done = &mut self.done;
+        let usage = &mut self.usage;
+        let last_sequence = &mut self.last_sequence;
+        self.framer.push(chunk, |piece| match piece {
+            LinePiece::Line(line) => {
+                if handle_responses_line(
+                    line,
+                    emit_event_lines,
+                    saw_event_line,
+                    *saw_data,
+                    done,
+                    usage,
+                    last_sequence,
+                    out,
+                ) && !*saw_data
+                {
+                    *saw_data = true;
+                    first_data = true;
                 }
             }
-        }
-
-        self.carry.extend_from_slice(rest);
-        while let Some(pos) = self.carry.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = self.carry.drain(..=pos).collect();
-            if self.handle_line(&line, out) && !self.saw_data {
-                self.saw_data = true;
-                first_data = true;
+            LinePiece::Overflow(overflow) => {
+                *saw_event_line = false;
+                out.extend_from_slice(overflow);
             }
-        }
-        if self.carry.len() > MAX_PATCH_LINE {
-            out.extend_from_slice(&self.carry);
-            self.carry.clear();
-            self.raw_until_newline = true;
-            self.saw_event_line = false;
-        }
+            LinePiece::Partial(_) => {}
+        });
         first_data
     }
 
     /// Flush a trailing partial line (upstream closed mid-line) verbatim.
     pub fn finish(&mut self, out: &mut Vec<u8>) {
-        if !self.carry.is_empty() {
-            out.extend_from_slice(&self.carry);
-            self.carry.clear();
-        }
+        let emit_event_lines = self.emit_event_lines;
+        let saw_event_line = &mut self.saw_event_line;
+        let saw_data = &mut self.saw_data;
+        let done = &mut self.done;
+        let usage = &mut self.usage;
+        let last_sequence = &mut self.last_sequence;
+        self.framer.finish(|piece| match piece {
+            LinePiece::Line(line) => {
+                if handle_responses_line(
+                    line,
+                    emit_event_lines,
+                    saw_event_line,
+                    *saw_data,
+                    done,
+                    usage,
+                    last_sequence,
+                    out,
+                ) && !*saw_data
+                {
+                    *saw_data = true;
+                }
+            }
+            LinePiece::Partial(partial) | LinePiece::Overflow(partial) => {
+                out.extend_from_slice(partial);
+            }
+        });
     }
+}
 
-    fn handle_line(&mut self, line: &[u8], out: &mut Vec<u8>) -> bool {
-        let content = trim_eol(line);
-        if content.is_empty() {
-            self.saw_event_line = false;
-            out.extend_from_slice(line);
-            return false;
-        }
-        if content.starts_with(b"event:") {
-            self.saw_event_line = true;
-            out.extend_from_slice(line);
-            return false;
-        }
-        let Some(rest) = content.strip_prefix(b"data:") else {
-            out.extend_from_slice(line);
-            return false;
-        };
-        let payload = trim_ascii(rest);
-        if payload.is_empty() {
-            out.extend_from_slice(line);
-            return false;
-        }
-        if payload == b"[DONE]" {
-            self.done = true;
-            out.extend_from_slice(line);
-            return false;
-        }
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) else {
-            out.extend_from_slice(line);
-            return false;
-        };
+#[allow(clippy::too_many_arguments)]
+fn handle_responses_line(
+    line: &[u8],
+    emit_event_lines: bool,
+    saw_event_line: &mut bool,
+    saw_data: bool,
+    done: &mut bool,
+    usage: &mut Option<Usage>,
+    last_sequence: &mut Option<u64>,
+    out: &mut Vec<u8>,
+) -> bool {
+    let content = sse::trim_eol(line);
+    if content.is_empty() {
+        *saw_event_line = false;
+        out.extend_from_slice(line);
+        return false;
+    }
+    let Some((field, val)) = sse::parse_field(content) else {
+        out.extend_from_slice(line);
+        return false;
+    };
+    if field == b"event" {
+        *saw_event_line = true;
+        out.extend_from_slice(line);
+        return false;
+    }
+    if field != b"data" {
+        out.extend_from_slice(line);
+        return false;
+    }
+    let payload = trim_ascii(val);
+    if payload.is_empty() {
+        out.extend_from_slice(line);
+        return false;
+    }
+    if payload == b"[DONE]" {
+        *done = true;
+        out.extend_from_slice(line);
+        return false;
+    }
+    let needs_event_line = emit_event_lines && !*saw_event_line;
+    if saw_data
+        && !needs_event_line
+        && !contains_bytes(payload, b"\"usage\"")
+        && !contains_bytes(payload, b"\"sequence_number\"")
+        && !contains_bytes(payload, b"\\u")
+    {
+        out.extend_from_slice(line);
+        return true;
+    }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) else {
+        out.extend_from_slice(line);
+        return false;
+    };
+    if needs_event_line {
         if let Some(kind) = value.get("type").and_then(|v| v.as_str()) {
             // Event names are ASCII tokens; refuse to synthesize anything else.
             let printable = !kind.is_empty()
                 && kind
                     .bytes()
                     .all(|b| b.is_ascii_graphic() || b == b' ' || b == b'.' || b == b'_');
-            if self.emit_event_lines && !self.saw_event_line && printable {
+            if printable {
                 out.extend_from_slice(b"event: ");
                 out.extend_from_slice(kind.as_bytes());
                 out.push(b'\n');
             }
         }
-        if let Some(usage) = Usage::from_responses(&value) {
-            self.usage = Some(usage);
-        }
-        if let Some(seq) = value.get("sequence_number").and_then(|v| v.as_u64()) {
-            self.last_sequence = Some(self.last_sequence.map_or(seq, |last| last.max(seq)));
-        }
-        out.extend_from_slice(line);
-        true
     }
+    if let Some(found) = Usage::from_responses(&value) {
+        *usage = Some(found);
+    }
+    if let Some(seq) = value.get("sequence_number").and_then(|v| v.as_u64()) {
+        *last_sequence = Some(last_sequence.map_or(seq, |last| last.max(seq)));
+    }
+    out.extend_from_slice(line);
+    true
 }
 
 /// Anthropic Messages stream observer (spec 2.3).
@@ -292,71 +343,94 @@ impl ResponsesPatcher {
 /// observer only reads a copy to learn: TTFT (first `data:` event), usage
 /// (`message_start.message.usage` + `message_delta.usage`), and whether the
 /// stream reached a terminal event (`message_stop`, or an upstream `error`).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MessagesPatcher {
-    carry: Vec<u8>,
+    framer: LineFramer,
     saw_data: bool,
     /// Upstream sent `message_stop` or a terminal `error` event.
     pub done: bool,
     usage: crate::usage::MessagesUsageFields,
 }
 
+impl Default for MessagesPatcher {
+    fn default() -> Self {
+        Self {
+            framer: LineFramer::new(MAX_OBSERVER_LINE_BYTES),
+            saw_data: false,
+            done: false,
+            usage: crate::usage::MessagesUsageFields::default(),
+        }
+    }
+}
+
 impl MessagesPatcher {
     /// Feed one raw upstream chunk. Returns `true` exactly once: on the first
     /// JSON `data:` event (TTFT).
     pub fn feed(&mut self, chunk: &[u8]) -> bool {
-        self.carry.extend_from_slice(chunk);
         let mut first_data = false;
-        while let Some(pos) = self.carry.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = self.carry.drain(..=pos).collect();
-            if self.handle_line(&line) && !self.saw_data {
-                self.saw_data = true;
-                first_data = true;
+        let saw_data = &mut self.saw_data;
+        let done = &mut self.done;
+        let usage = &mut self.usage;
+        self.framer.push(chunk, |piece| {
+            if let LinePiece::Line(line) = piece {
+                if handle_messages_line(line, *saw_data, done, usage) && !*saw_data {
+                    *saw_data = true;
+                    first_data = true;
+                }
             }
-        }
-        if self.carry.len() > MAX_CARRY {
-            self.carry.clear();
-        }
+        });
         first_data
-    }
-
-    fn handle_line(&mut self, line: &[u8]) -> bool {
-        let line = trim_eol(line);
-        let Some(rest) = line.strip_prefix(b"data:") else {
-            return false;
-        };
-        let payload = trim_ascii(rest);
-        if payload.is_empty() {
-            return false;
-        }
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) else {
-            return false;
-        };
-        match value.get("type").and_then(|v| v.as_str()) {
-            Some("message_start") => {
-                if let Some(usage) = value.pointer("/message/usage") {
-                    self.usage
-                        .merge(crate::usage::MessagesUsageFields::parse(usage));
-                }
-            }
-            Some("message_delta") => {
-                if let Some(usage) = value.get("usage") {
-                    self.usage
-                        .merge(crate::usage::MessagesUsageFields::parse(usage));
-                }
-            }
-            Some("message_stop") => self.done = true,
-            // An upstream `error` event terminates the stream; its body was
-            // already forwarded verbatim, so the gateway adds nothing.
-            Some("error") => self.done = true,
-            _ => {}
-        }
-        true
     }
 
     pub fn usage(&self) -> Option<Usage> {
         self.usage.to_usage()
     }
+}
+
+fn handle_messages_line(
+    line: &[u8],
+    saw_data: bool,
+    done: &mut bool,
+    usage: &mut crate::usage::MessagesUsageFields,
+) -> bool {
+    let content = sse::trim_eol(line);
+    let Some((b"data", val)) = sse::parse_field(content) else {
+        return false;
+    };
+    let payload = trim_ascii(val);
+    if payload.is_empty() {
+        return false;
+    }
+    // After TTFT is recorded, skip parsing hot content_block_* delta lines
+    // that cannot carry message lifecycle or error events.
+    if saw_data
+        && !contains_bytes(payload, b"message_")
+        && !contains_bytes(payload, b"error")
+        && !contains_bytes(payload, b"\\u")
+    {
+        return true;
+    }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) else {
+        return false;
+    };
+    match value.get("type").and_then(|v| v.as_str()) {
+        Some("message_start") => {
+            if let Some(found) = value.pointer("/message/usage") {
+                usage.merge(crate::usage::MessagesUsageFields::parse(found));
+            }
+        }
+        Some("message_delta") => {
+            if let Some(found) = value.get("usage") {
+                usage.merge(crate::usage::MessagesUsageFields::parse(found));
+            }
+        }
+        Some("message_stop") => *done = true,
+        // An upstream `error` event terminates the stream; its body was
+        // already forwarded verbatim, so the gateway adds nothing.
+        Some("error") => *done = true,
+        _ => {}
+    }
+    true
 }
 
 /// Side observer for one SSE stream: chat forwards bytes untouched, Responses
@@ -442,11 +516,11 @@ impl Observer {
     }
 }
 
-fn trim_eol(mut line: &[u8]) -> &[u8] {
-    while let [rest @ .., b'\n' | b'\r'] = line {
-        line = rest;
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
     }
-    line
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
