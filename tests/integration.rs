@@ -4729,3 +4729,72 @@ async fn reload_swaps_env_keys_logs_timeout_and_models_atomically() {
     );
     assert_eq!(rows2[0].status, 200);
 }
+
+#[tokio::test]
+async fn healthz_probe_runs_providers_in_parallel() {
+    let dir = temp_dir("healthz-parallel");
+    let slow_chat = || async {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        Json(json!({
+            "id": "chatcmpl-probe",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }]
+        }))
+    };
+    let app_a = Router::new().route("/v1/chat/completions", post(slow_chat));
+    let app_b = Router::new().route("/v1/chat/completions", post(slow_chat));
+    let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener_a, app_a).await;
+    });
+    tokio::spawn(async move {
+        let _ = axum::serve(listener_b, app_b).await;
+    });
+
+    let mut cfg = config(&dir, format!("http://{addr_a}/v1"), 50 * 1024 * 1024);
+    cfg.providers.push(Provider {
+        id: "second".into(),
+        vendor: None,
+        base_url: format!("http://{addr_b}/v1"),
+        anthropic_base_url: None,
+        api_key_env: "TEST_OD_KEY".into(),
+        auth: "api_key".into(),
+        protocols: vec!["chat".into()],
+        quirks: None,
+    });
+    cfg.models[0].backends.push(Backend {
+        provider: "second".into(),
+        upstream: "upstream-model".into(),
+    });
+    let app = build_router(AppState::new(cfg, env_file(&dir)).unwrap());
+
+    let started = Instant::now();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/healthz?probe=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = body_json(response).await;
+    assert_eq!(value["providers"]["od"]["probe"]["status"], "ok", "{value}");
+    assert_eq!(
+        value["providers"]["second"]["probe"]["status"], "ok",
+        "{value}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(750),
+        "two 400ms probes ran serially instead of in parallel: {elapsed:?}"
+    );
+}

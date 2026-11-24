@@ -1401,6 +1401,24 @@ async fn healthz_handler(
     let mut providers = serde_json::Map::new();
     let mut overall_ok = true;
 
+    let probe_results: HashMap<String, Value> = if probe {
+        let futs = cfg.providers.iter().map(|provider| {
+            let state = state.clone();
+            let cfg = Arc::clone(&cfg);
+            let provider = provider.clone();
+            async move {
+                let value = probe_provider(&state, &cfg, &provider).await;
+                (provider.id, value)
+            }
+        });
+        futures_util::future::join_all(futs)
+            .await
+            .into_iter()
+            .collect()
+    } else {
+        HashMap::new()
+    };
+
     for provider in &cfg.providers {
         let circuit = state.circuits().view(&provider.id);
         let mut entry = json!({
@@ -1437,15 +1455,14 @@ async fn healthz_handler(
                 overall_ok = false;
             }
         }
-        if probe {
-            let probe_value = probe_provider(&state, &cfg, provider).await;
+        if let Some(probe_value) = probe_results.get(&provider.id) {
             if let Some(balance) = probe_value.get("balance") {
                 entry["balance"] = balance.clone();
             }
             if probe_value["status"] != "ok" {
                 overall_ok = false;
             }
-            entry["probe"] = probe_value;
+            entry["probe"] = probe_value.clone();
         }
         providers.insert(provider.id.clone(), entry);
     }
@@ -1457,13 +1474,7 @@ async fn healthz_handler(
         "providers": providers,
     });
     let body = serde_json::to_vec(&payload).unwrap_or_default();
-    let status = if overall_ok {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
     // Health endpoints conventionally stay 200 for "degraded"; the body carries state.
-    let _ = status;
     Response::builder()
         .status(StatusCode::OK)
         .header(axum::http::header::CONTENT_TYPE, "application/json")
@@ -1494,7 +1505,16 @@ async fn metrics_handler(State(state): State<AppState>) -> Response {
         .expect("valid response")
 }
 
-async fn probe_provider(state: &AppState, cfg: &Config, provider: &Provider) -> Value {
+async fn probe_provider(state: &AppState, cfg: &Arc<Config>, provider: &Provider) -> Value {
+    probe_provider_with_timeout(state, cfg, provider, PROBE_TIMEOUT).await
+}
+
+async fn probe_provider_with_timeout(
+    state: &AppState,
+    cfg: &Arc<Config>,
+    provider: &Provider,
+    timeout: Duration,
+) -> Value {
     if let Some(cached) = state.probe_cached(&provider.id, Duration::from_secs(30)) {
         return cached;
     }
@@ -1533,26 +1553,8 @@ async fn probe_provider(state: &AppState, cfg: &Config, provider: &Provider) -> 
         state.probe_store(&provider.id, value.clone());
         return value;
     };
-    let up = state.upstream();
     let started = Instant::now();
-    let outcome = if provider.supports("chat") {
-        let body = json!({
-            "model": upstream,
-            "messages": [{"role": "user", "content": "ping"}],
-            "max_tokens": 1,
-            "reasoning_effort": "none",
-            "stream": false
-        });
-        up.chat(provider, &upstream, &body, &HeaderMap::new()).await
-    } else if provider.supports("responses") {
-        let body = json!({
-            "model": upstream,
-            "input": "ping",
-            "max_output_tokens": 16,
-            "stream": false
-        });
-        up.responses(provider, &body, &HeaderMap::new()).await
-    } else {
+    let Some(outcome) = probe_inference(state, cfg, provider, &upstream, timeout).await else {
         let value = json!({"status": "unknown", "error": "provider has no probeable protocol"});
         state.probe_store(&provider.id, value.clone());
         return value;
@@ -1577,6 +1579,52 @@ async fn probe_provider(state: &AppState, cfg: &Config, provider: &Provider) -> 
     }
     state.probe_store(&provider.id, value.clone());
     value
+}
+
+/// Minimal 1-token inference probe shared by `/healthz?probe=1` and background
+/// circuit recovery, bounded by `timeout` so a hung provider cannot block for
+/// the full 600s request timeout.
+async fn probe_inference(
+    state: &AppState,
+    cfg: &Arc<Config>,
+    provider: &Provider,
+    upstream: &str,
+    timeout: Duration,
+) -> Option<std::result::Result<ChatOutcome, ProxyError>> {
+    let rt = state.runtime();
+    let up = Upstream::with_clients(
+        Arc::clone(cfg),
+        Arc::clone(&rt.env),
+        rt.http.clone(),
+        state.stream_http().clone(),
+        state.sessions(),
+    );
+    let call = async {
+        if provider.supports("chat") {
+            let body = json!({
+                "model": upstream,
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 1,
+                "reasoning_effort": "none",
+                "stream": false
+            });
+            Some(up.chat(provider, upstream, &body, &HeaderMap::new()).await)
+        } else if provider.supports("responses") {
+            let body = json!({
+                "model": upstream,
+                "input": "ping",
+                "max_output_tokens": 16,
+                "stream": false
+            });
+            Some(up.responses(provider, &body, &HeaderMap::new()).await)
+        } else {
+            None
+        }
+    };
+    match tokio::time::timeout(timeout, call).await {
+        Ok(result) => result,
+        Err(_) => Some(Err(ProxyError::Timeout("health probe timed out".into()))),
+    }
 }
 
 /// Everything a protocol handler needs after auth, body parsing and routing.
@@ -4387,6 +4435,9 @@ const CATALOG_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
 const GROK_USAGE_INTERVAL: Duration = Duration::from_secs(240);
 /// How often the health task looks at the circuits at all.
 const HEALTH_TICK: Duration = Duration::from_secs(60);
+/// Per-provider bound for inference health probes (`/healthz?probe=1` and
+/// background circuit recovery), well below `request_timeout_s` (600s).
+const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 async fn deepseek_balance(
     state: &AppState,
@@ -4416,22 +4467,25 @@ fn balance_upstream(cfg: &Config, provider_id: &str) -> String {
 async fn refresh_catalog(state: &AppState) -> Vec<Value> {
     state.mark_catalog_refreshed();
     let cfg = state.cfg();
-    let mut rows = Vec::new();
-    for provider in &cfg.providers {
-        match fetch_model_ids(state, provider).await {
-            Ok(models) => {
-                let count = models.len();
-                state.note_catalog(&provider.id, models);
-                plog_health("catalog", &provider.id, "", &format!("models_{count}"));
-                rows.push(json!({"id": provider.id, "models": count}));
-            }
-            Err(err) => {
-                plog_health("catalog_failed", &provider.id, "", &err);
-                rows.push(json!({"id": provider.id, "error": err}));
+    let futs = cfg.providers.iter().map(|provider| {
+        let state = state.clone();
+        let provider = provider.clone();
+        async move {
+            match fetch_model_ids(&state, &provider).await {
+                Ok(models) => {
+                    let count = models.len();
+                    state.note_catalog(&provider.id, models);
+                    plog_health("catalog", &provider.id, "", &format!("models_{count}"));
+                    json!({"id": provider.id, "models": count})
+                }
+                Err(err) => {
+                    plog_health("catalog_failed", &provider.id, "", &err);
+                    json!({"id": provider.id, "error": err})
+                }
             }
         }
-    }
-    rows
+    });
+    futures_util::future::join_all(futs).await
 }
 
 async fn catalog_refresh_handler(State(state): State<AppState>) -> Response {
@@ -4493,218 +4547,223 @@ async fn fetch_model_ids(
     crate::catalog::parse_models(&body).ok_or_else(|| "unrecognized model list".to_string())
 }
 
+/// Run one health-tick pass for a single provider (usage poll, balance check,
+/// and circuit recovery probe). Executed concurrently across providers so one
+/// slow or hung upstream cannot delay the rest.
+async fn health_tick_provider(
+    state: AppState,
+    cfg: Arc<Config>,
+    provider: Provider,
+    due_grok: bool,
+    due_balance: bool,
+    grok_user_id: Option<String>,
+    probe_timeout: Duration,
+) -> Option<(String, String)> {
+    let circuits = state.circuits();
+    let view = circuits.view(&provider.id);
+    let mut updated_grok_user_id = None;
+
+    if due_grok {
+        let upstream = balance_upstream(&cfg, &provider.id);
+        let rt = state.runtime();
+        match grok_billing::fetch_usage(
+            &rt.http,
+            &state.sessions(),
+            &provider,
+            &rt.env
+                .get("UMSP_GROK_CLI_VERSION")
+                .unwrap_or_else(|| sessions::GROK_CLI_VERSION.to_string()),
+            grok_user_id.as_deref(),
+        )
+        .await
+        {
+            Ok((usage, user_id)) => {
+                updated_grok_user_id = Some((provider.id.clone(), user_id));
+                if let Some(window) = usage.into_window() {
+                    let remaining = window.remaining_fraction;
+                    state.note_provider_usage(&provider.id, window);
+                    plog_health(
+                        "grok_usage",
+                        &provider.id,
+                        &upstream,
+                        &format!("remaining_{:.0}pct", remaining * 100.0),
+                    );
+                } else {
+                    plog_health(
+                        "grok_usage",
+                        &provider.id,
+                        &upstream,
+                        "billing_period_ended",
+                    );
+                }
+            }
+            Err(err) => plog_health("grok_usage_failed", &provider.id, &upstream, &err),
+        }
+    }
+
+    // DeepSeek balance is free. Refresh it for healthy providers too, so
+    // selection can skip an exhausted account without waiting for a failure.
+    if due_balance {
+        match deepseek_balance(&state, &provider).await {
+            Ok(balance) => {
+                state.note_provider_balance(&provider.id, &balance);
+                if view.state != CircuitState::Closed {
+                    if balance.is_available {
+                        let balance_reason = matches!(
+                            view.reason.as_deref(),
+                            Some("insufficient_balance") | Some("balance_check_failed") | None
+                        );
+                        if balance_reason && circuits.close(&provider.id) {
+                            let upstream = balance_upstream(&cfg, &provider.id);
+                            plog_health(
+                                "circuit_close",
+                                &provider.id,
+                                &upstream,
+                                "balance_restored",
+                            );
+                        }
+                        if balance_reason {
+                            return updated_grok_user_id;
+                        }
+                    } else {
+                        circuits.force_open(
+                            &provider.id,
+                            "insufficient_balance",
+                            circuits.config().ds_balance_cooldown,
+                        );
+                        return updated_grok_user_id;
+                    }
+                }
+            }
+            Err(err) => {
+                let upstream = balance_upstream(&cfg, &provider.id);
+                let reason = format!("balance_check_failed:{err}");
+                if view.state == CircuitState::Closed {
+                    plog_health("balance_check_failed", &provider.id, &upstream, &reason);
+                } else {
+                    plog_health("circuit_open", &provider.id, &upstream, &reason);
+                    if view.state == CircuitState::HalfOpen {
+                        circuits.force_open(&provider.id, "balance_check_failed", BALANCE_INTERVAL);
+                    }
+                    return updated_grok_user_id;
+                }
+            }
+        }
+    }
+
+    if view.state == CircuitState::Closed {
+        return updated_grok_user_id;
+    }
+    let Some((model, upstream)) = cfg.models.iter().find_map(|m| {
+        m.backends
+            .iter()
+            .find(|b| b.provider == provider.id)
+            .map(|b| (m.clone(), b.upstream.clone()))
+    }) else {
+        return updated_grok_user_id;
+    };
+
+    let Some(_probe_guard) = circuits.take_probe(&provider.id) else {
+        return updated_grok_user_id;
+    };
+    let target = AttemptTarget {
+        model,
+        provider: provider.clone(),
+        upstream: upstream.clone(),
+        upstream_protocol: "chat".into(),
+    };
+    let Some(outcome) = probe_inference(&state, &cfg, &provider, &upstream, probe_timeout).await
+    else {
+        return updated_grok_user_id;
+    };
+    match outcome {
+        Ok(outcome) => {
+            state.note_health(
+                &target.provider.id,
+                outcome.status,
+                outcome.duration_ms,
+                (outcome.status >= 400).then(|| format!("http_{}", outcome.status)),
+            );
+            if outcome.status < 400 || !upstream::status_is_retryable(outcome.status) {
+                // A client error still proves the provider is reachable
+                // and the key works: close, don't count it.
+                if circuits.close(&target.provider.id) {
+                    plog_health(
+                        "circuit_close",
+                        &target.provider.id,
+                        &target.upstream,
+                        "probe_ok",
+                    );
+                }
+            } else {
+                note_circuit_result(&state, &target, outcome.status, true);
+            }
+        }
+        Err(err) => {
+            state.note_health(&target.provider.id, 0, 0, Some(err.code().to_string()));
+            note_circuit_error(&state, &target, &err);
+        }
+    }
+    updated_grok_user_id
+}
+
 /// Background circuit recovery and provider health (spec 3.4). DeepSeek gets a
-/// inference probe (`max_tokens: 1`, `reasoning_effort: none`).
+/// balance check first; other open providers get a 1-token inference probe.
 ///
-/// Spawned by `serve` and aborted when serving stops, so it can never keep the
-/// process alive.
+/// Spawned by `serve` and aborted when serving stops; `JoinSet`s abort any
+/// in-flight provider probes or catalog refreshes on drop so nothing outlives
+/// shutdown.
 async fn health_loop(state: AppState) {
     let mut ticker = tokio::time::interval(HEALTH_TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_balance: HashMap<String, Instant> = HashMap::new();
     let mut last_grok_usage: HashMap<String, Instant> = HashMap::new();
     let mut grok_user_ids: HashMap<String, String> = HashMap::new();
+    let mut catalog_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+
     loop {
         ticker.tick().await;
-        if state.catalog_due() {
+        while catalog_tasks.try_join_next().is_some() {}
+        if state.catalog_due() && catalog_tasks.is_empty() {
             let refresh = state.clone();
-            tokio::spawn(async move {
+            catalog_tasks.spawn(async move {
                 let _ = refresh_catalog(&refresh).await;
             });
         }
         let cfg = state.cfg();
-        let circuits = state.circuits();
+        let mut tick_tasks = tokio::task::JoinSet::new();
         for provider in &cfg.providers {
-            let view = circuits.view(&provider.id);
-            if provider.vendor.as_deref() == Some("grok") && provider.uses_oauth() {
-                let due = last_grok_usage
+            let due_grok = provider.vendor.as_deref() == Some("grok")
+                && provider.uses_oauth()
+                && last_grok_usage
                     .get(&provider.id)
                     .map(|at| at.elapsed() >= GROK_USAGE_INTERVAL)
                     .unwrap_or(true);
-                if due {
-                    last_grok_usage.insert(provider.id.clone(), Instant::now());
-                    let upstream = balance_upstream(&cfg, &provider.id);
-                    let user_id = grok_user_ids.get(&provider.id).map(String::as_str);
-                    let rt = state.runtime();
-                    match grok_billing::fetch_usage(
-                        &rt.http,
-                        &state.sessions(),
-                        provider,
-                        &rt.env
-                            .get("UMSP_GROK_CLI_VERSION")
-                            .unwrap_or_else(|| sessions::GROK_CLI_VERSION.to_string()),
-                        user_id,
-                    )
-                    .await
-                    {
-                        Ok((usage, user_id)) => {
-                            grok_user_ids.insert(provider.id.clone(), user_id);
-                            if let Some(window) = usage.into_window() {
-                                let remaining = window.remaining_fraction;
-                                state.note_provider_usage(&provider.id, window);
-                                plog_health(
-                                    "grok_usage",
-                                    &provider.id,
-                                    &upstream,
-                                    &format!("remaining_{:.0}pct", remaining * 100.0),
-                                );
-                            } else {
-                                plog_health(
-                                    "grok_usage",
-                                    &provider.id,
-                                    &upstream,
-                                    "billing_period_ended",
-                                );
-                            }
-                        }
-                        Err(err) => plog_health("grok_usage_failed", &provider.id, &upstream, &err),
-                    }
-                }
+            if due_grok {
+                last_grok_usage.insert(provider.id.clone(), Instant::now());
             }
-            // DeepSeek balance is free. Refresh it for healthy providers too, so
-            // selection can skip an exhausted account without waiting for a failure.
-            if provider.quirks.as_deref() == Some("deepseek") {
-                let due = last_balance
+            let due_balance = provider.quirks.as_deref() == Some("deepseek")
+                && last_balance
                     .get(&provider.id)
                     .map(|at| at.elapsed() >= BALANCE_INTERVAL)
                     .unwrap_or(true);
-                if due {
-                    last_balance.insert(provider.id.clone(), Instant::now());
-                    match deepseek_balance(&state, provider).await {
-                        Ok(balance) => {
-                            state.note_provider_balance(&provider.id, &balance);
-                            if view.state != CircuitState::Closed {
-                                if balance.is_available {
-                                    let balance_reason = matches!(
-                                        view.reason.as_deref(),
-                                        Some("insufficient_balance")
-                                            | Some("balance_check_failed")
-                                            | None
-                                    );
-                                    if balance_reason && circuits.close(&provider.id) {
-                                        let upstream = balance_upstream(&cfg, &provider.id);
-                                        plog_health(
-                                            "circuit_close",
-                                            &provider.id,
-                                            &upstream,
-                                            "balance_restored",
-                                        );
-                                    }
-                                    if balance_reason {
-                                        continue;
-                                    }
-                                } else {
-                                    circuits.force_open(
-                                        &provider.id,
-                                        "insufficient_balance",
-                                        circuits.config().ds_balance_cooldown,
-                                    );
-                                    continue;
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            let upstream = balance_upstream(&cfg, &provider.id);
-                            let reason = format!("balance_check_failed:{err}");
-                            if view.state == CircuitState::Closed {
-                                plog_health(
-                                    "balance_check_failed",
-                                    &provider.id,
-                                    &upstream,
-                                    &reason,
-                                );
-                            } else {
-                                plog_health("circuit_open", &provider.id, &upstream, &reason);
-                                if view.state == CircuitState::HalfOpen {
-                                    circuits.force_open(
-                                        &provider.id,
-                                        "balance_check_failed",
-                                        BALANCE_INTERVAL,
-                                    );
-                                }
-                                continue;
-                            }
-                        }
-                    }
-                }
+            if due_balance {
+                last_balance.insert(provider.id.clone(), Instant::now());
             }
-            if view.state == CircuitState::Closed {
-                continue;
-            }
-            let Some((model, upstream)) = cfg.models.iter().find_map(|m| {
-                m.backends
-                    .iter()
-                    .find(|b| b.provider == provider.id)
-                    .map(|b| (m.clone(), b.upstream.clone()))
-            }) else {
-                continue;
-            };
-
-            let Some(_probe_guard) = circuits.take_probe(&provider.id) else {
-                continue;
-            };
-            let target = AttemptTarget {
-                model: model.clone(),
-                provider: provider.clone(),
-                upstream: upstream.clone(),
-                upstream_protocol: "chat".into(),
-            };
-            let up = Upstream::with_clients(
-                cfg.clone(),
-                state.env(),
-                state.http(),
-                state.stream_http().clone(),
-                state.sessions(),
-            );
-            let outcome = if target.provider.supports("chat") {
-                let body = json!({
-                    "model": target.upstream,
-                    "messages": [{"role": "user", "content": "ping"}],
-                    "max_tokens": 1,
-                    "reasoning_effort": "none",
-                    "stream": false
-                });
-                up.chat(&target.provider, &target.upstream, &body, &HeaderMap::new())
-                    .await
-            } else if target.provider.supports("responses") {
-                let body = json!({
-                    "model": target.upstream,
-                    "input": "ping",
-                    "max_output_tokens": 16,
-                    "stream": false
-                });
-                up.responses(&target.provider, &body, &HeaderMap::new())
-                    .await
-            } else {
-                continue;
-            };
-            match outcome {
-                Ok(outcome) => {
-                    state.note_health(
-                        &target.provider.id,
-                        outcome.status,
-                        outcome.duration_ms,
-                        (outcome.status >= 400).then(|| format!("http_{}", outcome.status)),
-                    );
-                    if outcome.status < 400 || !upstream::status_is_retryable(outcome.status) {
-                        // A client error still proves the provider is reachable
-                        // and the key works: close, don't count it.
-                        if circuits.close(&target.provider.id) {
-                            plog_health(
-                                "circuit_close",
-                                &target.provider.id,
-                                &target.upstream,
-                                "probe_ok",
-                            );
-                        }
-                    } else {
-                        note_circuit_result(&state, &target, outcome.status, true);
-                    }
-                }
-                Err(err) => {
-                    state.note_health(&target.provider.id, 0, 0, Some(err.code().to_string()));
-                    note_circuit_error(&state, &target, &err);
-                }
+            let user_id = grok_user_ids.get(&provider.id).cloned();
+            tick_tasks.spawn(health_tick_provider(
+                state.clone(),
+                Arc::clone(&cfg),
+                provider.clone(),
+                due_grok,
+                due_balance,
+                user_id,
+                PROBE_TIMEOUT,
+            ));
+        }
+        while let Some(res) = tick_tasks.join_next().await {
+            if let Ok(Some((provider_id, user_id))) = res {
+                grok_user_ids.insert(provider_id, user_id);
             }
         }
     }
@@ -4748,7 +4807,7 @@ pub async fn serve(config_path: &std::path::Path, listen_override: Option<String
     let reload_state = state.clone();
     let config_path_owned = config_path.to_path_buf();
     let env_path_owned = env_path.clone();
-    tokio::spawn(async move {
+    let reload_task = tokio::spawn(async move {
         let mut hup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
             Ok(sig) => sig,
             Err(_) => return,
@@ -4811,6 +4870,7 @@ pub async fn serve(config_path: &std::path::Path, listen_override: Option<String
     )
     .with_graceful_shutdown(shutdown)
     .await;
+    reload_task.abort();
     health_task.abort();
     let flush_state = state.clone();
     let _ = tokio::task::spawn_blocking(move || flush_state.flush_logs()).await;
@@ -4986,5 +5046,81 @@ mod tests {
             error_type_for(StatusCode::NOT_IMPLEMENTED),
             "invalid_request_error"
         );
+    }
+
+    #[tokio::test]
+    async fn probe_provider_enforces_short_probe_timeout() {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                futures_util::future::pending::<StatusCode>().await;
+                StatusCode::OK
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let dir = std::env::temp_dir().join(format!("umsp-probe-to-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let env_path = dir.join("env");
+        std::fs::write(&env_path, "PROBE_KEY=sk-test\n").unwrap();
+
+        let server = crate::config::ServerConfig {
+            state_dir: dir.display().to_string(),
+            request_timeout_s: 60,
+            ..crate::config::ServerConfig::default()
+        };
+        let cfg = Config {
+            server,
+            providers: vec![Provider {
+                id: "hung".into(),
+                vendor: None,
+                base_url: format!("http://{addr}/v1"),
+                anthropic_base_url: None,
+                api_key_env: "PROBE_KEY".into(),
+                auth: "api_key".into(),
+                protocols: vec!["chat".into()],
+                quirks: None,
+            }],
+            models: vec![Model {
+                id: "m".into(),
+                backends: vec![crate::config::Backend {
+                    provider: "hung".into(),
+                    upstream: "m".into(),
+                }],
+                aliases: Vec::new(),
+                context_length: 8192,
+                context_lengths: Vec::new(),
+                max_completion_tokens: 1024,
+                capabilities: vec!["text".into()],
+                display_name: None,
+                created: 0,
+                description: None,
+            }],
+            clients: Vec::new(),
+        };
+
+        let state = AppState::new(cfg, EnvFile::load(&env_path)).unwrap();
+        let cfg_arc = state.cfg();
+        let started = Instant::now();
+        let value = probe_provider_with_timeout(
+            &state,
+            &cfg_arc,
+            &cfg_arc.providers[0],
+            Duration::from_millis(200),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert_eq!(value["status"], "error", "{value}");
+        assert_eq!(value["error"], "upstream_timeout", "{value}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "probe must not wait for request_timeout_s: {elapsed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
