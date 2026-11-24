@@ -88,9 +88,10 @@ umsp doctor --json
 ```
 
 When the CLI modifies configuration it uses `toml_edit` to preserve comments and formatting, writes a
-temporary file, then atomically replaces it with `rename`; if the process pointed to by
-`state_dir/umsp.pid` is still alive, it automatically sends `SIGHUP` to trigger a hot reload (disable
-with `--no-reload`).
+temporary file, then atomically replaces it with `rename`; if a running `umsp serve` still holds the
+lock on `state_dir/umsp.pid`, it automatically sends `SIGHUP` to trigger a hot reload (disable
+with `--no-reload`). A pid file left behind by a crashed server is not locked and is never signalled.
+`umsp serve` refuses to start while another server holds the same pid file.
 
 ---
 
