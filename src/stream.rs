@@ -48,19 +48,27 @@ pub fn error_event(message: &str) -> Vec<u8> {
     format!("data: {body}\n\n").into_bytes()
 }
 
-/// Build a protocol-native Responses error event for a stream that broke after
-/// the 200 was already sent (spec 2.2 / 8.3). Responses errors are events:
-/// `event: error` + `data: {"type":"error","error":{...}}`.
-pub fn responses_error_event(message: &str) -> Vec<u8> {
-    let payload = json!({
+/// Payload of a Responses stream `error` event. The Responses wire protocol
+/// defines it flat (`type`, `code`, `message`, `param`, `sequence_number`),
+/// unlike the nested Chat and Anthropic shapes. The caller adds
+/// `sequence_number`.
+pub fn responses_error_payload(message: &str) -> serde_json::Value {
+    json!({
         "type": "error",
-        "error": {
-            "message": message,
-            "type": "upstream_error",
-            "code": "upstream_stream_error",
-            "param": null
-        }
-    });
+        "code": "upstream_stream_error",
+        "message": message,
+        "param": null
+    })
+}
+
+/// Build a protocol-native Responses error event for a stream that broke after
+/// the 200 was already sent (spec 2.2 / 8.3): `event: error` + the flat
+/// payload, numbered after the last upstream event when it carried one.
+pub fn responses_error_event(message: &str, sequence_number: Option<u64>) -> Vec<u8> {
+    let mut payload = responses_error_payload(message);
+    if let (Some(seq), Some(obj)) = (sequence_number, payload.as_object_mut()) {
+        obj.insert("sequence_number".into(), json!(seq));
+    }
     let body = serde_json::to_string(&payload).unwrap_or_default();
     format!("event: error\ndata: {body}\n\n").into_bytes()
 }
@@ -159,6 +167,9 @@ pub struct ResponsesPatcher {
     pub done: bool,
     /// Last `usage` object seen (non-streaming shape or `response.completed`).
     pub usage: Option<Usage>,
+    /// Highest upstream `sequence_number`, so a synthesized error event
+    /// continues the numbering.
+    pub last_sequence: Option<u64>,
 }
 
 impl ResponsesPatcher {
@@ -171,6 +182,7 @@ impl ResponsesPatcher {
             saw_data: false,
             done: false,
             usage: None,
+            last_sequence: None,
         }
     }
 
@@ -264,6 +276,9 @@ impl ResponsesPatcher {
         }
         if let Some(usage) = Usage::from_responses(&value) {
             self.usage = Some(usage);
+        }
+        if let Some(seq) = value.get("sequence_number").and_then(|v| v.as_u64()) {
+            self.last_sequence = Some(self.last_sequence.map_or(seq, |last| last.max(seq)));
         }
         out.extend_from_slice(line);
         true
@@ -419,7 +434,9 @@ impl Observer {
     pub fn error_event(&self, message: &str) -> Vec<u8> {
         match self {
             Observer::Chat(_) => error_event(message),
-            Observer::Responses(_) => responses_error_event(message),
+            Observer::Responses(patcher) => {
+                responses_error_event(message, patcher.last_sequence.map(|seq| seq + 1))
+            }
             Observer::Messages(_) => messages_error_event(message),
         }
     }
@@ -642,9 +659,31 @@ mod tests {
         let payload: serde_json::Value =
             serde_json::from_str(text.lines().nth(1).unwrap().trim_start_matches("data: "))
                 .unwrap();
+        // Flat, as the Responses wire protocol defines the `error` event.
         assert_eq!(payload["type"], "error");
-        assert_eq!(payload["error"]["type"], "upstream_error");
-        assert_eq!(payload["error"]["message"], "boom");
+        assert_eq!(payload["code"], "upstream_stream_error");
+        assert_eq!(payload["message"], "boom");
+        assert!(payload["param"].is_null());
+        assert!(payload.get("error").is_none());
+        assert!(
+            payload.get("sequence_number").is_none(),
+            "no upstream numbering"
+        );
+    }
+
+    #[test]
+    fn responses_observer_error_event_continues_upstream_numbering() {
+        let mut observer = Observer::responses(true);
+        let mut out = Vec::new();
+        observer.transform(
+            b"data: {\"type\":\"response.created\",\"sequence_number\":0}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\",\"sequence_number\":4}\n\n",
+            &mut out,
+        );
+        let text = String::from_utf8(observer.error_event("boom")).unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(text.lines().nth(1).unwrap().trim_start_matches("data: "))
+                .unwrap();
+        assert_eq!(payload["sequence_number"], 5);
     }
 
     #[test]
