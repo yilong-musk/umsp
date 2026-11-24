@@ -172,9 +172,128 @@ pub fn expand_tilde(value: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(value)
 }
 
+/// Atomically replace `path` with `bytes`.
+///
+/// The temporary file is created next to `path` under a random name with
+/// `create_new` and `mode` from the start, so secrets are never readable by
+/// other users, concurrent writers never share a temp file, and a crash leaves
+/// either the old or the new content. Data and directory are fsynced so the
+/// rename survives power loss.
+pub fn atomic_write(path: &std::path::Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind, Write};
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let dir = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "path has no file name"))?
+        .to_string_lossy();
+
+    for _ in 0..16 {
+        let mut suffix = [0u8; 8];
+        if getrandom::fill(&mut suffix).is_err() {
+            let nanos = Utc::now().timestamp_nanos_opt().unwrap_or_default() as u64;
+            suffix = (nanos ^ u64::from(std::process::id())).to_le_bytes();
+        }
+        let tmp = dir.join(format!(".{name}.{}.tmp", hex_encode(&suffix)));
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&tmp)
+        {
+            Ok(file) => file,
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        };
+        let written = file
+            .write_all(bytes)
+            // `mode` passed to open() is filtered by the umask; make it exact.
+            .and_then(|()| file.set_permissions(std::fs::Permissions::from_mode(mode)))
+            .and_then(|()| file.sync_all())
+            .and_then(|()| std::fs::rename(&tmp, path));
+        if let Err(err) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err);
+        }
+        if let Ok(dir) = std::fs::File::open(dir) {
+            let _ = dir.sync_all();
+        }
+        return Ok(());
+    }
+    Err(Error::new(
+        ErrorKind::AlreadyExists,
+        "could not pick a unique temporary file name",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn atomic_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("umsp-atomic-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn atomic_write_replaces_content_with_the_requested_mode() {
+        let dir = atomic_dir("mode");
+        let path = dir.join("env");
+        std::fs::write(&path, "OLD=1\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        atomic_write(&path, b"NEW=2\n", 0o600).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "NEW=2\n");
+        assert_eq!(mode_of(&path), 0o600);
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name != "env")
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+    }
+
+    #[test]
+    fn atomic_write_creates_missing_parents() {
+        let dir = atomic_dir("parents");
+        let path = dir.join("a/b/state.json");
+        atomic_write(&path, b"{}", 0o600).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
+    }
+
+    #[test]
+    fn concurrent_atomic_writers_never_corrupt_the_file() {
+        let dir = atomic_dir("concurrent");
+        let path = dir.join("session.json");
+        let payloads: Vec<String> = (0..8).map(|i| format!("{i}").repeat(4096)).collect();
+        std::thread::scope(|scope| {
+            for payload in &payloads {
+                let path = &path;
+                scope.spawn(move || {
+                    for _ in 0..20 {
+                        atomic_write(path, payload.as_bytes(), 0o600).unwrap();
+                    }
+                });
+            }
+        });
+        let final_text = std::fs::read_to_string(&path).unwrap();
+        assert!(payloads.contains(&final_text), "torn write");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+    }
 
     #[test]
     fn glob_basics() {

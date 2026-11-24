@@ -155,26 +155,8 @@ impl EnvFile {
 }
 
 pub fn write_private(path: &Path, contents: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            UmspError::other(
-                "ENV_FILE",
-                format!("cannot create {}: {e}", parent.display()),
-            )
-        })?;
-    }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, contents).map_err(|e| {
-        UmspError::other("ENV_FILE", format!("cannot write {}: {e}", tmp.display()))
-    })?;
-    set_mode_600(&tmp)?;
-    std::fs::rename(&tmp, path).map_err(|e| {
-        UmspError::other(
-            "ENV_FILE",
-            format!("cannot replace {}: {e}", path.display()),
-        )
-    })?;
-    Ok(())
+    crate::util::atomic_write(path, contents.as_bytes(), 0o600)
+        .map_err(|e| UmspError::other("ENV_FILE", format!("cannot write {}: {e}", path.display())))
 }
 
 pub fn set_mode_600(path: &Path) -> Result<()> {

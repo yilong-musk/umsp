@@ -61,14 +61,9 @@ impl ConfigDoc {
             )));
         }
 
-        let tmp = self.path.with_extension("toml.tmp");
-        std::fs::write(&tmp, &text)
-            .map_err(|e| UmspError::config(format!("cannot write {}: {e}", tmp.display())))?;
         // Owner-only: the file holds client key hashes and prefixes.
-        crate::envfile::set_mode_600(&tmp)?;
-        std::fs::rename(&tmp, &self.path).map_err(|e| {
-            UmspError::config(format!("cannot replace {}: {e}", self.path.display()))
-        })?;
+        crate::util::atomic_write(&self.path, text.as_bytes(), 0o600)
+            .map_err(|e| UmspError::config(format!("cannot write {}: {e}", self.path.display())))?;
         Ok(())
     }
 }
