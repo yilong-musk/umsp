@@ -3,7 +3,8 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 
 use chrono::{DateTime, Local, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
@@ -375,6 +376,162 @@ impl LogStore {
     }
 }
 
+/// Bounded queue depth for [`LogWriter`]. Large enough to absorb bursts while
+/// bounding memory if the disk stalls.
+const LOG_WRITER_QUEUE: usize = 4096;
+
+enum WriterCmd {
+    Record(Box<RequestRecord>),
+    Flush(mpsc::SyncSender<()>),
+}
+
+/// Non-blocking JSONL ledger writer backed by one dedicated OS thread.
+///
+/// Keeps the current day's file handle open across requests instead of calling
+/// `create_dir_all` + `open` + `close` on an async worker thread per request.
+/// Rolls over automatically when the local date changes, and drains every
+/// queued row when the last clone is dropped.
+#[derive(Debug, Clone)]
+pub struct LogWriter {
+    inner: Arc<LogWriterInner>,
+}
+
+#[derive(Debug)]
+struct LogWriterInner {
+    store: LogStore,
+    tx: Option<mpsc::SyncSender<WriterCmd>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    dropped: AtomicU64,
+}
+
+impl LogWriter {
+    pub fn new(state_dir: &Path) -> Self {
+        let store = LogStore::new(state_dir);
+        let dir = store.dir().to_path_buf();
+        let (tx, rx) = mpsc::sync_channel(LOG_WRITER_QUEUE);
+        let spawned = std::thread::Builder::new()
+            .name("umsp-log-writer".into())
+            .spawn(move || writer_loop(dir, rx));
+        let (tx, handle) = match spawned {
+            Ok(handle) => (Some(tx), Some(handle)),
+            Err(_) => (None, None),
+        };
+        Self {
+            inner: Arc::new(LogWriterInner {
+                store,
+                tx,
+                handle,
+                dropped: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    pub fn store(&self) -> &LogStore {
+        &self.inner.store
+    }
+
+    /// Queue one ledger record without blocking. Returns `false` if the queue
+    /// was full and the record had to be dropped.
+    pub fn enqueue(&self, record: RequestRecord) -> bool {
+        let Some(tx) = &self.inner.tx else {
+            return self.inner.store.append(&record).is_ok();
+        };
+        match tx.try_send(WriterCmd::Record(Box::new(record))) {
+            Ok(()) => true,
+            Err(mpsc::TrySendError::Full(_)) | Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.inner.dropped.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        }
+    }
+
+    /// Block until every previously enqueued record has been written to disk.
+    pub fn flush(&self) {
+        let Some(tx) = &self.inner.tx else {
+            return;
+        };
+        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+        if tx.send(WriterCmd::Flush(ack_tx)).is_ok() {
+            let _ = ack_rx.recv();
+        }
+    }
+
+    /// Records dropped because the bounded writer queue was full.
+    pub fn dropped(&self) -> u64 {
+        self.inner.dropped.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for LogWriterInner {
+    fn drop(&mut self) {
+        // Close the channel first so the writer thread drains all pending
+        // records and exits cleanly, then join it.
+        self.tx.take();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn writer_loop(dir: PathBuf, rx: mpsc::Receiver<WriterCmd>) {
+    let mut open: Option<(String, std::fs::File)> = None;
+    let mut buf = Vec::with_capacity(512);
+    while let Ok(cmd) = rx.recv() {
+        match cmd {
+            WriterCmd::Record(record) => {
+                buf.clear();
+                if serde_json::to_writer(&mut buf, &*record).is_err() {
+                    continue;
+                }
+                buf.push(b'\n');
+                let stem = Local::now().format("%Y-%m-%d").to_string();
+                write_line(&dir, &mut open, &stem, &buf);
+            }
+            WriterCmd::Flush(ack) => {
+                if let Some((_, file)) = &mut open {
+                    let _ = file.flush();
+                }
+                let _ = ack.send(());
+            }
+        }
+    }
+    if let Some((_, file)) = &mut open {
+        let _ = file.flush();
+    }
+}
+
+fn write_line(dir: &Path, open: &mut Option<(String, std::fs::File)>, stem: &str, line: &[u8]) {
+    if open.as_ref().is_some_and(|(cur, _)| cur != stem) {
+        *open = None;
+    }
+    for attempt in 0..2 {
+        if open.is_none() {
+            if std::fs::create_dir_all(dir).is_err() {
+                return;
+            }
+            let path = dir.join(format!("{stem}.jsonl"));
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                Ok(file) => *open = Some((stem.to_string(), file)),
+                Err(_) => return,
+            }
+        }
+        if let Some((_, file)) = open.as_mut() {
+            if file.write_all(line).is_ok() {
+                return;
+            }
+            // Reopen once on write error (e.g. stale handle).
+            *open = None;
+            if attempt == 1 {
+                return;
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Aggregate {
     pub requests: u64,
@@ -684,6 +841,58 @@ mod tests {
             raw.lines().all(|line| !line.is_empty()),
             "empty line from a split newline"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn log_writer_handles_concurrent_enqueues_without_loss() {
+        let dir = std::env::temp_dir().join(format!(
+            "umsp-log-writer-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let writer = LogWriter::new(&dir);
+        let threads = 32;
+        let per_thread = 50;
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                let writer = writer.clone();
+                scope.spawn(move || {
+                    for _ in 0..per_thread {
+                        assert!(writer.enqueue(record(200, (1, 2))));
+                    }
+                });
+            }
+        });
+        writer.flush();
+        assert_eq!(writer.dropped(), 0);
+        let since = Utc::now() - TimeDelta::hours(1);
+        assert_eq!(writer.store().read_since(since).len(), threads * per_thread);
+        let files = writer.store().files();
+        assert_eq!(files.len(), 1);
+        let raw = std::fs::read_to_string(&files[0]).unwrap();
+        assert_eq!(raw.lines().count(), threads * per_thread);
+        assert!(raw.lines().all(|line| !line.is_empty()));
+        drop(writer);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn log_writer_drains_queued_records_on_drop() {
+        let dir = std::env::temp_dir().join(format!(
+            "umsp-log-writer-drop-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        {
+            let writer = LogWriter::new(&dir);
+            for _ in 0..25 {
+                assert!(writer.enqueue(record(200, (3, 4))));
+            }
+        }
+        let store = LogStore::new(&dir);
+        let since = Utc::now() - TimeDelta::hours(1);
+        assert_eq!(store.read_since(since).len(), 25);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
