@@ -14,7 +14,7 @@ use crate::registry;
 use crate::usage::RequestRecord;
 use crate::util;
 
-use super::error::{gateway_error, messages_error, protocol_gateway_error};
+use super::error::{GatewayError, Protocol, gateway_error, messages_error};
 use super::log::plog_binding;
 use super::state::AppState;
 
@@ -142,7 +142,6 @@ pub(super) struct Prepared {
     pub(super) started: Instant,
     pub(super) bytes_in: u64,
     pub(super) payload: Value,
-    pub(super) requested_model: String,
     pub(super) model: Model,
     pub(super) client_headers: HeaderMap,
     /// Raw client query string (`?beta=true` on Messages); relayed upstream.
@@ -151,29 +150,27 @@ pub(super) struct Prepared {
 
 /// Auth, body limit, JSON parse, model resolution, allowlist and protocol check.
 ///
-/// Shared by `/v1/chat/completions` and `/v1/responses` so the two entry points
-/// cannot drift apart. On failure the gateway error response is returned and a
-/// ledger row has already been written.
-// The error path is a fully built `Response` (headers + body); boxing it would
-// only add an allocation on the rare failure path.
-#[allow(clippy::result_large_err)]
+/// Shared by `/v1/chat/completions`, `/v1/responses`, and `/v1/messages` so the
+/// entry points cannot drift apart. On failure the error carries the rendered
+/// status/code/message and a ledger row has already been written.
 pub(super) async fn prepare_request(
     state: &AppState,
     req: Request,
-    protocol: &str,
-) -> std::result::Result<Prepared, Response> {
+    protocol: Protocol,
+) -> std::result::Result<Prepared, GatewayError> {
+    let protocol_name = protocol.as_str();
     let request_id = util::new_request_id();
     let started = Instant::now();
     let client = match req.extensions().get::<AuthedClient>() {
         Some(c) => c.0.clone(),
         None => {
-            return Err(protocol_gateway_error(
+            return Err(GatewayError {
                 protocol,
-                StatusCode::UNAUTHORIZED,
-                "unauthorized",
-                "missing or invalid API key",
-                &request_id,
-            ));
+                status: StatusCode::UNAUTHORIZED,
+                code: "unauthorized",
+                message: "missing or invalid API key".to_string(),
+                request_id,
+            });
         }
     };
     // Resolved by the auth layer; the fallback only fires for in-process
@@ -189,6 +186,35 @@ pub(super) async fn prepare_request(
     let query = parts.uri.query().map(|q| q.to_string());
     let max_body = cfg.server.max_body_bytes;
 
+    let reject = |status: StatusCode,
+                  code: &'static str,
+                  requested_model: &str,
+                  bytes_in: u64,
+                  message: String|
+     -> GatewayError {
+        log_gateway_error(
+            state,
+            &cfg,
+            &request_id,
+            &client.name,
+            protocol_name,
+            requested_model,
+            "",
+            status,
+            code,
+            bytes_in,
+            started.elapsed().as_millis() as u64,
+            false,
+        );
+        GatewayError {
+            protocol,
+            status,
+            code,
+            message,
+            request_id: request_id.clone(),
+        }
+    };
+
     if let Some(len) = parts
         .headers
         .get(axum::http::header::CONTENT_LENGTH)
@@ -196,26 +222,12 @@ pub(super) async fn prepare_request(
         .and_then(|v| v.parse::<usize>().ok())
     {
         if len > max_body {
-            log_gateway_error(
-                state,
-                &cfg,
-                &request_id,
-                &client.name,
-                protocol,
-                "",
-                "",
+            return Err(reject(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "request_too_large",
+                "",
                 len as u64,
-                started.elapsed().as_millis() as u64,
-                false,
-            );
-            return Err(protocol_gateway_error(
-                protocol,
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "request_too_large",
-                &format!("request body {len} bytes exceeds the {max_body} byte limit"),
-                &request_id,
+                format!("request body {len} bytes exceeds the {max_body} byte limit"),
             ));
         }
     }
@@ -237,27 +249,7 @@ pub(super) async fn prepare_request(
             } else {
                 "invalid_body"
             };
-            log_gateway_error(
-                state,
-                &cfg,
-                &request_id,
-                &client.name,
-                protocol,
-                "",
-                "",
-                status,
-                code,
-                0,
-                started.elapsed().as_millis() as u64,
-                false,
-            );
-            return Err(protocol_gateway_error(
-                protocol,
-                status,
-                code,
-                &err.to_string(),
-                &request_id,
-            ));
+            return Err(reject(status, code, "", 0, err.to_string()));
         }
     };
     let bytes_in = bytes.len() as u64;
@@ -265,26 +257,12 @@ pub(super) async fn prepare_request(
     let payload: Value = match serde_json::from_slice(&bytes) {
         Ok(value) => value,
         Err(err) => {
-            log_gateway_error(
-                state,
-                &cfg,
-                &request_id,
-                &client.name,
-                protocol,
-                "",
-                "",
+            return Err(reject(
                 StatusCode::BAD_REQUEST,
                 "invalid_json",
+                "",
                 bytes_in,
-                started.elapsed().as_millis() as u64,
-                false,
-            );
-            return Err(protocol_gateway_error(
-                protocol,
-                StatusCode::BAD_REQUEST,
-                "invalid_json",
-                &format!("request body is not valid JSON: {err}"),
-                &request_id,
+                format!("request body is not valid JSON: {err}"),
             ));
         }
     };
@@ -299,134 +277,65 @@ pub(super) async fn prepare_request(
     // through for an unknown model (spec 2.2): both upstreams are unreliable
     // for `previous_response_id` (OD 400s on a fake id, DS silently ignores it
     // and loses context), so the client must send the full input history.
-    if protocol == "responses"
+    if protocol == Protocol::Responses
         && payload
             .get("previous_response_id")
             .is_some_and(|value| !value.is_null())
     {
-        log_gateway_error(
-            state,
-            &cfg,
-            &request_id,
-            &client.name,
-            protocol,
+        return Err(reject(
+            StatusCode::BAD_REQUEST,
+            "unsupported_parameter",
             &requested_model,
-            "",
-            StatusCode::BAD_REQUEST,
-            "unsupported_parameter",
             bytes_in,
-            started.elapsed().as_millis() as u64,
-            false,
-        );
-        return Err(protocol_gateway_error(
-            protocol,
-            StatusCode::BAD_REQUEST,
-            "unsupported_parameter",
-            "previous_response_id is not supported by this gateway; send the full input history",
-            &request_id,
+            "previous_response_id is not supported by this gateway; send the full input history"
+                .to_string(),
         ));
     }
 
     if requested_model.is_empty() {
-        log_gateway_error(
-            state,
-            &cfg,
-            &request_id,
-            &client.name,
-            protocol,
-            "",
-            "",
+        return Err(reject(
             StatusCode::BAD_REQUEST,
             "missing_model",
+            "",
             bytes_in,
-            started.elapsed().as_millis() as u64,
-            false,
-        );
-        return Err(protocol_gateway_error(
-            protocol,
-            StatusCode::BAD_REQUEST,
-            "missing_model",
-            "request body must contain a 'model' field",
-            &request_id,
+            "request body must contain a 'model' field".to_string(),
         ));
     }
 
     let models = state.models();
     let Some(model) = registry::resolve_models(&models, &requested_model).cloned() else {
-        log_gateway_error(
-            state,
-            &cfg,
-            &request_id,
-            &client.name,
-            protocol,
+        return Err(reject(
+            StatusCode::NOT_FOUND,
+            "model_not_found",
             &requested_model,
-            "",
-            StatusCode::NOT_FOUND,
-            "model_not_found",
             bytes_in,
-            started.elapsed().as_millis() as u64,
-            false,
-        );
-        return Err(protocol_gateway_error(
-            protocol,
-            StatusCode::NOT_FOUND,
-            "model_not_found",
-            &format!("unknown model '{requested_model}'"),
-            &request_id,
+            format!("unknown model '{requested_model}'"),
         ));
     };
 
     if !util::any_glob_match(&client.allowed_models, &model.id) {
-        log_gateway_error(
-            state,
-            &cfg,
-            &request_id,
-            &client.name,
-            protocol,
+        return Err(reject(
+            StatusCode::FORBIDDEN,
+            "model_not_allowed",
             &requested_model,
-            "",
-            StatusCode::FORBIDDEN,
-            "model_not_allowed",
             bytes_in,
-            started.elapsed().as_millis() as u64,
-            false,
-        );
-        return Err(protocol_gateway_error(
-            protocol,
-            StatusCode::FORBIDDEN,
-            "model_not_allowed",
-            &format!(
+            format!(
                 "client '{}' is not allowed to use model '{}'",
                 client.name, model.id
             ),
-            &request_id,
         ));
     }
 
-    if !client.allowed_protocols.iter().any(|p| p == protocol) {
-        log_gateway_error(
-            state,
-            &cfg,
-            &request_id,
-            &client.name,
-            protocol,
+    if !client.allowed_protocols.iter().any(|p| p == protocol_name) {
+        return Err(reject(
+            StatusCode::FORBIDDEN,
+            "protocol_not_allowed",
             &requested_model,
-            "",
-            StatusCode::FORBIDDEN,
-            "protocol_not_allowed",
             bytes_in,
-            started.elapsed().as_millis() as u64,
-            false,
-        );
-        return Err(protocol_gateway_error(
-            protocol,
-            StatusCode::FORBIDDEN,
-            "protocol_not_allowed",
-            &format!(
-                "client '{}' is not allowed to use the {protocol} protocol",
+            format!(
+                "client '{}' is not allowed to use the {protocol_name} protocol",
                 client.name
             ),
-            &request_id,
         ));
     }
 
@@ -438,7 +347,6 @@ pub(super) async fn prepare_request(
         started,
         bytes_in,
         payload,
-        requested_model,
         model,
         client_headers: parts.headers,
         query,

@@ -1,27 +1,23 @@
-use std::collections::HashSet;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::Response;
-use serde_json::Value;
 
-use crate::circuit::Admission;
-use crate::config::{Client, Config, Model};
 use crate::stream;
 use crate::usage::{RequestRecord, Usage};
 
 use super::client::Upstream;
 use super::error::{
-    circuit_open_response, gateway_error, mapped_upstream_status, no_backend_response,
+    Protocol, circuit_open_response, gateway_error, mapped_upstream_status, no_backend_response,
     protocol_gateway_error, truncate_body, upstream_failure_response,
 };
 use super::failover::{
-    AttemptCursor, AttemptResult, AttemptTarget, advance_route, attempt_candidates,
-    headers_for_attempt, note_circuit_error, note_circuit_result, prepare_attempt, request_record,
+    AttemptLoop, AttemptResult, AttemptsOutcome, attempt_candidates, note_circuit_error,
+    note_circuit_result, request_record, run_attempts,
 };
-use super::log::{plog, plog_fallback, plog_health, plog_route};
+use super::log::{plog, plog_health, plog_route};
+use super::prepare::Prepared;
 use super::state::AppState;
 
 /// Ledger guard for the streaming path: if the handler future is cancelled
@@ -79,12 +75,16 @@ pub(super) enum StreamProtocol {
 }
 
 impl StreamProtocol {
-    pub(super) fn name(self) -> &'static str {
+    pub(super) fn protocol(self) -> Protocol {
         match self {
-            StreamProtocol::Chat => "chat",
-            StreamProtocol::Responses { .. } => "responses",
-            StreamProtocol::Messages => "messages",
+            StreamProtocol::Chat => Protocol::Chat,
+            StreamProtocol::Responses { .. } => Protocol::Responses,
+            StreamProtocol::Messages => Protocol::Messages,
         }
+    }
+
+    pub(super) fn name(self) -> &'static str {
+        self.protocol().as_str()
     }
 
     pub(super) fn observer(self) -> stream::Observer {
@@ -98,26 +98,28 @@ impl StreamProtocol {
     }
 }
 
-/// Streaming proxy for Chat Completions / Responses: open the upstream stream,
-/// then hand the live body to `pump_stream` and an unaggregated byte stream to
-/// the client.
-#[allow(clippy::too_many_arguments)]
+/// Streaming proxy for Chat Completions / Responses / Messages: open the
+/// upstream stream, then hand the live body to `pump_stream` and an
+/// unaggregated byte stream to the client.
 pub(super) async fn proxy_stream(
     state: AppState,
-    cfg: Arc<Config>,
-    client: Client,
-    client_ip: String,
-    request_id: String,
-    started: Instant,
-    bytes_in: u64,
-    _requested_model: String,
-    model: Model,
-    payload: Value,
-    client_headers: HeaderMap,
+    prepared: Prepared,
     request_quirks: Vec<String>,
-    query: Option<String>,
     protocol: StreamProtocol,
 ) -> Response {
+    let Prepared {
+        cfg,
+        client,
+        client_ip,
+        request_id,
+        started,
+        bytes_in,
+        model,
+        payload,
+        client_headers,
+        query,
+        ..
+    } = prepared;
     let up = Upstream::with_clients(
         cfg.clone(),
         state.env(),
@@ -126,6 +128,7 @@ pub(super) async fn proxy_stream(
         state.sessions(),
     );
     let header_timeout = Duration::from_secs(cfg.server.stream_header_timeout_s.max(1));
+    let protocol_kind = protocol.protocol();
     let protocol_name = protocol.name();
 
     let candidates = attempt_candidates(
@@ -160,166 +163,106 @@ pub(super) async fn proxy_stream(
 
     // A retry is only possible before any byte reaches the client, so
     // everything up to the `200` below is safe.
-
-    let mut cursor = AttemptCursor {
-        excluded_providers: HashSet::new(),
-        skipped: HashSet::new(),
-        planned: Vec::new(),
-        index: 0,
-        loaded: false,
-        exhausted: false,
-        use_pin: true,
-    };
-    let mut fallbacks_used = 0u32;
-    let mut previous_reason: Option<String> = None;
-    let mut previous: Option<AttemptTarget> = None;
-    let mut first_provider: Option<String> = None;
-    let mut last: Option<(
-        AttemptResult,
-        AttemptTarget,
-        Option<crate::metrics::Inflight>,
-        Vec<String>,
-    )> = None;
-
-    while let Some(target) = cursor.next(&state, &model.id, &candidates) {
-        if let Some(prev) = &previous {
-            fallbacks_used += 1;
-            plog_fallback(
-                &request_id,
-                &client.name,
-                &prev.provider.id,
-                &prev.upstream,
-                &target.provider.id,
-                &target.upstream,
-                previous_reason.as_deref().unwrap_or("retryable"),
-            );
-        }
-        first_provider.get_or_insert_with(|| target.provider.id.clone());
-        let (result, inflight, attempt_quirks) =
-            match prepare_attempt(&payload, &target, protocol_name, &client.name) {
-                Err(message) => (AttemptResult::Untranslatable { message }, None, Vec::new()),
-                Ok((attempt_body, mut attempt_quirks)) => {
-                    attempt_quirks.splice(0..0, request_quirks.iter().cloned());
-                    let attempt_headers = headers_for_attempt(
-                        &client_headers,
-                        protocol_name,
-                        &target.upstream_protocol,
-                    );
-                    let admission = state.circuits().admit(&target.provider.id);
-                    // A granted half-open probe owns the single probe slot until this
-                    // attempt records a result; a cancelled request releases it on drop.
-                    let _probe = match &admission {
-                        Admission::Probe(guard) => Some(guard),
-                        _ => None,
-                    };
-                    // In-flight gauge: the guard travels with a live stream into the pump,
-                    // and is dropped as soon as an attempt ends.
-                    let inflight = state.metrics().inflight(&target.provider.id);
-                    let result = match &admission {
-                        Admission::Reject => AttemptResult::CircuitOpen {
-                            reason: state.circuits().view(&target.provider.id).reason,
-                        },
-                        Admission::Allow | Admission::Probe(_) => {
-                            let upstream_query = if target.upstream_protocol == "messages" {
-                                query.as_deref()
-                            } else {
-                                None
-                            };
-                            let opened = match target.upstream_protocol.as_str() {
-                                "responses" => {
-                                    up.responses_stream(
-                                        &target.provider,
-                                        &attempt_body,
-                                        &attempt_headers,
-                                        header_timeout,
-                                    )
-                                    .await
-                                }
-                                "messages" => {
-                                    up.messages_stream(
-                                        &target.provider,
-                                        upstream_query,
-                                        &attempt_body,
-                                        &attempt_headers,
-                                        header_timeout,
-                                    )
-                                    .await
-                                }
-                                _ => {
-                                    up.chat_stream(
-                                        &target.provider,
-                                        &attempt_body,
-                                        &attempt_headers,
-                                        header_timeout,
-                                    )
-                                    .await
-                                }
-                            };
-                            match opened {
-                                Ok(stream) => {
-                                    state.note_health(
-                                        &target.provider.id,
-                                        stream.status,
-                                        started.elapsed().as_millis() as u64,
-                                        (stream.status >= 400)
-                                            .then(|| format!("http_{}", stream.status)),
-                                    );
-                                    // A 2xx stream is judged when it ends (in
-                                    // `pump_stream`): recording success at the
-                                    // headers would reset the failure window,
-                                    // so a provider that always dies mid-stream
-                                    // could never trip the circuit. A half-open
-                                    // probe still closes on the headers.
-                                    if stream.status >= 400 || _probe.is_some() {
-                                        note_circuit_result(
-                                            &state,
-                                            &target,
-                                            stream.status,
-                                            _probe.is_some(),
-                                        );
-                                    }
-                                    AttemptResult::Stream(stream)
-                                }
-                                Err(err) => {
-                                    state.note_health(
-                                        &target.provider.id,
-                                        0,
-                                        started.elapsed().as_millis() as u64,
-                                        Some(err.code().to_string()),
-                                    );
-                                    note_circuit_error(&state, &target, &err);
-                                    AttemptResult::Error(err)
-                                }
-                            }
+    let AttemptsOutcome {
+        last,
+        fallbacks_used,
+        first_provider,
+        exhausted,
+        ..
+    } = run_attempts(
+        AttemptLoop {
+            state: &state,
+            model_id: &model.id,
+            protocol: protocol_kind,
+            request_id: &request_id,
+            client_name: &client.name,
+            payload: &payload,
+            client_headers: &client_headers,
+            request_quirks: &request_quirks,
+            use_pin: true,
+            translate_buffered_response: false,
+        },
+        &candidates,
+        |_, _| {},
+        |target, attempt_body, attempt_headers, is_probe| {
+            let state = &state;
+            let up = &up;
+            let query = &query;
+            async move {
+                let attempt_started = Instant::now();
+                let upstream_query = if target.upstream_protocol == "messages" {
+                    query.as_deref()
+                } else {
+                    None
+                };
+                let opened = match target.upstream_protocol.as_str() {
+                    "responses" => {
+                        up.responses_stream(
+                            &target.provider,
+                            &attempt_body,
+                            &attempt_headers,
+                            header_timeout,
+                        )
+                        .await
+                    }
+                    "messages" => {
+                        up.messages_stream(
+                            &target.provider,
+                            upstream_query,
+                            &attempt_body,
+                            &attempt_headers,
+                            header_timeout,
+                        )
+                        .await
+                    }
+                    _ => {
+                        up.chat_stream(
+                            &target.provider,
+                            &attempt_body,
+                            &attempt_headers,
+                            header_timeout,
+                        )
+                        .await
+                    }
+                };
+                match opened {
+                    Ok(stream) => {
+                        state.note_health(
+                            &target.provider.id,
+                            stream.status,
+                            attempt_started.elapsed().as_millis() as u64,
+                            (stream.status >= 400).then(|| format!("http_{}", stream.status)),
+                        );
+                        // A 2xx stream is judged when it ends (in
+                        // `pump_stream`): recording success at the headers
+                        // would reset the failure window, so a provider that
+                        // always dies mid-stream could never trip the circuit.
+                        // A half-open probe still closes on the headers.
+                        if stream.status >= 400 || is_probe {
+                            note_circuit_result(state, &target, stream.status, is_probe);
                         }
-                    };
-                    (result, Some(inflight), attempt_quirks)
+                        AttemptResult::Stream(stream)
+                    }
+                    Err(err) => {
+                        state.note_health(
+                            &target.provider.id,
+                            0,
+                            attempt_started.elapsed().as_millis() as u64,
+                            Some(err.code().to_string()),
+                        );
+                        note_circuit_error(state, &target, &err);
+                        AttemptResult::Error(err)
+                    }
                 }
-            };
-        if let Some(code) = result.upstream_fault() {
-            state
-                .metrics()
-                .note_upstream_error(&target.provider.id, &code);
-        }
-        previous_reason = Some(result.reason());
-        let proceed = advance_route(
-            &state,
-            &model.id,
-            &candidates,
-            &mut cursor,
-            &target,
-            &result,
-        );
-        last = Some((result, target.clone(), inflight, attempt_quirks));
-        if proceed {
-            previous = Some(target);
-            continue;
-        }
-        break;
-    }
+            }
+        },
+    )
+    .await;
 
     let Some((result, target, inflight, attempt_quirks)) = last else {
-        if cursor.exhausted {
+        // Not a client disconnect: disarm before returning a gateway error.
+        let _ = guard.take();
+        if exhausted {
             return circuit_open_response(protocol_name, &request_id);
         }
         return no_backend_response(protocol_name, &model.id, &request_id);

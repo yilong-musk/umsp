@@ -6,7 +6,7 @@ use axum::body::Body;
 use axum::extract::{ConnectInfo, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
 use crate::circuit::CircuitState;
@@ -17,9 +17,9 @@ use crate::util;
 use super::VERSION;
 use super::background::{probe_provider, refresh_catalog};
 use super::buffered::{NonStreamCall, proxy_non_stream};
-use super::error::{gateway_error, messages_error};
+use super::error::{Protocol, gateway_error, messages_error};
 use super::failover::attempt_candidates;
-use super::prepare::{AuthedClient, Prepared, prepare_request};
+use super::prepare::{AuthedClient, prepare_request};
 use super::state::AppState;
 use super::stream_proxy::{StreamProtocol, proxy_stream};
 
@@ -210,27 +210,15 @@ pub(super) async fn metrics_handler(State(state): State<AppState>) -> Response {
 }
 
 pub(super) async fn chat_handler(State(state): State<AppState>, req: Request) -> Response {
-    let Prepared {
-        cfg,
-        client,
-        client_ip,
-        request_id,
-        started,
-        bytes_in,
-        mut payload,
-        requested_model,
-        model,
-        client_headers,
-        ..
-    } = match prepare_request(&state, req, "chat").await {
+    let mut prepared = match prepare_request(&state, req, Protocol::Chat).await {
         Ok(prepared) => prepared,
-        Err(response) => return response,
+        Err(err) => return err.into_response(),
     };
 
     // `stream` is only a stream when the client sent a real boolean; anything
     // else (`"yes"`, 1, null) is handled as `false` — including on the wire,
     // because strict upstreams (OD) reject a non-boolean `stream` with 400.
-    let stream_field = payload.get("stream").cloned();
+    let stream_field = prepared.payload.get("stream").cloned();
     let stream_requested = stream_field
         .as_ref()
         .and_then(Value::as_bool)
@@ -244,79 +232,37 @@ pub(super) async fn chat_handler(State(state): State<AppState>, req: Request) ->
     if non_boolean_stream {
         request_quirks.push("stream_non_boolean".to_string());
     }
-    if let Some(obj) = payload.as_object_mut() {
+    if let Some(obj) = prepared.payload.as_object_mut() {
         if non_boolean_stream {
             obj.insert("stream".to_string(), Value::Bool(false));
         }
     }
-    if stream_requested && inject_stream_include_usage(&mut payload) {
+    if stream_requested && inject_stream_include_usage(&mut prepared.payload) {
         request_quirks.push("injected_include_usage".to_string());
     }
 
     if stream_requested {
-        return proxy_stream(
-            state,
-            cfg,
-            client,
-            client_ip,
-            request_id,
-            started,
-            bytes_in,
-            requested_model,
-            model,
-            payload,
-            client_headers,
-            request_quirks,
-            None,
-            StreamProtocol::Chat,
-        )
-        .await;
+        return proxy_stream(state, prepared, request_quirks, StreamProtocol::Chat).await;
     }
 
-    proxy_non_stream(
-        state,
-        cfg,
-        client,
-        client_ip,
-        request_id,
-        started,
-        bytes_in,
-        requested_model,
-        model,
-        payload,
-        client_headers,
-        request_quirks,
-        NonStreamCall::Chat,
-    )
-    .await
+    proxy_non_stream(state, prepared, request_quirks, NonStreamCall::Chat).await
 }
 
 /// `POST /v1/responses` — OpenAI Responses (OD provider, non-streaming and
 /// streaming). Only `model` is rewritten; every other field is relayed as-is
 /// (spec 2.2).
 pub(super) async fn responses_handler(State(state): State<AppState>, req: Request) -> Response {
-    let Prepared {
-        cfg,
-        client,
-        client_ip,
-        request_id,
-        started,
-        bytes_in,
-        payload,
-        requested_model,
-        model,
-        client_headers,
-        ..
-    } = match prepare_request(&state, req, "responses").await {
+    let prepared = match prepare_request(&state, req, Protocol::Responses).await {
         Ok(prepared) => prepared,
-        Err(response) => return response,
+        Err(err) => return err.into_response(),
     };
 
     // `previous_response_id` was already rejected in `prepare_request` (before
     // routing, so it is 400 even for an unknown model). `model` is rewritten
     // per attempt.
-    let emit_event_lines = cfg.server.responses_emit_event_lines;
-    let stream_requested = payload
+    let emit_event_lines = prepared.cfg.server.responses_emit_event_lines;
+    let stream_requested = prepared
+        .payload
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
@@ -324,39 +270,14 @@ pub(super) async fn responses_handler(State(state): State<AppState>, req: Reques
     if stream_requested {
         return proxy_stream(
             state,
-            cfg,
-            client,
-            client_ip,
-            request_id,
-            started,
-            bytes_in,
-            requested_model,
-            model,
-            payload,
-            client_headers,
+            prepared,
             Vec::new(),
-            None,
             StreamProtocol::Responses { emit_event_lines },
         )
         .await;
     }
 
-    proxy_non_stream(
-        state,
-        cfg,
-        client,
-        client_ip,
-        request_id,
-        started,
-        bytes_in,
-        requested_model,
-        model,
-        payload,
-        client_headers,
-        Vec::new(),
-        NonStreamCall::Responses,
-    )
-    .await
+    proxy_non_stream(state, prepared, Vec::new(), NonStreamCall::Responses).await
 }
 
 /// Default Anthropic API version injected when the client omits it; OD's
@@ -377,61 +298,26 @@ pub(super) fn with_default_anthropic_version(mut headers: HeaderMap) -> HeaderMa
 /// streaming). Only `model` is rewritten; the query string, every header
 /// outside the deny list and every body field are relayed as-is (spec 2.3).
 pub(super) async fn messages_handler(State(state): State<AppState>, req: Request) -> Response {
-    let Prepared {
-        cfg,
-        client,
-        client_ip,
-        request_id,
-        started,
-        bytes_in,
-        payload,
-        requested_model,
-        model,
-        client_headers,
-        query,
-    } = match prepare_request(&state, req, "messages").await {
+    let mut prepared = match prepare_request(&state, req, Protocol::Messages).await {
         Ok(prepared) => prepared,
-        Err(response) => return response,
+        Err(err) => return err.into_response(),
     };
 
-    let client_headers = with_default_anthropic_version(client_headers);
-    let stream_requested = payload
+    prepared.client_headers = with_default_anthropic_version(prepared.client_headers);
+    let stream_requested = prepared
+        .payload
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
     if stream_requested {
-        return proxy_stream(
-            state,
-            cfg,
-            client,
-            client_ip,
-            request_id,
-            started,
-            bytes_in,
-            requested_model,
-            model,
-            payload,
-            client_headers,
-            Vec::new(),
-            query,
-            StreamProtocol::Messages,
-        )
-        .await;
+        return proxy_stream(state, prepared, Vec::new(), StreamProtocol::Messages).await;
     }
 
+    let query = prepared.query.take();
     proxy_non_stream(
         state,
-        cfg,
-        client,
-        client_ip,
-        request_id,
-        started,
-        bytes_in,
-        requested_model,
-        model,
-        payload,
-        client_headers,
+        prepared,
         Vec::new(),
         NonStreamCall::Messages { query },
     )
@@ -449,50 +335,37 @@ pub(super) async fn messages_count_tokens_handler(
     State(state): State<AppState>,
     req: Request,
 ) -> Response {
-    let Prepared {
-        cfg,
-        client,
-        client_ip,
-        request_id,
-        started,
-        bytes_in,
-        payload,
-        requested_model,
-        model,
-        client_headers,
-        ..
-    } = match prepare_request(&state, req, "messages").await {
+    let mut prepared = match prepare_request(&state, req, Protocol::Messages).await {
         Ok(prepared) => prepared,
-        Err(response) => return response,
+        Err(err) => return err.into_response(),
     };
 
-    if attempt_candidates(&cfg, &model, "messages", true, &state.catalog_snapshot()).is_empty() {
+    if attempt_candidates(
+        &prepared.cfg,
+        &prepared.model,
+        Protocol::Messages.as_str(),
+        true,
+        &state.catalog_snapshot(),
+    )
+    .is_empty()
+    {
         let message = format!(
             "count_tokens is not supported by any backend of model '{}'",
-            model.id
+            prepared.model.id
         );
         return messages_error(
             StatusCode::NOT_IMPLEMENTED,
             "not_supported_error",
             "not_supported_error",
             &message,
-            &request_id,
+            &prepared.request_id,
         );
     }
 
-    let client_headers = with_default_anthropic_version(client_headers);
+    prepared.client_headers = with_default_anthropic_version(prepared.client_headers);
     proxy_non_stream(
         state,
-        cfg,
-        client,
-        client_ip,
-        request_id,
-        started,
-        bytes_in,
-        requested_model,
-        model,
-        payload,
-        client_headers,
+        prepared,
         Vec::new(),
         NonStreamCall::MessagesCountTokens,
     )

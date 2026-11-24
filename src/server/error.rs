@@ -6,6 +6,47 @@ use serde_json::json;
 use super::client::ProxyError;
 use super::failover::AttemptTarget;
 
+/// Client-facing API protocol served by the gateway.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Protocol {
+    Chat,
+    Responses,
+    Messages,
+}
+
+impl Protocol {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Responses => "responses",
+            Self::Messages => "messages",
+        }
+    }
+}
+
+/// Compact error value returned from request preparation and rendered into the
+/// caller's protocol error shape via `IntoResponse`.
+#[derive(Debug)]
+pub(super) struct GatewayError {
+    pub(super) protocol: Protocol,
+    pub(super) status: StatusCode,
+    pub(super) code: &'static str,
+    pub(super) message: String,
+    pub(super) request_id: String,
+}
+
+impl IntoResponse for GatewayError {
+    fn into_response(self) -> Response {
+        protocol_gateway_error(
+            self.protocol.as_str(),
+            self.status,
+            self.code,
+            &self.message,
+            &self.request_id,
+        )
+    }
+}
+
 pub(super) fn error_type_for(status: StatusCode) -> &'static str {
     match status.as_u16() {
         401 => "authentication_error",

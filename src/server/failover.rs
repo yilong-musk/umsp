@@ -1,8 +1,10 @@
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
 
+use crate::circuit::Admission;
 use crate::config::{Config, Model, Provider};
 use crate::quirks;
 use crate::route::PinDrop;
@@ -11,8 +13,9 @@ use crate::usage::RequestRecord;
 use crate::util;
 
 use super::client::{ChatOutcome, ChatStream, ProxyError};
+use super::error::Protocol;
 use super::handlers::DEFAULT_ANTHROPIC_VERSION;
-use super::log::{plog_health, plog_route};
+use super::log::{plog_fallback, plog_health, plog_route};
 use super::state::AppState;
 
 // ---------------------------------------------------------------------------
@@ -521,6 +524,184 @@ pub(super) fn note_route_failure(state: &AppState, model: &str, provider: &str) 
             provider,
             PinDrop::Unreachable.as_str(),
         );
+    }
+}
+
+/// Inputs to the shared backend attempt loop.
+pub(super) struct AttemptLoop<'a> {
+    pub(super) state: &'a AppState,
+    pub(super) model_id: &'a str,
+    pub(super) protocol: Protocol,
+    pub(super) request_id: &'a str,
+    pub(super) client_name: &'a str,
+    pub(super) payload: &'a Value,
+    pub(super) client_headers: &'a HeaderMap,
+    pub(super) request_quirks: &'a [String],
+    pub(super) use_pin: bool,
+    pub(super) translate_buffered_response: bool,
+}
+
+/// Final state produced by [`run_attempts`].
+pub(super) struct AttemptsOutcome {
+    pub(super) last: Option<(
+        AttemptResult,
+        AttemptTarget,
+        Option<crate::metrics::Inflight>,
+        Vec<String>,
+    )>,
+    pub(super) fallbacks_used: u32,
+    pub(super) first_provider: Option<String>,
+    pub(super) translation_error: Option<String>,
+    pub(super) exhausted: bool,
+}
+
+/// Shared candidate attempt driver for both buffered and streaming proxy paths.
+///
+/// Walks `candidates` via `AttemptCursor`, applies request translation/quirks,
+/// enforces circuit admission and probe/in-flight guards, records upstream
+/// fault metrics, optionally translates buffered responses, and advances the
+/// route on retryable outcomes.
+pub(super) async fn run_attempts<F, Fut>(
+    ctx: AttemptLoop<'_>,
+    candidates: &[AttemptTarget],
+    mut on_attempt: impl FnMut(&AttemptTarget, u32),
+    mut send: F,
+) -> AttemptsOutcome
+where
+    F: FnMut(AttemptTarget, Value, HeaderMap, bool) -> Fut,
+    Fut: Future<Output = AttemptResult>,
+{
+    let protocol_name = ctx.protocol.as_str();
+    let mut cursor = AttemptCursor {
+        excluded_providers: HashSet::new(),
+        skipped: HashSet::new(),
+        planned: Vec::new(),
+        index: 0,
+        loaded: false,
+        exhausted: false,
+        use_pin: ctx.use_pin,
+    };
+    let mut fallbacks_used = 0u32;
+    let mut previous_reason: Option<String> = None;
+    let mut previous: Option<AttemptTarget> = None;
+    let mut first_provider: Option<String> = None;
+    let mut translation_error: Option<String> = None;
+    let mut last: Option<(
+        AttemptResult,
+        AttemptTarget,
+        Option<crate::metrics::Inflight>,
+        Vec<String>,
+    )> = None;
+
+    while let Some(target) = cursor.next(ctx.state, ctx.model_id, candidates) {
+        if let Some(prev) = &previous {
+            fallbacks_used += 1;
+            plog_fallback(
+                ctx.request_id,
+                ctx.client_name,
+                &prev.provider.id,
+                &prev.upstream,
+                &target.provider.id,
+                &target.upstream,
+                previous_reason.as_deref().unwrap_or("retryable"),
+            );
+        }
+        on_attempt(&target, fallbacks_used);
+        first_provider.get_or_insert_with(|| target.provider.id.clone());
+
+        let (mut result, inflight, attempt_quirks) =
+            match prepare_attempt(ctx.payload, &target, protocol_name, ctx.client_name) {
+                Err(message) => (AttemptResult::Untranslatable { message }, None, Vec::new()),
+                Ok((attempt_body, mut attempt_quirks)) => {
+                    attempt_quirks.splice(0..0, ctx.request_quirks.iter().cloned());
+                    let attempt_headers = headers_for_attempt(
+                        ctx.client_headers,
+                        protocol_name,
+                        &target.upstream_protocol,
+                    );
+                    let admission = ctx.state.circuits().admit(&target.provider.id);
+                    // A granted half-open probe owns the single probe slot until
+                    // this attempt records a result; a cancelled request
+                    // releases it on drop so the circuit stays half_open.
+                    let _probe = match &admission {
+                        Admission::Probe(guard) => Some(guard),
+                        _ => None,
+                    };
+                    // In-flight gauge: travels with a live stream into the pump,
+                    // or drops when replaced / when the buffered call returns.
+                    let inflight = ctx.state.metrics().inflight(&target.provider.id);
+                    let result = match &admission {
+                        Admission::Reject => AttemptResult::CircuitOpen {
+                            reason: ctx.state.circuits().view(&target.provider.id).reason,
+                        },
+                        Admission::Allow | Admission::Probe(_) => {
+                            send(
+                                target.clone(),
+                                attempt_body,
+                                attempt_headers,
+                                _probe.is_some(),
+                            )
+                            .await
+                        }
+                    };
+                    (result, Some(inflight), attempt_quirks)
+                }
+            };
+
+        if let Some(code) = result.upstream_fault() {
+            ctx.state
+                .metrics()
+                .note_upstream_error(&target.provider.id, &code);
+        }
+        if ctx.translate_buffered_response {
+            if let AttemptResult::Response(outcome) = &mut result {
+                if (200..300).contains(&outcome.status) && target.upstream_protocol != protocol_name
+                {
+                    match crate::translate::translate_response(
+                        &outcome.body,
+                        &target.upstream_protocol,
+                        protocol_name,
+                        &target.model.id,
+                    ) {
+                        Ok(body) => outcome.body = body,
+                        Err(message) => {
+                            cursor.skip_backend(&target.provider.id, &target.upstream);
+                            previous_reason = Some("translation_failed".to_string());
+                            if cursor.has_more() {
+                                previous = Some(target);
+                                continue;
+                            }
+                            translation_error = Some(message);
+                            last = Some((result, target, inflight, attempt_quirks));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        previous_reason = Some(result.reason());
+        let proceed = advance_route(
+            ctx.state,
+            ctx.model_id,
+            candidates,
+            &mut cursor,
+            &target,
+            &result,
+        );
+        last = Some((result, target.clone(), inflight, attempt_quirks));
+        if proceed {
+            previous = Some(target);
+            continue;
+        }
+        break;
+    }
+
+    AttemptsOutcome {
+        last,
+        fallbacks_used,
+        first_provider,
+        translation_error,
+        exhausted: cursor.exhausted,
     }
 }
 

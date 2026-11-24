@@ -1,25 +1,21 @@
-use std::collections::HashSet;
-use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::Body;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::Response;
-use serde_json::Value;
-
-use crate::circuit::Admission;
-use crate::config::{Client, Config, Model};
 
 use super::client::Upstream;
 use super::error::{
-    circuit_open_response, client_response_headers, gateway_error, mapped_upstream_status,
-    no_backend_response, protocol_gateway_error, truncate_body, upstream_failure_response,
+    Protocol, circuit_open_response, client_response_headers, gateway_error,
+    mapped_upstream_status, no_backend_response, protocol_gateway_error, truncate_body,
+    upstream_failure_response,
 };
 use super::failover::{
-    AttemptCursor, AttemptResult, AttemptTarget, advance_route, attempt_candidates,
-    headers_for_attempt, note_circuit_error, note_circuit_result, prepare_attempt, request_record,
+    AttemptLoop, AttemptResult, AttemptTarget, AttemptsOutcome, attempt_candidates,
+    note_circuit_error, note_circuit_result, request_record, run_attempts,
 };
-use super::log::{plog, plog_fallback};
+use super::log::plog;
+use super::prepare::Prepared;
 use super::state::AppState;
 
 /// Which non-streaming upstream call a handler is making.
@@ -36,11 +32,13 @@ pub(super) enum NonStreamCall {
 
 impl NonStreamCall {
     /// Ledger `protocol` value: count_tokens is a Messages-protocol call.
-    pub(super) fn protocol(&self) -> &'static str {
+    pub(super) fn protocol(&self) -> Protocol {
         match self {
-            NonStreamCall::Chat => "chat",
-            NonStreamCall::Responses => "responses",
-            NonStreamCall::Messages { .. } | NonStreamCall::MessagesCountTokens => "messages",
+            NonStreamCall::Chat => Protocol::Chat,
+            NonStreamCall::Responses => Protocol::Responses,
+            NonStreamCall::Messages { .. } | NonStreamCall::MessagesCountTokens => {
+                Protocol::Messages
+            }
         }
     }
 
@@ -122,22 +120,24 @@ impl Drop for BufferedCancelGuard<'_> {
 ///
 /// A provider that speaks the client protocol relays the body. A mismatch
 /// translates the successful body back into the client's protocol.
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn proxy_non_stream(
     state: AppState,
-    cfg: Arc<Config>,
-    client: Client,
-    client_ip: String,
-    request_id: String,
-    started: Instant,
-    bytes_in: u64,
-    _requested_model: String,
-    model: Model,
-    payload: Value,
-    client_headers: HeaderMap,
+    prepared: Prepared,
     request_quirks: Vec<String>,
     call: NonStreamCall,
 ) -> Response {
+    let Prepared {
+        cfg,
+        client,
+        client_ip,
+        request_id,
+        started,
+        bytes_in,
+        model,
+        payload,
+        client_headers,
+        ..
+    } = prepared;
     let up = Upstream::with_clients(
         cfg.clone(),
         state.env(),
@@ -145,7 +145,8 @@ pub(super) async fn proxy_non_stream(
         state.stream_http().clone(),
         state.sessions(),
     );
-    let protocol = call.protocol();
+    let protocol_kind = call.protocol();
+    let protocol = protocol_kind.as_str();
     let count_tokens = matches!(call, NonStreamCall::MessagesCountTokens);
 
     let candidates = attempt_candidates(
@@ -159,21 +160,6 @@ pub(super) async fn proxy_non_stream(
         return no_backend_response(protocol, &model.id, &request_id);
     }
 
-    let mut cursor = AttemptCursor {
-        excluded_providers: HashSet::new(),
-        skipped: HashSet::new(),
-        planned: Vec::new(),
-        index: 0,
-        loaded: false,
-        exhausted: false,
-        use_pin: !count_tokens,
-    };
-    let mut fallbacks_used = 0u32;
-    let mut previous_reason: Option<String> = None;
-    let mut previous: Option<AttemptTarget> = None;
-    let mut first_provider: Option<String> = None;
-    let mut translation_error: Option<String> = None;
-    let mut last: Option<(AttemptResult, AttemptTarget, Vec<String>)> = None;
     let mut cancel_guard = BufferedCancelGuard {
         state: &state,
         request_id: &request_id,
@@ -187,167 +173,98 @@ pub(super) async fn proxy_non_stream(
         fallbacks: 0,
     };
 
-    while let Some(target) = cursor.next(&state, &model.id, &candidates) {
-        if let Some(prev) = &previous {
-            fallbacks_used += 1;
-            plog_fallback(
-                &request_id,
-                &client.name,
-                &prev.provider.id,
-                &prev.upstream,
-                &target.provider.id,
-                &target.upstream,
-                previous_reason.as_deref().unwrap_or("retryable"),
-            );
-        }
-        cancel_guard.attempting(&target, fallbacks_used);
-        first_provider.get_or_insert_with(|| target.provider.id.clone());
-        let (mut result, attempt_quirks) =
-            match prepare_attempt(&payload, &target, protocol, &client.name) {
-                Err(message) => (AttemptResult::Untranslatable { message }, Vec::new()),
-                Ok((attempt_body, mut attempt_quirks)) => {
-                    attempt_quirks.splice(0..0, request_quirks.iter().cloned());
-                    let attempt_headers =
-                        headers_for_attempt(&client_headers, protocol, &target.upstream_protocol);
-                    let admission = state.circuits().admit(&target.provider.id);
-                    // A granted half-open probe owns the single probe slot for the attempt.
-                    // Dropping the guard before a result is recorded (client cancel, aborted
-                    // task) only releases the slot; the circuit stays half_open.
-                    let _probe = match &admission {
-                        Admission::Probe(guard) => Some(guard),
-                        _ => None,
-                    };
-                    let _inflight = state.metrics().inflight(&target.provider.id);
-                    let result = match &admission {
-                        Admission::Reject => AttemptResult::CircuitOpen {
-                            reason: state.circuits().view(&target.provider.id).reason,
-                        },
-                        Admission::Allow | Admission::Probe(_) => {
-                            let attempt_started = Instant::now();
-                            let outcome = if count_tokens {
-                                up.count_tokens(&target.provider, &attempt_body, &attempt_headers)
-                                    .await
-                            } else {
-                                match target.upstream_protocol.as_str() {
-                                    "responses" => {
-                                        up.responses(
-                                            &target.provider,
-                                            &attempt_body,
-                                            &attempt_headers,
-                                        )
-                                        .await
-                                    }
-                                    "messages" => {
-                                        let query = (protocol == "messages")
-                                            .then(|| call.query())
-                                            .flatten();
-                                        up.messages(
-                                            &target.provider,
-                                            query,
-                                            &attempt_body,
-                                            &attempt_headers,
-                                        )
-                                        .await
-                                    }
-                                    _ => {
-                                        up.chat(
-                                            &target.provider,
-                                            &target.upstream,
-                                            &attempt_body,
-                                            &attempt_headers,
-                                        )
-                                        .await
-                                    }
-                                }
-                            };
-                            match outcome {
-                                Ok(outcome) => {
-                                    state.note_health(
-                                        &target.provider.id,
-                                        outcome.status,
-                                        outcome.duration_ms,
-                                        (outcome.status >= 400)
-                                            .then(|| format!("http_{}", outcome.status)),
-                                    );
-                                    note_circuit_result(
-                                        &state,
-                                        &target,
-                                        outcome.status,
-                                        _probe.is_some(),
-                                    );
-                                    AttemptResult::Response(outcome)
-                                }
-                                Err(err) => {
-                                    state.note_health(
-                                        &target.provider.id,
-                                        0,
-                                        attempt_started.elapsed().as_millis() as u64,
-                                        Some(err.code().to_string()),
-                                    );
-                                    note_circuit_error(&state, &target, &err);
-                                    AttemptResult::Error(err)
-                                }
-                            }
+    let AttemptsOutcome {
+        last,
+        fallbacks_used,
+        first_provider,
+        translation_error,
+        exhausted,
+    } = run_attempts(
+        AttemptLoop {
+            state: &state,
+            model_id: &model.id,
+            protocol: protocol_kind,
+            request_id: &request_id,
+            client_name: &client.name,
+            payload: &payload,
+            client_headers: &client_headers,
+            request_quirks: &request_quirks,
+            use_pin: !count_tokens,
+            translate_buffered_response: true,
+        },
+        &candidates,
+        |target, fallbacks| cancel_guard.attempting(target, fallbacks),
+        |target, attempt_body, attempt_headers, is_probe| {
+            let state = &state;
+            let up = &up;
+            let call = &call;
+            async move {
+                let attempt_started = Instant::now();
+                let outcome = if count_tokens {
+                    up.count_tokens(&target.provider, &attempt_body, &attempt_headers)
+                        .await
+                } else {
+                    match target.upstream_protocol.as_str() {
+                        "responses" => {
+                            up.responses(&target.provider, &attempt_body, &attempt_headers)
+                                .await
                         }
-                    };
-                    (result, attempt_quirks)
-                }
-            };
-        if let Some(code) = result.upstream_fault() {
-            state
-                .metrics()
-                .note_upstream_error(&target.provider.id, &code);
-        }
-        if let AttemptResult::Response(outcome) = &mut result {
-            if (200..300).contains(&outcome.status) && target.upstream_protocol != protocol {
-                match crate::translate::translate_response(
-                    &outcome.body,
-                    &target.upstream_protocol,
-                    protocol,
-                    &target.model.id,
-                ) {
-                    Ok(body) => outcome.body = body,
-                    Err(message) => {
-                        cursor.skip_backend(&target.provider.id, &target.upstream);
-                        previous_reason = Some("translation_failed".to_string());
-                        if cursor.has_more() {
-                            previous = Some(target);
-                            continue;
+                        "messages" => {
+                            let query = (protocol_kind == Protocol::Messages)
+                                .then(|| call.query())
+                                .flatten();
+                            up.messages(&target.provider, query, &attempt_body, &attempt_headers)
+                                .await
                         }
-                        translation_error = Some(message);
-                        last = Some((result, target, attempt_quirks));
-                        break;
+                        _ => {
+                            up.chat(
+                                &target.provider,
+                                &target.upstream,
+                                &attempt_body,
+                                &attempt_headers,
+                            )
+                            .await
+                        }
+                    }
+                };
+                match outcome {
+                    Ok(outcome) => {
+                        state.note_health(
+                            &target.provider.id,
+                            outcome.status,
+                            outcome.duration_ms,
+                            (outcome.status >= 400).then(|| format!("http_{}", outcome.status)),
+                        );
+                        note_circuit_result(state, &target, outcome.status, is_probe);
+                        AttemptResult::Response(outcome)
+                    }
+                    Err(err) => {
+                        state.note_health(
+                            &target.provider.id,
+                            0,
+                            attempt_started.elapsed().as_millis() as u64,
+                            Some(err.code().to_string()),
+                        );
+                        note_circuit_error(state, &target, &err);
+                        AttemptResult::Error(err)
                     }
                 }
             }
-        }
-        previous_reason = Some(result.reason());
-        let proceed = advance_route(
-            &state,
-            &model.id,
-            &candidates,
-            &mut cursor,
-            &target,
-            &result,
-        );
-        last = Some((result, target.clone(), attempt_quirks));
-        if proceed {
-            previous = Some(target);
-            continue;
-        }
-        break;
-    }
+        },
+    )
+    .await;
     // From here on the request runs to completion synchronously and writes its
     // own row.
     cancel_guard.disarm();
     drop(cancel_guard);
 
-    let Some((result, target, attempt_quirks)) = last else {
-        if cursor.exhausted {
+    let Some((result, target, _inflight, attempt_quirks)) = last else {
+        if exhausted {
             return circuit_open_response(protocol, &request_id);
         }
         return no_backend_response(protocol, &model.id, &request_id);
     };
+    drop(_inflight);
     let duration_ms = started.elapsed().as_millis() as u64;
     let mut record = request_record(
         &request_id,
