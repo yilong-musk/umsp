@@ -2052,6 +2052,42 @@ fn messages_post(body: Value, mode: &str) -> Request<Body> {
 }
 
 #[tokio::test]
+async fn messages_upstream_failures_use_the_anthropic_error_shape() {
+    let dir = temp_dir("msg-err-shape");
+    let (upstream, _) = start_upstream().await;
+    let mut cfg = config(&dir, upstream, 50 * 1024 * 1024);
+    // The env file never defines this variable: every attempt fails with
+    // `upstream_key_missing` before reaching the upstream.
+    cfg.providers[0].api_key_env = "TEST_UNSET_KEY".into();
+    let app = build_router(AppState::new(cfg, env_file(&dir)).unwrap());
+
+    for stream in [false, true] {
+        let response = app
+            .clone()
+            .oneshot(messages_post(messages_body(stream), "normal"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.headers().get("x-umsp-code").unwrap(),
+            "upstream_key_missing"
+        );
+        let value = body_json(response).await;
+        assert_eq!(value["type"], "error", "stream={stream}: {value}");
+        assert_eq!(value["error"]["type"], "api_error", "stream={stream}");
+        assert!(value["error"].get("param").is_none(), "stream={stream}");
+        assert!(value["error"].get("code").is_none(), "stream={stream}");
+    }
+
+    // Chat clients keep the OpenAI shape for the same failure.
+    let response = app.oneshot(stream_request("sse")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let value = body_json(response).await;
+    assert_eq!(value["error"]["code"], "upstream_key_missing");
+    assert_eq!(value["error"]["type"], "server_error");
+}
+
+#[tokio::test]
 async fn messages_non_stream_relays_body_verbatim_and_records_usage() {
     let dir = temp_dir("msg-nonstream");
     let (app, _, rec) = gateway(&dir, 50 * 1024 * 1024).await;
