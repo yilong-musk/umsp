@@ -4662,3 +4662,72 @@ async fn models_get_binds_and_enforces() {
     let response = app.oneshot(get(Some("9.9.9.9"))).await.unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn reload_swaps_env_keys_logs_timeout_and_models_atomically() {
+    let dir1 = temp_dir("reload-dir1");
+    let dir2 = temp_dir("reload-dir2");
+    let (upstream, rec) = start_upstream().await;
+
+    let mut cfg1 = config(&dir1, upstream.clone(), 50 * 1024 * 1024);
+    cfg1.providers[0].api_key_env = "TEST_ROTATED_KEY".into();
+    // Env file starts without TEST_ROTATED_KEY so the first call fails.
+    let state = AppState::new(cfg1.clone(), env_file(&dir1)).unwrap();
+    let app = build_router(state.clone());
+
+    let response = app.clone().oneshot(chat_request("normal")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        response.headers().get("x-umsp-code").unwrap(),
+        "upstream_key_missing"
+    );
+    let rows1_before =
+        LogStore::new(&dir1).read_since(chrono::Utc::now() - chrono::TimeDelta::minutes(5));
+    assert_eq!(rows1_before.len(), 1);
+
+    // Prepare a reloaded config pointing at dir2, a new request timeout, a new
+    // model alias, and a fresh env file carrying the rotated upstream key.
+    let mut cfg2 = cfg1;
+    cfg2.server.state_dir = dir2.display().to_string();
+    cfg2.server.request_timeout_s = 12;
+    cfg2.models[0].aliases.push("reloaded-alias".into());
+    let env2_path = dir2.join("env");
+    std::fs::write(&env2_path, "TEST_ROTATED_KEY=sk-rotated-new\n").unwrap();
+    let env2 = EnvFile::load(&env2_path);
+
+    state.reload(cfg2, env2).unwrap();
+
+    // Request using the new alias succeeds with the rotated key and writes its
+    // ledger row to dir2, leaving dir1 untouched.
+    let response = app
+        .clone()
+        .oneshot(post_body(
+            json!({
+                "model": "reloaded-alias",
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+            "normal",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        rec.last_headers().get("authorization").unwrap(),
+        "Bearer sk-rotated-new"
+    );
+
+    let rows1_after =
+        LogStore::new(&dir1).read_since(chrono::Utc::now() - chrono::TimeDelta::minutes(5));
+    let rows2 = LogStore::new(&dir2).read_since(chrono::Utc::now() - chrono::TimeDelta::minutes(5));
+    assert_eq!(
+        rows1_after.len(),
+        1,
+        "old state_dir must stop receiving rows"
+    );
+    assert_eq!(
+        rows2.len(),
+        1,
+        "new state_dir must receive the reloaded row"
+    );
+    assert_eq!(rows2[0].status, 200);
+}

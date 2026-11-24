@@ -52,30 +52,58 @@ struct ProbeCacheEntry {
     value: Value,
 }
 
+/// Reloadable runtime snapshot swapped atomically on SIGHUP (or catalog update).
+///
+/// Bundling these fields into one `Arc` keeps every request internally
+/// consistent: a reload that changes `state_dir`, `request_timeout_s`, or
+/// upstream keys updates config, env, HTTP pool, ledger store, bindings, and
+/// the precomputed model list together — never half-new and half-old.
+#[derive(Clone)]
+struct Runtime {
+    cfg: Arc<Config>,
+    env: Arc<EnvFile>,
+    http: reqwest::Client,
+    logs: LogStore,
+    /// TOFU device bindings (client name -> source IP). Reloaded from disk on
+    /// SIGHUP so CLI `client unbind` / `rotate` edits reach the data plane.
+    bindings: Arc<crate::bindings::BindingStore>,
+    /// Last successful upstream model list, keyed by provider id.
+    catalog: Arc<HashMap<String, Vec<crate::catalog::ListedModel>>>,
+    /// Precomputed logical models (`catalog::merge` over `cfg` + `catalog`).
+    models: Arc<Vec<Model>>,
+}
+
+fn compute_models(
+    cfg: &Config,
+    catalog: &HashMap<String, Vec<crate::catalog::ListedModel>>,
+) -> Vec<Model> {
+    if catalog.is_empty() {
+        return cfg.models.clone();
+    }
+    let provider_ids: Vec<String> = cfg
+        .providers
+        .iter()
+        .map(|provider| provider.id.clone())
+        .collect();
+    crate::catalog::merge(&cfg.models, &provider_ids, catalog)
+}
+
 pub struct AppState {
     inner: Arc<Inner>,
 }
 
 struct Inner {
-    cfg: RwLock<Arc<Config>>,
-    env: EnvFile,
-    http: reqwest::Client,
+    runtime: RwLock<Arc<Runtime>>,
     http_stream: reqwest::Client,
     started: Instant,
     health: Mutex<HashMap<String, ProviderHealth>>,
     probe_cache: Mutex<HashMap<String, ProbeCacheEntry>>,
     circuits: CircuitBreaker,
     routes: Mutex<RouteTable>,
-    /// Last successful upstream model list, keyed by provider id.
-    catalog: RwLock<HashMap<String, Vec<crate::catalog::ListedModel>>>,
     /// When the catalog was last refreshed, automatic or manual.
     catalog_refreshed_at: Mutex<Option<Instant>>,
-    logs: LogStore,
     metrics: Metrics,
     sessions: SessionStore,
-    /// TOFU device bindings (client name -> source IP). Reloaded from disk on
-    /// SIGHUP so CLI `client unbind` / `rotate` edits reach the data plane.
-    bindings: RwLock<Arc<crate::bindings::BindingStore>>,
 }
 
 impl Clone for AppState {
@@ -111,27 +139,38 @@ impl AppState {
         sessions: SessionStore,
     ) -> Result<Self> {
         let http_stream = upstream::build_stream_client()?;
-        let logs = LogStore::new(&cfg.server.state_path());
-        let bindings = crate::bindings::BindingStore::load(&cfg.server.state_path());
+        let state_dir = cfg.server.state_path();
+        let logs = LogStore::new(&state_dir);
+        let bindings = Arc::new(crate::bindings::BindingStore::load(&state_dir));
+        let catalog = Arc::new(HashMap::new());
+        let models = Arc::new(compute_models(&cfg, &catalog));
+        let runtime = Arc::new(Runtime {
+            cfg: Arc::new(cfg),
+            env: Arc::new(env),
+            http,
+            logs,
+            bindings,
+            catalog,
+            models,
+        });
         Ok(Self {
             inner: Arc::new(Inner {
-                cfg: RwLock::new(Arc::new(cfg)),
-                env,
-                http,
+                runtime: RwLock::new(runtime),
                 http_stream,
                 started: Instant::now(),
                 health: Mutex::new(HashMap::new()),
                 probe_cache: Mutex::new(HashMap::new()),
                 circuits: CircuitBreaker::default(),
                 routes: Mutex::new(RouteTable::default()),
-                catalog: RwLock::new(HashMap::new()),
                 catalog_refreshed_at: Mutex::new(None),
-                logs,
                 metrics: Metrics::new(),
                 sessions,
-                bindings: RwLock::new(Arc::new(bindings)),
             }),
         })
+    }
+
+    fn runtime(&self) -> Arc<Runtime> {
+        Arc::clone(&self.inner.runtime.read().expect("runtime lock poisoned"))
     }
 
     pub fn circuits(&self) -> &CircuitBreaker {
@@ -253,46 +292,29 @@ impl AppState {
     }
 
     pub fn cfg(&self) -> Arc<Config> {
-        Arc::clone(&self.inner.cfg.read().expect("config lock poisoned"))
+        Arc::clone(&self.runtime().cfg)
     }
 
     /// Logical models callers can request. Before any upstream list has been
     /// read this is the configured set. After that it is the deduplicated
     /// union. Metadata comes from the upstream list when that list carries it;
     /// configured entries fill only the gaps and keep unlisted models.
-    pub fn models(&self) -> Vec<Model> {
-        let cfg = self.cfg();
-        let listings = self
-            .inner
-            .catalog
-            .read()
-            .expect("catalog lock poisoned")
-            .clone();
-        if listings.is_empty() {
-            return cfg.models.clone();
-        }
-        let provider_ids: Vec<String> = cfg
-            .providers
-            .iter()
-            .map(|provider| provider.id.clone())
-            .collect();
-        crate::catalog::merge(&cfg.models, &provider_ids, &listings)
+    pub fn models(&self) -> Arc<Vec<Model>> {
+        Arc::clone(&self.runtime().models)
     }
 
-    fn catalog_snapshot(&self) -> HashMap<String, Vec<crate::catalog::ListedModel>> {
-        self.inner
-            .catalog
-            .read()
-            .expect("catalog lock poisoned")
-            .clone()
+    fn catalog_snapshot(&self) -> Arc<HashMap<String, Vec<crate::catalog::ListedModel>>> {
+        Arc::clone(&self.runtime().catalog)
     }
 
     fn note_catalog(&self, provider: &str, models: Vec<crate::catalog::ListedModel>) {
-        self.inner
-            .catalog
-            .write()
-            .expect("catalog lock poisoned")
-            .insert(provider.to_string(), models);
+        let mut guard = self.inner.runtime.write().expect("runtime lock poisoned");
+        let mut next = (**guard).clone();
+        let mut catalog = (*next.catalog).clone();
+        catalog.insert(provider.to_string(), models);
+        next.models = Arc::new(compute_models(&next.cfg, &catalog));
+        next.catalog = Arc::new(catalog);
+        *guard = Arc::new(next);
     }
 
     fn catalog_due(&self) -> bool {
@@ -312,12 +334,12 @@ impl AppState {
             .expect("catalog clock poisoned") = Some(Instant::now());
     }
 
-    pub fn env(&self) -> &EnvFile {
-        &self.inner.env
+    pub fn env(&self) -> Arc<EnvFile> {
+        Arc::clone(&self.runtime().env)
     }
 
-    pub fn http(&self) -> &reqwest::Client {
-        &self.inner.http
+    pub fn http(&self) -> reqwest::Client {
+        self.runtime().http.clone()
     }
 
     /// Timeout-free client used for SSE upstream requests.
@@ -325,8 +347,8 @@ impl AppState {
         &self.inner.http_stream
     }
 
-    pub fn logs(&self) -> &LogStore {
-        &self.inner.logs
+    pub fn logs(&self) -> LogStore {
+        self.runtime().logs.clone()
     }
 
     pub fn metrics(&self) -> &Metrics {
@@ -339,10 +361,11 @@ impl AppState {
 
     /// Upstream client bound to this process's HTTP pools and session store.
     pub fn upstream(&self) -> Upstream {
+        let rt = self.runtime();
         Upstream::with_clients(
-            self.cfg(),
-            self.env().clone(),
-            self.http().clone(),
+            Arc::clone(&rt.cfg),
+            Arc::clone(&rt.env),
+            rt.http.clone(),
             self.stream_http().clone(),
             self.sessions(),
         )
@@ -352,35 +375,95 @@ impl AppState {
     /// metrics observation, so `/metrics` and `umsp usage` cannot diverge.
     pub fn finish_request(&self, record: &RequestRecord) {
         self.inner.metrics.observe(record);
-        let _ = self.inner.logs.append(record);
+        let _ = self.runtime().logs.append(record);
     }
 
     pub fn uptime_s(&self) -> u64 {
         self.inner.started.elapsed().as_secs()
     }
 
-    /// Swap in a new config (SIGHUP reload). Returns the previous one.
+    /// Atomically replace the reloadable runtime snapshot (SIGHUP reload).
+    ///
+    /// Re-reads device bindings from the new `state_dir`, swaps the env file,
+    /// switches the log store when `state_dir` changed, rebuilds the HTTP
+    /// client when `request_timeout_s` changed (keeping existing pools when it
+    /// did not), and recomputes the merged model list.
+    pub fn reload(&self, cfg: Config, env: EnvFile) -> Result<()> {
+        let current = self.runtime();
+        let next_http = if cfg.server.request_timeout_s != current.cfg.server.request_timeout_s {
+            Some(upstream::build_http_client(&cfg)?)
+        } else {
+            None
+        };
+        let state_dir = cfg.server.state_path();
+        let next_logs = if state_dir != current.cfg.server.state_path() {
+            Some(LogStore::new(&state_dir))
+        } else {
+            None
+        };
+        let next_bindings = Arc::new(crate::bindings::BindingStore::load(&state_dir));
+        let next_cfg = Arc::new(cfg);
+        let next_env = Arc::new(env);
+
+        let mut guard = self.inner.runtime.write().expect("runtime lock poisoned");
+        let models = Arc::new(compute_models(&next_cfg, &guard.catalog));
+        let runtime = Runtime {
+            cfg: next_cfg,
+            env: next_env,
+            http: next_http.unwrap_or_else(|| guard.http.clone()),
+            logs: next_logs.unwrap_or_else(|| guard.logs.clone()),
+            bindings: next_bindings,
+            catalog: Arc::clone(&guard.catalog),
+            models,
+        };
+        *guard = Arc::new(runtime);
+        Ok(())
+    }
+
+    /// Swap in a new config while keeping the current env file and bindings.
+    /// Returns the previous config.
     pub fn replace_config(&self, cfg: Config) -> Arc<Config> {
-        let mut guard = self.inner.cfg.write().expect("config lock poisoned");
-        std::mem::replace(&mut *guard, Arc::new(cfg))
+        let current = self.runtime();
+        let next_http = if cfg.server.request_timeout_s != current.cfg.server.request_timeout_s {
+            upstream::build_http_client(&cfg).ok()
+        } else {
+            None
+        };
+        let state_dir = cfg.server.state_path();
+        let next_logs = if state_dir != current.cfg.server.state_path() {
+            Some(LogStore::new(&state_dir))
+        } else {
+            None
+        };
+        let mut guard = self.inner.runtime.write().expect("runtime lock poisoned");
+        let prev = Arc::clone(&guard.cfg);
+        let next_cfg = Arc::new(cfg);
+        let models = Arc::new(compute_models(&next_cfg, &guard.catalog));
+        let runtime = Runtime {
+            cfg: next_cfg,
+            env: Arc::clone(&guard.env),
+            http: next_http.unwrap_or_else(|| guard.http.clone()),
+            logs: next_logs.unwrap_or_else(|| guard.logs.clone()),
+            bindings: Arc::clone(&guard.bindings),
+            catalog: Arc::clone(&guard.catalog),
+            models,
+        };
+        *guard = Arc::new(runtime);
+        prev
     }
 
     /// Current device-binding store (cheap Arc clone under a read lock).
     pub fn bindings(&self) -> Arc<crate::bindings::BindingStore> {
-        self.inner
-            .bindings
-            .read()
-            .expect("bindings lock poisoned")
-            .clone()
+        Arc::clone(&self.runtime().bindings)
     }
 
-    /// Re-read bindings from disk. Called on SIGHUP after a config swap so
-    /// CLI edits (`client unbind`, `rotate`, `remove`) reach the data plane,
-    /// and so a changed `state_dir` points at the right file.
+    /// Re-read bindings from disk.
     pub fn reload_bindings(&self, state_dir: &std::path::Path) {
-        let store = crate::bindings::BindingStore::load(state_dir);
-        let mut guard = self.inner.bindings.write().expect("bindings lock poisoned");
-        *guard = Arc::new(store);
+        let store = Arc::new(crate::bindings::BindingStore::load(state_dir));
+        let mut guard = self.inner.runtime.write().expect("runtime lock poisoned");
+        let mut next = (**guard).clone();
+        next.bindings = store;
+        *guard = Arc::new(next);
     }
 
     pub fn note_health(&self, provider: &str, status: u16, latency_ms: u64, error: Option<String>) {
@@ -500,7 +583,7 @@ impl ProxyError {
 /// Minimal upstream client shared by `serve` and `umsp call`.
 pub struct Upstream {
     pub cfg: Arc<Config>,
-    pub env: EnvFile,
+    pub env: Arc<EnvFile>,
     pub http: reqwest::Client,
     /// Timeout-free client for SSE (see `upstream::build_stream_client`).
     pub http_stream: reqwest::Client,
@@ -514,7 +597,7 @@ impl Upstream {
         let sessions = SessionStore::new(sessions_dir.to_path_buf(), http.clone());
         Ok(Self {
             cfg,
-            env,
+            env: Arc::new(env),
             http,
             http_stream,
             sessions,
@@ -525,7 +608,7 @@ impl Upstream {
     /// (and warming) new connection pools per request.
     pub fn with_clients(
         cfg: Arc<Config>,
-        env: EnvFile,
+        env: Arc<EnvFile>,
         http: reqwest::Client,
         http_stream: reqwest::Client,
         sessions: SessionStore,
@@ -2761,8 +2844,8 @@ async fn proxy_non_stream(
 ) -> Response {
     let up = Upstream::with_clients(
         cfg.clone(),
-        state.env().clone(),
-        state.http().clone(),
+        state.env(),
+        state.http(),
         state.stream_http().clone(),
         state.sessions(),
     );
@@ -3498,8 +3581,8 @@ async fn proxy_stream(
 ) -> Response {
     let up = Upstream::with_clients(
         cfg.clone(),
-        state.env().clone(),
-        state.http().clone(),
+        state.env(),
+        state.http(),
         state.stream_http().clone(),
         state.sessions(),
     );
@@ -4295,11 +4378,12 @@ async fn deepseek_balance(
     state: &AppState,
     provider: &Provider,
 ) -> std::result::Result<Balance, String> {
-    let key = state
-        .env()
+    let rt = state.runtime();
+    let key = rt
+        .env
         .get(&provider.api_key_env)
         .ok_or_else(|| format!("missing {}", provider.api_key_env))?;
-    health::fetch_balance(state.http(), provider, &key).await
+    health::fetch_balance(&rt.http, provider, &key).await
 }
 
 fn balance_upstream(cfg: &Config, provider_id: &str) -> String {
@@ -4427,12 +4511,12 @@ async fn health_loop(state: AppState) {
                     last_grok_usage.insert(provider.id.clone(), Instant::now());
                     let upstream = balance_upstream(&cfg, &provider.id);
                     let user_id = grok_user_ids.get(&provider.id).map(String::as_str);
+                    let rt = state.runtime();
                     match grok_billing::fetch_usage(
-                        state.http(),
+                        &rt.http,
                         &state.sessions(),
                         provider,
-                        &state
-                            .env()
+                        &rt.env
                             .get("UMSP_GROK_CLI_VERSION")
                             .unwrap_or_else(|| sessions::GROK_CLI_VERSION.to_string()),
                         user_id,
@@ -4553,8 +4637,8 @@ async fn health_loop(state: AppState) {
             };
             let up = Upstream::with_clients(
                 cfg.clone(),
-                state.env().clone(),
-                state.http().clone(),
+                state.env(),
+                state.http(),
                 state.stream_http().clone(),
                 state.sessions(),
             );
@@ -4645,9 +4729,11 @@ pub async fn serve(config_path: &std::path::Path, listen_override: Option<String
     use std::io::Write;
     let _ = std::io::stdout().flush();
 
-    // SIGHUP: reload config if valid, keep the old one otherwise.
+    // SIGHUP: atomically reload config, env keys, HTTP client, log store and
+    // device bindings when valid; keep the previous snapshot otherwise.
     let reload_state = state.clone();
     let config_path_owned = config_path.to_path_buf();
+    let env_path_owned = env_path.clone();
     tokio::spawn(async move {
         let mut hup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
             Ok(sig) => sig,
@@ -4659,10 +4745,22 @@ pub async fn serve(config_path: &std::path::Path, listen_override: Option<String
                     let issues = cfg.validate();
                     let errors = issues.iter().filter(|i| i.level == "error").count();
                     if errors == 0 {
-                        let state_dir = cfg.server.state_path();
-                        reload_state.replace_config(cfg);
-                        reload_state.reload_bindings(&state_dir);
-                        plog("info", "config_reloaded", "-", None, None, None);
+                        let env = EnvFile::load(&env_path_owned);
+                        match reload_state.reload(cfg, env) {
+                            Ok(()) => {
+                                plog("info", "config_reloaded", "-", None, None, None);
+                            }
+                            Err(err) => {
+                                plog(
+                                    "error",
+                                    "config_reload_failed",
+                                    "-",
+                                    None,
+                                    None,
+                                    Some(&err.code),
+                                );
+                            }
+                        }
                     } else {
                         plog(
                             "error",
