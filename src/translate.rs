@@ -1717,9 +1717,15 @@ impl StreamBridge {
         self.close_text_block(out);
         self.close_tool_block(out);
         let has_tools = self.tools_seen > 0;
-        let finish = self
-            .finish
-            .unwrap_or(if has_tools { "tool_calls" } else { "stop" });
+        // The finish reason is mapped when the upstream reports it, but Chat
+        // tool calls are buffered and only counted by the flush above (and may
+        // even arrive after the reason). A tool-bearing turn that the upstream
+        // closed with a plain "stop" is still a tool turn for the client.
+        let finish = match self.finish {
+            Some("stop") | None if has_tools => "tool_calls",
+            Some(finish) => finish,
+            None => "stop",
+        };
         match self.to {
             Proto::Chat => {
                 out.push_str(&chat_chunk(
@@ -2857,6 +2863,37 @@ mod tests {
         assert!(text.contains("data: [DONE]"), "{text}");
         assert_eq!(bridge.usage().unwrap().input_tokens, 11);
         assert!(bridge.done());
+    }
+
+    #[test]
+    fn chat_stream_tool_calls_finished_with_stop_still_end_as_tool_use() {
+        // Some vendors close a tool-call turn with finish_reason "stop", in the
+        // same chunk as the tool delta or in a later one.
+        let same_chunk = concat!(
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let later_chunk = concat!(
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        for raw in [same_chunk, later_chunk] {
+            let mut bridge = StreamBridge::new("chat", "messages", "logical", false).unwrap();
+            let mut out = Vec::new();
+            bridge.push(raw.as_bytes(), &mut out);
+            let text = String::from_utf8(out).unwrap();
+            assert!(text.contains("\"type\":\"tool_use\""), "{text}");
+            assert!(text.contains("\"stop_reason\":\"tool_use\""), "{text}");
+            assert!(!text.contains("end_turn"), "{text}");
+
+            let mut bridge = StreamBridge::new("chat", "responses", "logical", false).unwrap();
+            let mut out = Vec::new();
+            bridge.push(raw.as_bytes(), &mut out);
+            let text = String::from_utf8(out).unwrap();
+            assert!(text.contains("\"status\":\"completed\""), "{text}");
+            assert!(text.contains("\"type\":\"function_call\""), "{text}");
+        }
     }
 
     #[test]
