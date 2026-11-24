@@ -8,10 +8,13 @@ export CC_x86_64_unknown_linux_musl="${CC_x86_64_unknown_linux_musl:-musl-gcc}"
 export AR_x86_64_unknown_linux_musl="${AR_x86_64_unknown_linux_musl:-ar}"
 TARGET=x86_64-unknown-linux-musl
 
-cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test --locked
+if [[ "${SKIP_CHECKS:-0}" != "1" ]]; then
+  cargo fmt --all -- --check
+  cargo clippy --all-targets -- -D warnings
+  cargo test --locked
+fi
 cargo build --release --locked --target "$TARGET"
 
-echo "binary:  $(stat -c%s "target/${TARGET}/release/umsp") bytes"
+size="$(wc -c < "target/${TARGET}/release/umsp" | tr -d ' ')"
+echo "binary:  ${size} bytes"
 ./scripts/stage-release.sh "target/${TARGET}/release/umsp" "$TARGET"
