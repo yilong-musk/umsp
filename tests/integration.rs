@@ -281,6 +281,11 @@ async fn fake_chat(
         }
         "sse-endless" => return sse_endless().await,
         "sse-stall" => return sse_stall().await,
+        "slow" => {
+            // Buffered response that takes a while, to exercise a client that
+            // gives up first.
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        }
         "sse-delay" => {
             // Headers only after a pause, to exercise "client left first".
             tokio::time::sleep(std::time::Duration::from_millis(400)).await;
@@ -1113,6 +1118,38 @@ async fn streaming_disconnect_before_headers_still_logs() {
     assert_eq!(record.status, 499);
     assert_eq!(record.error_code.as_deref(), Some("client_disconnected"));
     assert!(record.stream);
+}
+
+#[tokio::test]
+async fn cancelled_buffered_request_still_writes_a_499_row() {
+    let dir = temp_dir("buffered-cancel");
+    let (app, _, rec) = gateway(&dir, 50 * 1024 * 1024).await;
+
+    // The client gives up while the upstream call is in flight: dropping the
+    // handler future is what a disconnect does to the request task.
+    let gave_up = tokio::time::timeout(
+        Duration::from_millis(100),
+        app.clone().oneshot(chat_request("slow")),
+    )
+    .await;
+    assert!(gave_up.is_err(), "the request must still be in flight");
+
+    let record = wait_until(&dir, |r| r.client_disconnected, Duration::from_secs(5))
+        .await
+        .expect("a 499 row must be written instead of losing the request");
+    assert_eq!(record.status, 499);
+    assert_eq!(record.error_code.as_deref(), Some("client_disconnected"));
+    assert!(!record.stream);
+    assert_eq!(record.provider, "od");
+    assert_eq!(record.requested_model, "upstream-model");
+    assert_eq!(rec.seen.lock().unwrap().len(), 1);
+
+    // A completed request still writes exactly one row of its own.
+    let response = app.oneshot(chat_request("normal")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let records = wait_records(&dir, 2).await;
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records.iter().filter(|r| r.status == 499).count(), 1);
 }
 
 #[tokio::test]
