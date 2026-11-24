@@ -190,7 +190,9 @@ through byte-for-byte by default.
 - 15s `: keep-alive`; client disconnect cancels the upstream immediately and records
   `client_disconnected` (also writes a 499 line if disconnecting before response headers); upstream
   disconnect after 200 → send protocol-native `event: error` +
-  `data: {"type":"error",...}`, then `data: [DONE]`, without fabricating `response.completed`;
+  `data: {"type":"error","code":"upstream_stream_error","message":…,"param":null,"sequence_number":…}`
+  (the flat shape the Responses protocol defines; `sequence_number` continues the upstream numbering
+  when it has one), then `data: [DONE]`, without fabricating `response.completed`;
   non-2xx before upstream response headers uses the unified failure mapping, not converted to SSE.
 - Does not proxy `POST /v1/responses/input_tokens`, `GET /v1/responses/{id}`, cancel, `input_items`
   (all `501 unsupported_endpoint`); does not implement WebSocket Responses.

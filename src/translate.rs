@@ -1034,16 +1034,10 @@ impl StreamBridge {
         self.done = true;
         match self.to {
             Proto::Messages => stream::messages_error_event(message),
-            Proto::Responses => self
-                .responses_event(
-                    "error",
-                    &json!({
-                        "type": "error",
-                        "message": message,
-                        "code": "upstream_stream_error",
-                    }),
-                )
-                .into_bytes(),
+            Proto::Responses => {
+                let payload = stream::responses_error_payload(message);
+                self.responses_event("error", &payload).into_bytes()
+            }
             Proto::Chat => stream::error_event(message),
         }
     }
@@ -3062,6 +3056,39 @@ mod tests {
         bridge.push(raw.as_bytes(), &mut out);
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("\"stop_reason\":\"refusal\""), "{text}");
+    }
+
+    #[test]
+    fn bridge_and_native_responses_error_events_share_one_shape() {
+        let mut bridge = StreamBridge::new("chat", "responses", "logical", true).unwrap();
+        let mut out = Vec::new();
+        bridge.push(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            &mut out,
+        );
+        let parse = |bytes: Vec<u8>| -> Value {
+            let text = String::from_utf8(bytes).unwrap();
+            assert!(text.starts_with("event: error\n"), "{text}");
+            let data = text
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap();
+            serde_json::from_str(data).unwrap()
+        };
+        let bridged = parse(bridge.error_event("boom"));
+        let native = parse(stream::Observer::responses(true).error_event("boom"));
+        for event in [&bridged, &native] {
+            assert_eq!(event["type"], "error", "{event}");
+            assert_eq!(event["code"], "upstream_stream_error", "{event}");
+            assert_eq!(event["message"], "boom", "{event}");
+            assert!(event["param"].is_null(), "{event}");
+            assert!(event.get("error").is_none(), "{event}");
+        }
+        // The bridge numbers its own events, so the error continues them.
+        assert!(
+            bridged["sequence_number"].as_u64().unwrap() > 0,
+            "{bridged}"
+        );
     }
 
     #[test]
