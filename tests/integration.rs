@@ -767,8 +767,7 @@ async fn chat_proxy_applies_od_quirks_and_counts_usage() {
     );
 
     // Ledger recorded exactly one request with usage.
-    let store = umsp::usage::LogStore::new(&dir);
-    let records = store.read_since(chrono::Utc::now() - chrono::TimeDelta::minutes(5));
+    let records = wait_records(&dir, 1).await;
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].status, 200);
     assert_eq!(records[0].prompt_tokens, 10);
@@ -4498,8 +4497,7 @@ async fn key_binds_on_first_use_and_rejects_other_ips() {
     assert_eq!(response.status(), StatusCode::OK);
 
     // Ledger rows carry the effective client IP.
-    let store = LogStore::new(&dir);
-    let rows = store.read_since(chrono::Utc::now() - chrono::TimeDelta::minutes(5));
+    let rows = wait_records(&dir, 2).await;
     assert!(rows.len() >= 2);
     for row in &rows {
         assert_eq!(row.client_ip.as_deref(), Some("127.0.0.1"));
@@ -4681,8 +4679,7 @@ async fn reload_swaps_env_keys_logs_timeout_and_models_atomically() {
         response.headers().get("x-umsp-code").unwrap(),
         "upstream_key_missing"
     );
-    let rows1_before =
-        LogStore::new(&dir1).read_since(chrono::Utc::now() - chrono::TimeDelta::minutes(5));
+    let rows1_before = wait_records(&dir1, 1).await;
     assert_eq!(rows1_before.len(), 1);
 
     // Prepare a reloaded config pointing at dir2, a new request timeout, a new
@@ -4716,9 +4713,10 @@ async fn reload_swaps_env_keys_logs_timeout_and_models_atomically() {
         "Bearer sk-rotated-new"
     );
 
+    state.flush_logs();
     let rows1_after =
         LogStore::new(&dir1).read_since(chrono::Utc::now() - chrono::TimeDelta::minutes(5));
-    let rows2 = LogStore::new(&dir2).read_since(chrono::Utc::now() - chrono::TimeDelta::minutes(5));
+    let rows2 = wait_records(&dir2, 1).await;
     assert_eq!(
         rows1_after.len(),
         1,

@@ -29,7 +29,7 @@ use crate::route::{PinDrop, PlanKind, RouteTable, UsageWindow};
 use crate::sessions::{self, SessionError, SessionStore};
 use crate::stream;
 use crate::upstream::{self, forward_request_headers, relay_response_headers};
-use crate::usage::{LogStore, RequestRecord, Usage};
+use crate::usage::{LogStore, LogWriter, RequestRecord, Usage};
 use crate::util;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -63,7 +63,7 @@ struct Runtime {
     cfg: Arc<Config>,
     env: Arc<EnvFile>,
     http: reqwest::Client,
-    logs: LogStore,
+    logs: LogWriter,
     /// TOFU device bindings (client name -> source IP). Reloaded from disk on
     /// SIGHUP so CLI `client unbind` / `rotate` edits reach the data plane.
     bindings: Arc<crate::bindings::BindingStore>,
@@ -140,7 +140,7 @@ impl AppState {
     ) -> Result<Self> {
         let http_stream = upstream::build_stream_client()?;
         let state_dir = cfg.server.state_path();
-        let logs = LogStore::new(&state_dir);
+        let logs = LogWriter::new(&state_dir);
         let bindings = Arc::new(crate::bindings::BindingStore::load(&state_dir));
         let catalog = Arc::new(HashMap::new());
         let models = Arc::new(compute_models(&cfg, &catalog));
@@ -348,7 +348,12 @@ impl AppState {
     }
 
     pub fn logs(&self) -> LogStore {
-        self.runtime().logs.clone()
+        self.runtime().logs.store().clone()
+    }
+
+    /// Block until every queued ledger row has been written to disk.
+    pub fn flush_logs(&self) {
+        self.runtime().logs.flush();
     }
 
     pub fn metrics(&self) -> &Metrics {
@@ -375,7 +380,16 @@ impl AppState {
     /// metrics observation, so `/metrics` and `umsp usage` cannot diverge.
     pub fn finish_request(&self, record: &RequestRecord) {
         self.inner.metrics.observe(record);
-        let _ = self.runtime().logs.append(record);
+        if !self.runtime().logs.enqueue(record.clone()) {
+            plog(
+                "warn",
+                "ledger_queue_full",
+                &record.request_id,
+                Some(&record.client),
+                Some(&record.provider),
+                None,
+            );
+        }
     }
 
     pub fn uptime_s(&self) -> u64 {
@@ -397,7 +411,7 @@ impl AppState {
         };
         let state_dir = cfg.server.state_path();
         let next_logs = if state_dir != current.cfg.server.state_path() {
-            Some(LogStore::new(&state_dir))
+            Some(LogWriter::new(&state_dir))
         } else {
             None
         };
@@ -431,7 +445,7 @@ impl AppState {
         };
         let state_dir = cfg.server.state_path();
         let next_logs = if state_dir != current.cfg.server.state_path() {
-            Some(LogStore::new(&state_dir))
+            Some(LogWriter::new(&state_dir))
         } else {
             None
         };
@@ -4798,6 +4812,8 @@ pub async fn serve(config_path: &std::path::Path, listen_override: Option<String
     .with_graceful_shutdown(shutdown)
     .await;
     health_task.abort();
+    let flush_state = state.clone();
+    let _ = tokio::task::spawn_blocking(move || flush_state.flush_logs()).await;
     drop(pid_lock);
     result.map_err(|e| UmspError::other("SERVE", format!("server error: {e}")))
 }
