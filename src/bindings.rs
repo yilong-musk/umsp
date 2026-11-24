@@ -139,15 +139,10 @@ impl BindingStore {
         map.clone()
     }
 
-    /// Atomic write: temp file in the same directory, then rename.
+    /// Atomic, owner-only write (client names and source IPs).
     fn persist_locked(&self, map: &HashMap<String, String>) -> std::io::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let text = serde_json::to_string_pretty(map).map_err(std::io::Error::other)?;
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, text.as_bytes())?;
-        std::fs::rename(&tmp, &self.path)
+        crate::util::atomic_write(&self.path, text.as_bytes(), 0o600)
     }
 }
 
