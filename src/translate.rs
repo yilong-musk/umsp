@@ -1239,7 +1239,14 @@ impl StreamBridge {
             "response.output_item.done" => self.on_responses_item_done(value, out),
             "response.completed" => self.emit_terminal(out),
             "response.incomplete" => {
-                self.finish = Some("length");
+                let reason = value
+                    .pointer("/response/incomplete_details/reason")
+                    .and_then(Value::as_str);
+                self.finish = Some(if reason == Some("content_filter") {
+                    "content_filter"
+                } else {
+                    "length"
+                });
                 self.emit_terminal(out);
             }
             "response.failed" | "response.error" | "error" => {
@@ -1770,10 +1777,16 @@ impl StreamBridge {
                     };
                     response["incomplete_details"] = json!({"reason": reason});
                 }
-                out.push_str(&self.responses_event(
-                    "response.completed",
-                    &json!({"type": "response.completed", "response": response}),
-                ));
+                // The Responses wire protocol ends an incomplete response with
+                // `response.incomplete`; SDK clients dispatch on the event type.
+                let event = if status == "incomplete" {
+                    "response.incomplete"
+                } else {
+                    "response.completed"
+                };
+                out.push_str(
+                    &self.responses_event(event, &json!({"type": event, "response": response})),
+                );
             }
         }
         self.terminal_sent = true;
@@ -3000,6 +3013,55 @@ mod tests {
         assert_eq!(output.len(), 2, "{completed}");
         assert_eq!(output[0]["content"][0]["text"], "hi");
         assert_eq!(output[1]["arguments"], "{\"a\":1}");
+    }
+
+    #[test]
+    fn truncated_chat_stream_ends_responses_clients_with_response_incomplete() {
+        let raw = concat!(
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut bridge = StreamBridge::new("chat", "responses", "logical", true).unwrap();
+        let mut out = Vec::new();
+        bridge.push(raw.as_bytes(), &mut out);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("event: response.incomplete\n"), "{text}");
+        assert!(!text.contains("response.completed"), "{text}");
+        let terminal: Value = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+            .find(|event| event["type"] == "response.incomplete")
+            .expect("response.incomplete event");
+        assert_eq!(terminal["response"]["status"], "incomplete");
+        assert_eq!(
+            terminal["response"]["incomplete_details"]["reason"],
+            "max_output_tokens"
+        );
+        assert!(bridge.done());
+    }
+
+    #[test]
+    fn upstream_response_incomplete_keeps_a_content_filter_reason() {
+        let raw = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_1\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"content_filter\"}}}\n\n",
+        );
+        let mut bridge = StreamBridge::new("responses", "chat", "logical", false).unwrap();
+        let mut out = Vec::new();
+        bridge.push(raw.as_bytes(), &mut out);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("\"finish_reason\":\"content_filter\""),
+            "{text}"
+        );
+
+        let mut bridge = StreamBridge::new("responses", "messages", "logical", false).unwrap();
+        let mut out = Vec::new();
+        bridge.push(raw.as_bytes(), &mut out);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\"stop_reason\":\"refusal\""), "{text}");
     }
 
     #[test]
