@@ -3931,6 +3931,10 @@ async fn pump_stream(
     let mut upstream_error: Option<&'static str> = None;
     let mut disconnected = false;
     let mut ka_deadline = tokio::time::Instant::now() + keepalive;
+    // The idle deadline only moves when upstream bytes arrive. Keepalive
+    // frames are gateway-generated and must not extend it, otherwise a silent
+    // upstream would be kept open forever.
+    let mut idle_deadline = tokio::time::Instant::now() + idle;
 
     loop {
         if observer.done() {
@@ -3950,18 +3954,15 @@ async fn pump_stream(
                 bytes_out += keepalive_frame.len() as u64;
                 ka_deadline = tokio::time::Instant::now() + keepalive;
             }
-            item = tokio::time::timeout(idle, upstream.next()) => {
+            item = upstream.next() => {
                 match item {
-                    Err(_) => {
-                        upstream_error = Some("upstream_stream_timeout");
-                        break;
-                    }
-                    Ok(None) => break,
-                    Ok(Some(Err(_))) => {
+                    None => break,
+                    Some(Err(_)) => {
                         upstream_error = Some("upstream_stream_error");
                         break;
                     }
-                    Ok(Some(Ok(chunk))) => {
+                    Some(Ok(chunk)) => {
+                        idle_deadline = tokio::time::Instant::now() + idle;
                         let mut out = Vec::with_capacity(chunk.len() + 32);
                         if observer.transform(&chunk, &mut out) && record.ttft_ms.is_none() {
                             record.ttft_ms = Some(started.elapsed().as_millis() as u64);
@@ -3979,6 +3980,10 @@ async fn pump_stream(
                         }
                     }
                 }
+            }
+            _ = tokio::time::sleep_until(idle_deadline) => {
+                upstream_error = Some("upstream_stream_timeout");
+                break;
             }
         }
     }

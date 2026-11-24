@@ -214,6 +214,30 @@ async fn sse_error_response() -> axum::response::Response {
         .unwrap()
 }
 
+/// One event, then the upstream keeps the connection open but never sends
+/// another byte.
+async fn sse_stall() -> axum::response::Response {
+    let stream = futures_util::stream::unfold(0u8, |i| async move {
+        match i {
+            0 => Some((
+                Ok::<_, std::io::Error>(Bytes::from(
+                    "data: {\"id\":\"\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"part\"}}]}\n\n",
+                )),
+                1,
+            )),
+            _ => {
+                futures_util::future::pending::<()>().await;
+                None
+            }
+        }
+    });
+    axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
 async fn sse_endless() -> axum::response::Response {
     let stream = futures_util::stream::unfold(0usize, |i| async move {
         if i >= 500 {
@@ -256,6 +280,7 @@ async fn fake_chat(
             return sse_response(pieces).await;
         }
         "sse-endless" => return sse_endless().await,
+        "sse-stall" => return sse_stall().await,
         "sse-delay" => {
             // Headers only after a pause, to exercise "client left first".
             tokio::time::sleep(std::time::Duration::from_millis(400)).await;
@@ -954,6 +979,38 @@ async fn streaming_keepalive_fills_upstream_silence() {
         text.replace(": keep-alive\n\n", ""),
         format!("{SSE_NO_DONE}data: [DONE]\n\n")
     );
+}
+
+#[tokio::test]
+async fn streaming_idle_timeout_fires_despite_keepalives() {
+    let dir = temp_dir("sse-idle");
+    let (upstream, _) = start_upstream().await;
+    let mut cfg = config(&dir, upstream, 50 * 1024 * 1024);
+    // Keepalive fires several times inside one idle window; it must not
+    // extend the window.
+    cfg.server.stream_idle_timeout_s = 2;
+    cfg.server.stream_keepalive_s = 1;
+    let app = build_router(AppState::new(cfg, env_file(&dir)).unwrap());
+
+    let started = Instant::now();
+    let response = app.oneshot(stream_request("sse-stall")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = tokio::time::timeout(Duration::from_secs(10), body_bytes(response))
+        .await
+        .expect("stream must end at the idle timeout, not hang");
+    let elapsed = started.elapsed();
+    let text = String::from_utf8(bytes).unwrap();
+    assert!(text.contains(": keep-alive\n\n"), "{text:?}");
+    // The wire code stays `upstream_stream_error` (docs/protocols.md); the
+    // message and the ledger row carry the timeout.
+    assert!(text.contains("upstream stream idle timeout"), "{text:?}");
+    assert!(text.ends_with("data: [DONE]\n\n"));
+    assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
+
+    let r = wait_until(&dir, |_| true, Duration::from_secs(5))
+        .await
+        .expect("ledger row");
+    assert_eq!(r.error_code.as_deref(), Some("upstream_stream_timeout"));
 }
 
 #[tokio::test]
