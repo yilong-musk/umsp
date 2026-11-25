@@ -25,6 +25,7 @@ pub mod registry;
 pub mod route;
 pub mod server;
 pub mod sessions;
+pub mod sse;
 pub mod stream;
 pub mod translate;
 pub mod upstream;
