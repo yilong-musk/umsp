@@ -4,13 +4,6 @@ on:
   push:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "Existing tag to rebuild and republish (vX.Y.Z)"
-        required: true
-        type: string
-
 # One release build at a time. A second tag waits; it does not cancel a
 # publish that is already uploading assets.
 concurrency:
@@ -49,7 +42,6 @@ jobs:
 
   publish:
     name: github release
-    if: github.event_name == 'push'
     needs: [ci]
     runs-on: ubuntu-24.04
     permissions:
@@ -60,6 +52,27 @@ jobs:
         with:
           name: umsp-x86_64-linux-musl
           path: dist
+      - name: install minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
+      - name: verify and sign the archive
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          [[ -n "$MINISIGN_SECRET_KEY" ]] || { echo "missing secret MINISIGN_SECRET_KEY" >&2; exit 1; }
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          archive="$(ls dist/*.tar.gz)"
+          name="$(basename "$archive" .tar.gz)"
+          tmp="$(mktemp -d)"
+          tar -xzf "$archive" -C "$tmp"
+          "$tmp/${name}/umsp" version --json | jq -e --arg v "$version" '.version == $v' >/dev/null
+          printf '%s' "$MINISIGN_SECRET_KEY" > "$tmp/minisign.key"
+          [[ -s "$tmp/minisign.key" && -n "$(tail -c 1 "$tmp/minisign.key")" ]] && printf '\n' >> "$tmp/minisign.key"
+          chmod 600 "$tmp/minisign.key"
+          minisign -S -W -s "$tmp/minisign.key" -m "$archive" -c "umsp ${tag}" >/dev/null
+          rm -f "$tmp/minisign.key"
+          ls -l dist
       - name: publish assets
         env:
           GH_TOKEN: ${{ github.token }}
@@ -69,12 +82,12 @@ jobs:
           tag="${GITHUB_REF_NAME}"
           ls -l dist
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" dist/*.tar.gz dist/*.sha256 --clobber
+            gh release upload "$tag" dist/*.tar.gz dist/*.sha256 dist/*.minisig umsp.pub --clobber
           else
-            gh release create "$tag" dist/*.tar.gz dist/*.sha256 \
+            gh release create "$tag" dist/*.tar.gz dist/*.sha256 dist/*.minisig umsp.pub \
               --target "${GITHUB_SHA}" \
               --title "$tag" \
-              --notes "Static musl build of UMSP ${tag}."
+              --notes "Static musl build of UMSP ${tag}. The archive is signed with minisign; the public key is umsp.pub (key ID DF38540589CD1246)."
           fi
           gh release view "$tag" --json tagName,assets \
             --jq '{tag: .tagName, assets: [.assets[].name]}'

@@ -33,8 +33,9 @@ file ~/.local/bin/umsp                   # statically linked
 ```
 
 Pushing an annotated tag `vX.Y.Z` (the number must match `version` in `Cargo.toml`)
-publishes this archive as a GitHub Release. Installing it is up to you: the
-repository also gets no host access. See
+publishes this archive as a GitHub Release, signed with minisign
+([`umsp.pub`](umsp.pub)). Installing it is up to you: the repository also
+gets no host access. See
 [Installing a release](docs/operations.md#installing-a-release).
 
 ### Build from source
