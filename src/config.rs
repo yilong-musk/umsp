@@ -466,9 +466,9 @@ impl Config {
                     ),
                 ));
             }
-            if p.vendor.as_deref() == Some("grok") && !p.uses_oauth()
-                || p.vendor.as_deref() == Some("chatgpt") && !p.uses_oauth()
-            {
+            let vendor_spec = p.vendor.as_deref().and_then(crate::vendors::find);
+            let vendor_requires_oauth = vendor_spec.is_some_and(|v| v.auth == AUTH_OAUTH);
+            if vendor_requires_oauth && !p.uses_oauth() {
                 issues.push(err(
                     "provider_auth",
                     format!(
@@ -478,12 +478,18 @@ impl Config {
                     ),
                 ));
             }
-            if p.uses_oauth() && !matches!(p.vendor.as_deref(), Some("grok") | Some("chatgpt")) {
+            if p.uses_oauth() && !vendor_requires_oauth {
+                let oauth_vendors: Vec<&str> = crate::vendors::VENDORS
+                    .iter()
+                    .filter(|v| v.auth == AUTH_OAUTH)
+                    .map(|v| v.id)
+                    .collect();
                 issues.push(err(
                     "provider_auth",
                     format!(
-                        "provider '{}' auth = \"oauth\" is only valid for vendor grok or chatgpt",
-                        p.id
+                        "provider '{}' auth = \"oauth\" is only valid for vendor {}",
+                        p.id,
+                        oauth_vendors.join(" or ")
                     ),
                 ));
             }

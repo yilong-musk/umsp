@@ -34,11 +34,15 @@ pub fn login(config_path: &Path, args: LoginArgs, json: bool) -> Result<i32> {
         .enable_all()
         .build()
         .map_err(|err| UmspError::other("RUNTIME", format!("tokio: {err}")))?;
+    let auth_flow = crate::adapter::for_provider(provider).auth_flow();
     rt.block_on(async {
-        if provider.vendor.as_deref() == Some("chatgpt") {
-            store.login_chatgpt(&provider_id, !args.no_browser).await
-        } else {
-            store.login(&provider_id, !args.no_browser).await
+        match auth_flow {
+            crate::adapter::AuthFlow::ChatGptOAuth => {
+                store.login_chatgpt(&provider_id, !args.no_browser).await
+            }
+            crate::adapter::AuthFlow::GrokOAuth | crate::adapter::AuthFlow::ApiKey => {
+                store.login(&provider_id, !args.no_browser).await
+            }
         }
     })?;
     let session = dir.join(format!("{provider_id}.json"));

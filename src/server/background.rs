@@ -5,11 +5,11 @@ use std::time::{Duration, Instant};
 use axum::http::HeaderMap;
 use serde_json::{Value, json};
 
+use crate::adapter::{self, HealthPoller};
 use crate::circuit::CircuitState;
 use crate::config::{Config, Provider};
 use crate::grok_billing;
 use crate::health::{self, Balance};
-use crate::sessions;
 use crate::upstream;
 
 use super::client::{ChatOutcome, ProxyError, Upstream};
@@ -34,10 +34,10 @@ pub(super) async fn probe_provider_with_timeout(
     if let Some(cached) = state.probe_cached(&provider.id, Duration::from_secs(30)) {
         return cached;
     }
-    // DeepSeek: check the balance first — an empty account is a definitive
-    // answer and must not burn a token (spec 6.1).
+    // Balance-backed providers: check the balance first — an empty account is a
+    // definitive answer and must not burn a token (spec 6.1).
     let mut balance_info: Option<Balance> = None;
-    if provider.quirks.as_deref() == Some("deepseek") {
+    if adapter::for_provider(provider).health_poller() == HealthPoller::DeepSeekBalance {
         match deepseek_balance(state, provider).await {
             Ok(balance) => {
                 state.note_provider_balance(&provider.id, &balance);
@@ -213,6 +213,7 @@ pub(super) async fn fetch_model_ids(
     state: &AppState,
     provider: &Provider,
 ) -> std::result::Result<Vec<crate::catalog::ListedModel>, String> {
+    let rt = state.runtime();
     let token = if provider.uses_oauth() {
         state
             .sessions()
@@ -220,28 +221,18 @@ pub(super) async fn fetch_model_ids(
             .await
             .map_err(|err| err.to_string())?
     } else {
-        state
-            .env()
+        rt.env
             .get(&provider.api_key_env)
             .ok_or_else(|| format!("missing {}", provider.api_key_env))?
     };
     let url = upstream::join_url(&provider.base_url, "models");
-    let mut request = state
-        .http()
+    let mut request = rt
+        .http
         .get(&url)
         .timeout(Duration::from_secs(15))
         .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
-    if provider.vendor.as_deref() == Some("grok") {
-        let version = state
-            .env()
-            .get("UMSP_GROK_CLI_VERSION")
-            .unwrap_or_else(|| sessions::GROK_CLI_VERSION.to_string());
-        request = request
-            .header("X-XAI-Token-Auth", sessions::CLI_TOKEN_AUTH)
-            .header("x-grok-client-version", version);
-    }
-    if provider.vendor.as_deref() == Some("opencode-go") {
-        request = request.header(reqwest::header::USER_AGENT, upstream::OPENCODE_USER_AGENT);
+    for (name, value) in adapter::for_provider(provider).catalog_headers(&rt.env) {
+        request = request.header(name, value);
     }
     let response = request
         .send()
@@ -281,9 +272,7 @@ pub(super) async fn health_tick_provider(
             &rt.http,
             &state.sessions(),
             &provider,
-            &rt.env
-                .get("UMSP_GROK_CLI_VERSION")
-                .unwrap_or_else(|| sessions::GROK_CLI_VERSION.to_string()),
+            &adapter::grok_cli_version(&rt.env),
             grok_user_id.as_deref(),
         )
         .await
@@ -444,7 +433,8 @@ pub(super) async fn health_loop(state: AppState) {
         let cfg = state.cfg();
         let mut tick_tasks = tokio::task::JoinSet::new();
         for provider in &cfg.providers {
-            let due_grok = provider.vendor.as_deref() == Some("grok")
+            let poller = adapter::for_provider(provider).health_poller();
+            let due_grok = poller == HealthPoller::GrokBilling
                 && provider.uses_oauth()
                 && last_grok_usage
                     .get(&provider.id)
@@ -453,7 +443,7 @@ pub(super) async fn health_loop(state: AppState) {
             if due_grok {
                 last_grok_usage.insert(provider.id.clone(), Instant::now());
             }
-            let due_balance = provider.quirks.as_deref() == Some("deepseek")
+            let due_balance = poller == HealthPoller::DeepSeekBalance
                 && last_balance
                     .get(&provider.id)
                     .map(|at| at.elapsed() >= BALANCE_INTERVAL)

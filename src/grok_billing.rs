@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
+use crate::capacity::UsageWindow;
 use crate::config::Provider;
-use crate::route::UsageWindow;
 use crate::sessions::{CLI_TOKEN_AUTH, SessionStore};
 
 /// How long one billing call may take before the health loop gives up on it.
