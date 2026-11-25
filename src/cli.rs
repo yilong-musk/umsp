@@ -304,6 +304,8 @@ pub enum ClientCmd {
     Remove { name: String },
     /// Replace a client's key and print the new key once
     Rotate { name: String },
+    /// Change a client's limits without rotating its key
+    Update(ClientUpdateArgs),
     /// Clear a client's device binding (next request re-binds, TOFU)
     Unbind { name: String },
 }
@@ -318,6 +320,20 @@ pub struct ClientAddArgs {
     /// Comma list: chat,responses,messages
     #[arg(long, default_value = "chat,responses,messages")]
     pub protocols: String,
+    /// Key lifetime counted from now: 90m, 12h, 30d, 2w (default: never expires)
+    #[arg(long, value_name = "DURATION")]
+    pub expires_in: Option<String>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ClientUpdateArgs {
+    pub name: String,
+    /// New key lifetime counted from now: 90m, 12h, 30d, 2w
+    #[arg(long, value_name = "DURATION", conflicts_with = "no_expiry")]
+    pub expires_in: Option<String>,
+    /// Remove the expiry; the key never expires
+    #[arg(long)]
+    pub no_expiry: bool,
 }
 
 #[derive(Debug, Subcommand)]

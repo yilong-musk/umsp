@@ -112,6 +112,43 @@ pub fn parse_since(raw: &str) -> Result<DateTime<Utc>> {
     Ok(Utc::now() - delta)
 }
 
+/// Parse a positive relative duration: `90m`, `24h`, `30d`, `2w` (also `s`).
+pub fn parse_duration(raw: &str) -> Result<TimeDelta> {
+    let s = raw.trim();
+    let invalid = || {
+        UmspError::usage(format!(
+            "invalid duration '{s}' (use a positive number followed by s/m/h/d/w, e.g. 30d)"
+        ))
+    };
+    let Some((split, _)) = s.char_indices().last() else {
+        return Err(invalid());
+    };
+    let (num, unit) = s.split_at(split);
+    let amount: i64 = num.parse().map_err(|_| invalid())?;
+    if amount <= 0 {
+        return Err(invalid());
+    }
+    let delta = match unit {
+        "s" => TimeDelta::try_seconds(amount),
+        "m" => TimeDelta::try_minutes(amount),
+        "h" => TimeDelta::try_hours(amount),
+        "d" => TimeDelta::try_days(amount),
+        "w" => TimeDelta::try_weeks(amount),
+        _ => None,
+    };
+    delta.ok_or_else(invalid)
+}
+
+/// Absolute expiry for a `--expires-in` value, as a whole-second UTC RFC3339
+/// string (the form stored in `config.toml`).
+pub fn expiry_from_now(raw: &str) -> Result<String> {
+    let delta = parse_duration(raw)?;
+    let at = Utc::now()
+        .checked_add_signed(delta)
+        .ok_or_else(|| UmspError::usage(format!("duration '{}' is too large", raw.trim())))?;
+    Ok(at.to_rfc3339_opts(SecondsFormat::Secs, true))
+}
+
 /// Minimal glob: `*` matches any run of characters (including `/`), `?` matches one char.
 pub fn glob_match(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
@@ -326,6 +363,29 @@ mod tests {
         assert!(parse_since("2026-11-01T00:00:00Z").is_ok());
         assert!(parse_since("nope").is_err());
         assert!(parse_since("12x").is_err());
+    }
+
+    #[test]
+    fn duration_parsing() {
+        assert_eq!(parse_duration("30d").unwrap(), TimeDelta::days(30));
+        assert_eq!(parse_duration(" 12h ").unwrap(), TimeDelta::hours(12));
+        assert_eq!(parse_duration("2w").unwrap(), TimeDelta::weeks(2));
+        assert_eq!(parse_duration("90m").unwrap(), TimeDelta::minutes(90));
+        // A multi-byte trailing char must be rejected, not split mid-codepoint.
+        for bad in ["", "d", "0d", "-1d", "12x", "1.5d", "30", "3\u{00e9}"] {
+            assert!(parse_duration(bad).is_err(), "{bad:?} should be rejected");
+        }
+        assert!(parse_duration("999999999999w").is_err());
+    }
+
+    #[test]
+    fn expiry_is_whole_seconds_utc_in_the_future() {
+        let raw = expiry_from_now("1h").unwrap();
+        assert!(raw.ends_with('Z'), "{raw}");
+        assert!(!raw.contains('.'), "{raw}");
+        let at = DateTime::parse_from_rfc3339(&raw).unwrap();
+        let ahead = at.with_timezone(&Utc) - Utc::now();
+        assert!(ahead > TimeDelta::minutes(59) && ahead <= TimeDelta::hours(1));
     }
 
     #[test]

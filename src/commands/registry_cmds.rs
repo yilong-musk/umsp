@@ -6,8 +6,8 @@ use serde_json::{Value, json};
 use toml_edit::Table;
 
 use crate::cli::{
-    CatalogCmd, ClientAddArgs, ClientCmd, KeyCmd, ModelAddArgs, ModelBackendCmd, ModelCmd,
-    ProviderAddArgs, ProviderCmd, ProviderTestArgs, VendorCmd,
+    CatalogCmd, ClientAddArgs, ClientCmd, ClientUpdateArgs, KeyCmd, ModelAddArgs, ModelBackendCmd,
+    ModelCmd, ProviderAddArgs, ProviderCmd, ProviderTestArgs, VendorCmd,
 };
 use crate::commands::config_edit::{self, ConfigDoc};
 use crate::config::{Config, PROTOCOLS};
@@ -907,6 +907,7 @@ pub fn run_client(path: &Path, cmd: ClientCmd, json: bool, no_reload: bool) -> R
         ClientCmd::Add(args) => client_add(path, args, json, no_reload),
         ClientCmd::Remove { name } => client_remove(path, &name, json, no_reload),
         ClientCmd::Rotate { name } => client_rotate(path, &name, json, no_reload),
+        ClientCmd::Update(args) => client_update(path, args, json, no_reload),
         ClientCmd::Unbind { name } => client_unbind(path, &name, json, no_reload),
     }
 }
@@ -923,6 +924,7 @@ pub fn run_key(path: &Path, cmd: KeyCmd, json: bool, no_reload: bool) -> Result<
 fn client_list(path: &Path, json: bool) -> Result<i32> {
     let cfg = crate::commands::load_config(path)?;
     let bindings = crate::bindings::BindingStore::load(&cfg.server.state_path());
+    let now = chrono::Utc::now();
     let rows: Vec<Value> = cfg
         .clients
         .iter()
@@ -933,6 +935,8 @@ fn client_list(path: &Path, json: bool) -> Result<i32> {
                 "bound_ip": bindings.bound_ip(&c.name),
                 "allowed_models": if c.allowed_models.is_empty() { vec!["*".to_string()] } else { c.allowed_models.clone() },
                 "allowed_protocols": c.allowed_protocols,
+                "expires_at": c.expires_at,
+                "expired": c.is_expired(now),
             })
         })
         .collect();
@@ -942,11 +946,17 @@ fn client_list(path: &Path, json: bool) -> Result<i32> {
         println!("no clients configured");
     } else {
         for row in &rows {
+            let expires = match row["expires_at"].as_str() {
+                None => "never".to_string(),
+                Some(at) if row["expired"] == true => format!("{at}(expired)"),
+                Some(at) => at.to_string(),
+            };
             println!(
-                "{:<16} {:<20} bound:{:<16} models:{:<24} protocols:{}",
+                "{:<16} {:<20} bound:{:<16} expires:{:<22} models:{:<24} protocols:{}",
                 row["name"].as_str().unwrap_or("-"),
                 row["key_prefix"].as_str().unwrap_or("-"),
                 row["bound_ip"].as_str().unwrap_or("-"),
+                expires,
                 row["allowed_models"]
                     .as_array()
                     .map(|a| a
@@ -1000,6 +1010,12 @@ fn client_add(path: &Path, args: ClientAddArgs, json: bool, no_reload: bool) -> 
         }
     }
 
+    let expires_at = args
+        .expires_in
+        .as_deref()
+        .map(util::expiry_from_now)
+        .transpose()?;
+
     let plaintext = keys::generate_key();
     let hash = keys::hash_key(&plaintext);
     let prefix = keys::key_prefix(&plaintext);
@@ -1011,6 +1027,9 @@ fn client_add(path: &Path, args: ClientAddArgs, json: bool, no_reload: bool) -> 
     table.insert("key_prefix", config_edit::str_item(&prefix));
     table.insert("allowed_models", config_edit::str_array_item(&models));
     table.insert("allowed_protocols", config_edit::str_array_item(&protocols));
+    if let Some(at) = &expires_at {
+        table.insert("expires_at", config_edit::str_item(at));
+    }
     doc.ensure_table("clients").push(table);
     doc.save()?;
     after_edit(path, no_reload)?;
@@ -1022,15 +1041,76 @@ fn client_add(path: &Path, args: ClientAddArgs, json: bool, no_reload: bool) -> 
             "key_prefix": prefix,
             "allowed_models": models,
             "allowed_protocols": protocols,
+            "expires_at": expires_at,
         }
     });
     if json {
         crate::commands::emit_json(crate::server::success_json(value));
     } else {
         println!("client {} created", args.name);
+        if let Some(at) = &expires_at {
+            println!("expires at {at}");
+        }
         println!("key (shown once, store it now): {plaintext}");
     }
     Ok(0)
+}
+
+fn client_update(path: &Path, args: ClientUpdateArgs, json: bool, no_reload: bool) -> Result<i32> {
+    let existing = Config::load(path)?;
+    if existing.client(&args.name).is_none() {
+        return Err(UmspError::not_found(format!(
+            "client '{}' not found",
+            args.name
+        )));
+    }
+    if args.expires_in.is_none() && !args.no_expiry {
+        return Err(UmspError::usage(
+            "nothing to update; pass --expires-in or --no-expiry",
+        ));
+    }
+    let expires_at = args
+        .expires_in
+        .as_deref()
+        .map(util::expiry_from_now)
+        .transpose()?;
+
+    let mut doc = ConfigDoc::load(path)?;
+    let updated = match &expires_at {
+        Some(at) => config_edit::set_field_in_table_array(
+            &mut doc.doc,
+            "clients",
+            "name",
+            &args.name,
+            "expires_at",
+            config_edit::str_item(at),
+        ),
+        None => config_edit::remove_field_in_table_array(
+            &mut doc.doc,
+            "clients",
+            "name",
+            &args.name,
+            "expires_at",
+        ),
+    };
+    if !updated {
+        return Err(UmspError::other(
+            "UPDATE",
+            "client entry could not be updated",
+        ));
+    }
+    doc.save()?;
+    after_edit(path, no_reload)?;
+
+    let name = args.name;
+    crate::commands::emit(
+        json,
+        json!({"client": {"name": name, "expires_at": expires_at}}),
+        || match &expires_at {
+            Some(at) => format!("client {name} now expires at {at}"),
+            None => format!("client {name} never expires"),
+        },
+    )
 }
 
 fn client_remove(path: &Path, name: &str, json: bool, no_reload: bool) -> Result<i32> {

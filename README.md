@@ -85,6 +85,16 @@ Bindings persist in `state_dir/client-bindings.json` and survive restarts.
 - Devices behind the same NAT share one public IP and are indistinguishable;
   issue one key per device for attribution and per-device revocation.
 
+### Client limits
+
+Each key can carry optional limits; unset means unlimited. Set them on
+`umsp client add` and change them with `umsp client update <name>`:
+
+- `--expires-in 30d` — the key is rejected with `401 key_expired` after that
+  (`--no-expiry` on `update` removes it).
+
+Details: [docs/configuration.md](docs/configuration.md#client-limits).
+
 ## Configuration
 
 Minimal `~/.config/umsp/config.toml`:

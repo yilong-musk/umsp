@@ -15,7 +15,7 @@ use crate::usage::RequestRecord;
 use crate::util;
 
 use super::error::{GatewayError, Protocol, gateway_error, messages_error};
-use super::log::plog_binding;
+use super::log::{plog, plog_binding};
 use super::state::AppState;
 
 #[derive(Clone)]
@@ -35,6 +35,27 @@ pub(super) async fn auth_middleware(
     let matched = presented.and_then(|key| keys::authenticate(&cfg.clients, &key).cloned());
     match matched {
         Some(client) => {
+            // Expiry is checked before the device binding, so an expired key
+            // can never claim (or probe) a binding.
+            if client.is_expired(chrono::Utc::now()) {
+                let request_id = util::new_request_id();
+                plog(
+                    "warn",
+                    "client_key_expired",
+                    &request_id,
+                    Some(&client.name),
+                    None,
+                    Some("key_expired"),
+                );
+                return auth_error(
+                    req.uri().path(),
+                    StatusCode::UNAUTHORIZED,
+                    "authentication_error",
+                    "key_expired",
+                    "this key has expired; ask the gateway admin to extend or replace it",
+                    &request_id,
+                );
+            }
             // TOFU device binding: the first authenticated request binds the
             // key to its effective source IP; later requests must match.
             let peer = req
@@ -129,6 +150,23 @@ pub(super) async fn auth_middleware(
             );
             resp
         }
+    }
+}
+
+/// A client-facing rejection from the auth layer, in the caller's protocol
+/// shape: Anthropic's envelope on `/v1/messages*`, the gateway's elsewhere.
+pub(super) fn auth_error(
+    path: &str,
+    status: StatusCode,
+    messages_type: &str,
+    code: &str,
+    message: &str,
+    request_id: &str,
+) -> Response {
+    if path.starts_with("/v1/messages") {
+        messages_error(status, messages_type, code, message, request_id)
+    } else {
+        gateway_error(status, code, message, request_id)
     }
 }
 

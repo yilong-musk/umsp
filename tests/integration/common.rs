@@ -85,6 +85,7 @@ pub(crate) fn config(dir: &Path, upstream_url: String, max_body: usize) -> Confi
             key_prefix: keys::key_prefix(TEST_KEY),
             allowed_models: vec!["*".into()],
             allowed_protocols: PROTOCOLS.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
         }],
     }
 }

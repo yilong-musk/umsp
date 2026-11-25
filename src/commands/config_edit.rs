@@ -135,6 +135,31 @@ pub fn set_field_in_table_array(
     false
 }
 
+/// Remove a field from an array-of-tables entry. Returns true when the entry
+/// exists, whether or not it carried the field.
+pub fn remove_field_in_table_array(
+    doc: &mut DocumentMut,
+    key: &str,
+    match_field: &str,
+    match_value: &str,
+    field: &str,
+) -> bool {
+    let Some(array) = doc.get_mut(key).and_then(Item::as_array_of_tables_mut) else {
+        return false;
+    };
+    for table in array.iter_mut() {
+        let matches = table
+            .get(match_field)
+            .and_then(Item::as_str)
+            .is_some_and(|v| v == match_value);
+        if matches {
+            table.remove(field);
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

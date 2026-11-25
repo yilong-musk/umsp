@@ -21,7 +21,7 @@ config path globally.
 | `umsp env list\|set\|unset` | Manage upstream keys in the env file (masked display only; `set` hides input on a TTY) |
 | `umsp model list [--aliases]\|add\|remove` | Manage the local model registry (logical id + aliases) |
 | `umsp model backend add\|remove` | Attach/detach a backend for an existing model (`--first` inserts at the front of the tie-break order) |
-| `umsp client list\|add\|remove\|rotate\|unbind` | Manage client keys (only SHA-256 stored); `list` shows the TOFU device binding, `unbind` clears it |
+| `umsp client list\|add\|remove\|rotate\|update\|unbind` | Manage client keys (only SHA-256 stored); `list` shows the TOFU device binding and limits, `update` changes limits, `unbind` clears the binding |
 | `umsp key list\|add\|revoke\|unbind` | Compatibility alias for `client` |
 | `umsp usage summary\|by-client\|by-model\|by-protocol\|prune` | Aggregate the JSONL ledger |
 | `umsp probe --provider ID [--model ID]` | Send one minimal request (chat) to a provider |
@@ -172,6 +172,7 @@ key_hash = "sha256:<64 hex>"       # written by `umsp client add`
 key_prefix = "umsp_ab12cd34"
 allowed_models = ["deepseek-*", "claude-*"]   # glob, empty = *
 allowed_protocols = ["chat", "responses"]  # chat / responses / messages
+expires_at = "2026-12-25T02:00:00Z"        # optional; see "Client limits"
 ```
 
 Conventions:
@@ -244,3 +245,28 @@ Limits: devices behind one NAT share a public IP and cannot be told apart;
 binding is per key, so issue one key per device. Binding events (`client_bound`,
 `device_mismatch`) go to the operational log with both IPs; ledger rows carry
 `client_ip` for attribution.
+
+## Client limits
+
+Every limit below is optional and per client; an unset limit means "no limit".
+Limits are stored on the `[[clients]]` entry in `config.toml`, set with
+`umsp client add` and changed later with `umsp client update` (no key rotation
+needed). Edits reach a running server through the usual `SIGHUP` reload.
+
+### Expiry
+
+```bash
+umsp client add --name hermes --expires-in 30d    # 90m / 12h / 30d / 2w
+umsp client update hermes --expires-in 7d         # new lifetime counted from now
+umsp client update hermes --no-expiry             # never expires
+```
+
+- Only relative durations are accepted on the CLI; they are stored as an
+  absolute whole-second UTC timestamp, `expires_at = "2026-12-25T02:00:00Z"`.
+  No `expires_at` means the key never expires.
+- From that instant every request with the key gets `401 key_expired`
+  (`authentication_error` on `/v1/messages`). Expiry is checked before the
+  device binding, so an expired key never claims a binding.
+- A malformed `expires_at` fails `umsp check` and is treated as expired at
+  runtime (fail closed).
+- `umsp client rotate` keeps the expiry; `umsp client list` shows it.

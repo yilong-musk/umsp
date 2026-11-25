@@ -252,7 +252,7 @@ impl Model {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Client {
     pub name: String,
     #[serde(default)]
@@ -263,6 +263,32 @@ pub struct Client {
     pub allowed_models: Vec<String>,
     #[serde(default = "default_all_protocols")]
     pub allowed_protocols: Vec<String>,
+    /// RFC3339 instant from which the key is rejected. Absent: never expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+}
+
+impl Client {
+    /// Parsed `expires_at`. `None` when unset or malformed (`validate`
+    /// reports the malformed case).
+    pub fn expires_at_utc(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.expires_at.as_deref().and_then(parse_expiry)
+    }
+
+    /// True once `now` reaches `expires_at`. A malformed value counts as
+    /// expired: an unreadable limit must fail closed, not open.
+    pub fn is_expired(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        match self.expires_at.as_deref() {
+            None => false,
+            Some(raw) => parse_expiry(raw).is_none_or(|at| now >= at),
+        }
+    }
+}
+
+fn parse_expiry(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(raw.trim())
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -661,6 +687,17 @@ impl Config {
                     ));
                 }
             }
+            if let Some(raw) = &c.expires_at {
+                if parse_expiry(raw).is_none() {
+                    issues.push(err(
+                        "client_expires_at",
+                        format!(
+                            "client '{}' expires_at must be an RFC3339 timestamp, got '{raw}'",
+                            c.name
+                        ),
+                    ));
+                }
+            }
         }
 
         if self.providers.is_empty() {
@@ -832,6 +869,7 @@ mod tests {
                 key_prefix: "umsp_aaaa".into(),
                 allowed_models: vec!["od/*".into()],
                 allowed_protocols: default_all_protocols(),
+                ..Default::default()
             }],
         }
     }
@@ -953,6 +991,24 @@ mod tests {
         cfg.clients[0].key_hash = "sha256:xyz".into();
         let issues = cfg.validate();
         assert!(issues.iter().any(|i| i.code == "client_key_hash"));
+    }
+
+    #[test]
+    fn client_expiry_parses_validates_and_fails_closed() {
+        let mut cfg = base_config();
+        let now = chrono::Utc::now();
+        assert!(!cfg.clients[0].is_expired(now), "no expiry = never expires");
+
+        cfg.clients[0].expires_at = Some("2999-01-01T00:00:00Z".into());
+        assert!(!cfg.clients[0].is_expired(now));
+        assert!(cfg.validate().iter().all(|i| i.code != "client_expires_at"));
+
+        cfg.clients[0].expires_at = Some("2020-01-01T00:00:00+08:00".into());
+        assert!(cfg.clients[0].is_expired(now));
+
+        cfg.clients[0].expires_at = Some("tomorrow".into());
+        assert!(cfg.clients[0].is_expired(now), "malformed must fail closed");
+        assert!(cfg.validate().iter().any(|i| i.code == "client_expires_at"));
     }
 
     #[test]

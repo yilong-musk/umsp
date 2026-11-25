@@ -93,6 +93,7 @@ mod tests {
             key_prefix: "umsp_0000".into(),
             allowed_models: vec!["*".into()],
             allowed_protocols: PROTOCOLS.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
         }
     }
 
