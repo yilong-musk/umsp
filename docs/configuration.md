@@ -21,7 +21,7 @@ config path globally.
 | `umsp env list\|set\|unset` | Manage upstream keys in the env file (masked display only; `set` hides input on a TTY) |
 | `umsp model list [--aliases]\|add\|remove` | Manage the local model registry (logical id + aliases) |
 | `umsp model backend add\|remove` | Attach/detach a backend for an existing model (`--first` inserts at the front of the tie-break order) |
-| `umsp client list\|add\|remove\|rotate\|unbind` | Manage client keys (only SHA-256 stored); `list` shows the TOFU device binding, `unbind` clears it |
+| `umsp client list\|add\|remove\|rotate\|update\|unbind` | Manage client keys (only SHA-256 stored); `list` shows the TOFU device binding and limits, `update` changes limits, `unbind` clears the binding |
 | `umsp key list\|add\|revoke\|unbind` | Compatibility alias for `client` |
 | `umsp usage summary\|by-client\|by-model\|by-protocol\|prune` | Aggregate the JSONL ledger |
 | `umsp probe --provider ID [--model ID]` | Send one minimal request (chat) to a provider |
@@ -172,6 +172,9 @@ key_hash = "sha256:<64 hex>"       # written by `umsp client add`
 key_prefix = "umsp_ab12cd34"
 allowed_models = ["deepseek-*", "claude-*"]   # glob, empty = *
 allowed_protocols = ["chat", "responses"]  # chat / responses / messages
+expires_at = "2026-12-25T02:00:00Z"        # optional; see "Client limits"
+max_concurrency = 1                        # optional, 1-9
+budget_tokens = 5000000                    # optional lifetime token budget
 ```
 
 Conventions:
@@ -244,3 +247,93 @@ Limits: devices behind one NAT share a public IP and cannot be told apart;
 binding is per key, so issue one key per device. Binding events (`client_bound`,
 `device_mismatch`) go to the operational log with both IPs; ledger rows carry
 `client_ip` for attribution.
+
+## Client limits
+
+Every limit below is optional and per client; an unset limit means "no limit".
+Limits are stored on the `[[clients]]` entry in `config.toml`, set with
+`umsp client add` and changed later with `umsp client update` (no key rotation
+needed). Edits reach a running server through the usual `SIGHUP` reload.
+
+### Expiry
+
+```bash
+umsp client add --name hermes --expires-in 30d    # 90m / 12h / 30d / 2w
+umsp client update hermes --expires-in 7d         # new lifetime counted from now
+umsp client update hermes --no-expiry             # never expires
+```
+
+- Only relative durations are accepted on the CLI; they are stored as an
+  absolute whole-second UTC timestamp, `expires_at = "2026-12-25T02:00:00Z"`.
+  No `expires_at` means the key never expires.
+- From that instant every request with the key gets `401 key_expired`
+  (`authentication_error` on `/v1/messages`). Expiry is checked before the
+  device binding, so an expired key never claims a binding.
+- A malformed `expires_at` fails `umsp check` and is treated as expired at
+  runtime (fail closed).
+- `umsp client rotate` keeps the expiry; `umsp client list` shows it.
+
+### Concurrency
+
+```bash
+umsp client add --name hermes --max-concurrency 1   # 1-9
+umsp client update hermes --max-concurrency 2
+umsp client update hermes --no-concurrency-limit
+```
+
+- `max_concurrency = N` caps the model calls (`/v1/chat/completions`,
+  `/v1/responses`, `/v1/messages`) a key may have in flight. A call over the
+  cap is rejected at once with `429 concurrency_limit` and `Retry-After: 1`
+  (`rate_limit_error` on `/v1/messages`); nothing is queued. Each refusal is
+  a ledger row with `error_code = "concurrency_limit"` (no model: the body is
+  not read).
+- A slot is held until the response body is fully sent or the client
+  disconnects, so a stream occupies its slot for its whole life.
+- `/v1/models` and `/v1/messages/count_tokens` are exempt: agents call them
+  next to a running stream.
+- Counts are in memory: a restart starts from zero, and a reload applies the
+  new cap to the next admission without cutting running calls.
+
+### Token budget
+
+```bash
+umsp client add --name hermes --budget-tokens 5000000
+umsp client update hermes --budget-tokens 8000000   # raise; consumption kept
+umsp client update hermes --reset-usage             # consumption back to 0
+umsp client update hermes --no-budget               # lift it (forgets consumption)
+```
+
+- `budget_tokens = N` is a lifetime total of input + output tokens as reported
+  by the upstream (the ledger's `prompt_tokens + completion_tokens`). It never
+  resets on its own.
+- Before a model call the output it may produce is reserved: its cap —
+  `max_tokens` / `max_completion_tokens` (Chat, the larger one),
+  `max_output_tokens` (Responses), `max_tokens` (Messages) — times `n` on Chat.
+  A call without a cap reserves the model's `max_completion_tokens` (the
+  upstream applies its own default), and a cap above that is clamped to it.
+  A call whose reservation does not fit in `budget - used - reserved` is
+  refused with `403 budget_exhausted` (`permission_error` on `/v1/messages`),
+  and so is every call once nothing is left. Output therefore never overruns
+  the budget, as long as the model's `max_completion_tokens` is accurate.
+- Input tokens are not reserved (the gateway has no tokenizer): the last
+  admitted call may overshoot the budget by its own input. After it, the key
+  is refused.
+- When a call finishes, its real usage is charged and its reservation released
+  (when the response body is done). A call that reached the upstream but has
+  no reliable usage — the client disconnected mid-call, or a successful
+  upstream reported none — is charged at least its reservation, so walking
+  away before the final usage frame is not free. Calls refused before or by
+  the upstream (4xx/5xx) are not charged. `count_tokens` is free.
+- A budgeted client cannot switch the usage report off: on a Chat stream an
+  explicit `stream_options.include_usage: false` is overridden to `true`
+  (ledger quirk `forced_include_usage`).
+- Consumption is tracked only while a budget is set, starting at zero, and
+  persists in `state_dir/client-usage.json` (mode 0600); the server and the
+  CLI serialize their updates with an `flock` on `client-usage.json.lock`.
+  `umsp client list` shows `used/budget`. `remove` and `--no-budget` forget
+  it; `rotate` keeps it.
+- `--reset-usage` rewrites the file at once, but a running server keeps
+  admitting from its in-memory total until the reload that follows the edit
+  (or its next charge for that key). With `--no-reload`, send the server
+  `SIGHUP` yourself.
+- Refusals are ledger rows with `error_code = "budget_exhausted"`.

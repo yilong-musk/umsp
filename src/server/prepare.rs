@@ -14,8 +14,9 @@ use crate::registry;
 use crate::usage::RequestRecord;
 use crate::util;
 
+use super::admission::BudgetSlot;
 use super::error::{GatewayError, Protocol, gateway_error, messages_error};
-use super::log::plog_binding;
+use super::log::{plog, plog_binding};
 use super::state::AppState;
 
 #[derive(Clone)]
@@ -35,6 +36,27 @@ pub(super) async fn auth_middleware(
     let matched = presented.and_then(|key| keys::authenticate(&cfg.clients, &key).cloned());
     match matched {
         Some(client) => {
+            // Expiry is checked before the device binding, so an expired key
+            // can never claim (or probe) a binding.
+            if client.is_expired(chrono::Utc::now()) {
+                let request_id = util::new_request_id();
+                plog(
+                    "warn",
+                    "client_key_expired",
+                    &request_id,
+                    Some(&client.name),
+                    None,
+                    Some("key_expired"),
+                );
+                return auth_error(
+                    req.uri().path(),
+                    StatusCode::UNAUTHORIZED,
+                    "authentication_error",
+                    "key_expired",
+                    "this key has expired; ask the gateway admin to extend or replace it",
+                    &request_id,
+                );
+            }
             // TOFU device binding: the first authenticated request binds the
             // key to its effective source IP; later requests must match.
             let peer = req
@@ -132,6 +154,62 @@ pub(super) async fn auth_middleware(
     }
 }
 
+/// The output tokens a request may produce, which is what a token budget
+/// reserves.
+///
+/// - The cap is the protocol's field: `max_completion_tokens` / `max_tokens`
+///   (Chat, the larger one — upstreams honour either), `max_output_tokens`
+///   (Responses), `max_tokens` (Messages). A float is rounded up.
+/// - Without a usable cap the upstream applies its own default, so the
+///   model's `max_completion_tokens` is reserved instead; a client cap above
+///   it is clamped to it.
+/// - Chat `n` asks for that many choices, each up to the cap.
+fn requested_output_cap(protocol: Protocol, payload: &Value, model_max: u64) -> u64 {
+    let field = |key: &str| payload.get(key).and_then(positive_token_count);
+    let cap = match protocol {
+        Protocol::Chat => field("max_completion_tokens").max(field("max_tokens")),
+        Protocol::Responses => field("max_output_tokens"),
+        Protocol::Messages => field("max_tokens"),
+    };
+    let cap = match (cap, model_max) {
+        (Some(cap), 0) => cap,
+        (Some(cap), max) => cap.min(max),
+        (None, max) => max,
+    };
+    let choices = match protocol {
+        Protocol::Chat => payload.get("n").and_then(positive_token_count).unwrap_or(1),
+        _ => 1,
+    };
+    cap.saturating_mul(choices)
+}
+
+/// A positive JSON number as a whole count (floats rounded up).
+fn positive_token_count(value: &Value) -> Option<u64> {
+    if let Some(n) = value.as_u64() {
+        return (n > 0).then_some(n);
+    }
+    let f = value.as_f64()?;
+    // `as` saturates at u64::MAX for huge finite values.
+    (f.is_finite() && f > 0.0).then(|| f.ceil() as u64)
+}
+
+/// A client-facing rejection from the auth layer, in the caller's protocol
+/// shape: Anthropic's envelope on `/v1/messages*`, the gateway's elsewhere.
+pub(super) fn auth_error(
+    path: &str,
+    status: StatusCode,
+    messages_type: &str,
+    code: &str,
+    message: &str,
+    request_id: &str,
+) -> Response {
+    if path.starts_with("/v1/messages") {
+        messages_error(status, messages_type, code, message, request_id)
+    } else {
+        gateway_error(status, code, message, request_id)
+    }
+}
+
 /// Everything a protocol handler needs after auth, body parsing and routing.
 pub(super) struct Prepared {
     pub(super) cfg: Arc<Config>,
@@ -180,6 +258,8 @@ pub(super) async fn prepare_request(
         .get::<ClientIp>()
         .map(|c| c.0.clone())
         .unwrap_or_else(|| "127.0.0.1".to_string());
+
+    let budget_slot = req.extensions().get::<BudgetSlot>().cloned();
 
     let cfg = state.cfg();
     let (parts, body) = req.into_parts();
@@ -339,6 +419,27 @@ pub(super) async fn prepare_request(
         ));
     }
 
+    // Token budget: reserve the output the call may produce. Only model-call routes
+    // carry a slot (count_tokens is free and never reserves).
+    if let (Some(budget), Some(slot)) = (client.budget_tokens, budget_slot) {
+        let amount = requested_output_cap(protocol, &payload, model.max_completion_tokens);
+        match state
+            .budgets()
+            .try_reserve(&client.name, budget, amount, &request_id)
+        {
+            Ok(reservation) => slot.fill(reservation),
+            Err(denied) => {
+                return Err(reject(
+                    StatusCode::FORBIDDEN,
+                    "budget_exhausted",
+                    &requested_model,
+                    bytes_in,
+                    denied.message(),
+                ));
+            }
+        }
+    }
+
     Ok(Prepared {
         cfg,
         client,
@@ -399,4 +500,44 @@ pub(super) fn log_gateway_error(
         fallbacks: 0,
     };
     state.finish_request(&record);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn output_cap_uses_the_field_the_model_default_and_n() {
+        let chat = |body: Value| requested_output_cap(Protocol::Chat, &body, 1000);
+        assert_eq!(
+            chat(json!({"max_tokens": 20, "max_completion_tokens": 99})),
+            99
+        );
+        assert_eq!(chat(json!({})), 1000, "uncapped reserves the model default");
+        assert_eq!(
+            chat(json!({"max_tokens": 5000})),
+            1000,
+            "clamped to the model"
+        );
+        assert_eq!(chat(json!({"max_tokens": 30, "n": 3})), 90);
+        assert_eq!(chat(json!({"max_tokens": 10.2})), 11, "floats round up");
+        assert_eq!(chat(json!({"max_tokens": -5})), 1000, "unusable cap");
+        assert_eq!(chat(json!({"max_tokens": "64"})), 1000, "unusable cap");
+        assert_eq!(
+            requested_output_cap(
+                Protocol::Responses,
+                &json!({"max_output_tokens": 64, "n": 4}),
+                1000
+            ),
+            64,
+            "n only multiplies Chat"
+        );
+        assert_eq!(
+            requested_output_cap(Protocol::Messages, &json!({"max_tokens": 64}), 0),
+            64,
+            "no model default: the cap stands"
+        );
+        assert_eq!(requested_output_cap(Protocol::Messages, &json!({}), 0), 0);
+    }
 }

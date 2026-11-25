@@ -1539,6 +1539,7 @@ dependencies = [
  "clap_complete",
  "futures-util",
  "getrandom 0.4.3",
+ "http-body",
  "libc",
  "reqwest",
  "rustls",

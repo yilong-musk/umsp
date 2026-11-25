@@ -1,5 +1,6 @@
 //! HTTP data plane: auth, `/v1/models`, `/healthz`, Chat/Responses/Messages proxy.
 
+mod admission;
 mod background;
 mod buffered;
 mod client;
@@ -29,6 +30,7 @@ pub use error::{gateway_error, messages_error, protocol_gateway_error};
 pub use log::plog;
 pub use state::{AppState, ProviderHealth};
 
+use admission::admission_middleware;
 use background::health_loop;
 use handlers::{
     admin_loopback_guard, catalog_refresh_handler, chat_handler, healthz_handler, hello_handler,
@@ -44,11 +46,19 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 // ---------------------------------------------------------------------------
 
 pub fn build_router(state: AppState) -> Router {
-    let api = Router::new()
-        .route("/v1/models", get(models_handler))
+    // Model calls pass the per-client admission layer (concurrency) after auth.
+    let model_calls = Router::new()
         .route("/v1/chat/completions", post(chat_handler))
         .route("/v1/responses", post(responses_handler))
         .route("/v1/messages", post(messages_handler))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            admission_middleware,
+        ));
+
+    let api = Router::new()
+        .route("/v1/models", get(models_handler))
+        .merge(model_calls)
         .route(
             "/v1/messages/count_tokens",
             post(messages_count_tokens_handler),

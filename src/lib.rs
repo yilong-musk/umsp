@@ -19,6 +19,7 @@ pub mod error;
 pub mod grok_billing;
 pub mod health;
 pub mod keys;
+pub mod limits;
 pub mod metrics;
 pub mod model_defaults;
 pub mod pidfile;

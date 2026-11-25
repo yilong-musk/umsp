@@ -2,6 +2,7 @@
 
 mod bindings;
 mod chat;
+mod client_limits;
 mod common;
 mod deepseek;
 mod messages;

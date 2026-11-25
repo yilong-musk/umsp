@@ -91,6 +91,10 @@ struct Inner {
     catalog_refreshed_at: Mutex<Option<Instant>>,
     metrics: Metrics,
     sessions: SessionStore,
+    /// Per-client in-flight model calls; process-local, survives reloads.
+    concurrency: Arc<crate::limits::ConcurrencyLimiter>,
+    /// Per-client token consumption and reservations; re-read on reload.
+    budgets: Arc<crate::limits::BudgetStore>,
 }
 
 impl Clone for AppState {
@@ -152,8 +156,62 @@ impl AppState {
                 catalog_refreshed_at: Mutex::new(None),
                 metrics: Metrics::new(),
                 sessions,
+                concurrency: Arc::default(),
+                budgets: Arc::new(crate::limits::BudgetStore::load(&state_dir)),
             }),
         })
+    }
+
+    pub(super) fn concurrency(&self) -> &Arc<crate::limits::ConcurrencyLimiter> {
+        &self.inner.concurrency
+    }
+
+    pub(super) fn budgets(&self) -> &Arc<crate::limits::BudgetStore> {
+        &self.inner.budgets
+    }
+
+    /// Charge a finished call to its client's token budget. Only clients
+    /// with a budget are tracked, and `count_tokens` is free.
+    ///
+    /// A call that reached the upstream but whose usage is missing or
+    /// incomplete — the client disconnected, or a successful upstream
+    /// reported none — is charged at least what it reserved: the upstream
+    /// has usually billed it, and otherwise disconnecting just before the
+    /// final usage frame would make every call free.
+    fn charge_budget(&self, record: &RequestRecord) {
+        if record.quirks.iter().any(|q| q == "count_tokens") {
+            return;
+        }
+        let held = self.inner.budgets.settle(&record.request_id);
+        let budgeted = self
+            .cfg()
+            .client(&record.client)
+            .is_some_and(|c| c.budget_tokens.is_some());
+        if !budgeted {
+            return;
+        }
+        let reported = record.total_tokens();
+        let reached_upstream = !record.provider.is_empty();
+        let usage_unreliable = record.client_disconnected
+            || (reported == 0 && record.upstream_status.is_some_and(|s| s < 400));
+        let tokens = if reached_upstream && usage_unreliable {
+            reported.max(held)
+        } else {
+            reported
+        };
+        if tokens == 0 {
+            return;
+        }
+        if self.inner.budgets.charge(&record.client, tokens).is_err() {
+            plog(
+                "error",
+                "budget_persist_failed",
+                &record.request_id,
+                Some(&record.client),
+                Some(&record.provider),
+                None,
+            );
+        }
     }
 
     pub(super) fn runtime(&self) -> Arc<Runtime> {
@@ -368,6 +426,7 @@ impl AppState {
     /// Single exit point for a finished request: one ledger row *and* one
     /// metrics observation, so `/metrics` and `umsp usage` cannot diverge.
     pub fn finish_request(&self, record: &RequestRecord) {
+        self.charge_budget(record);
         self.inner.metrics.observe(record);
         if !self.runtime().logs.enqueue(record.clone()) {
             plog(
@@ -405,6 +464,7 @@ impl AppState {
             None
         };
         let next_bindings = Arc::new(crate::bindings::BindingStore::load(&state_dir));
+        self.inner.budgets.reload(&state_dir);
         let next_cfg = Arc::new(cfg);
         let next_env = Arc::new(env);
 

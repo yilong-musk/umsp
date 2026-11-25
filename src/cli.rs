@@ -304,6 +304,8 @@ pub enum ClientCmd {
     Remove { name: String },
     /// Replace a client's key and print the new key once
     Rotate { name: String },
+    /// Change a client's limits without rotating its key
+    Update(ClientUpdateArgs),
     /// Clear a client's device binding (next request re-binds, TOFU)
     Unbind { name: String },
 }
@@ -318,6 +320,51 @@ pub struct ClientAddArgs {
     /// Comma list: chat,responses,messages
     #[arg(long, default_value = "chat,responses,messages")]
     pub protocols: String,
+    /// Key lifetime counted from now: 90m, 12h, 30d, 2w (default: never expires)
+    #[arg(long, value_name = "DURATION")]
+    pub expires_in: Option<String>,
+    /// Model calls allowed in flight at once, 1-9 (default: unlimited)
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=9))]
+    pub max_concurrency: Option<u32>,
+    /// Total tokens the key may consume, never reset (default: no budget)
+    #[arg(long, value_name = "TOKENS", value_parser = clap::value_parser!(u64).range(1..))]
+    pub budget_tokens: Option<u64>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ClientUpdateArgs {
+    pub name: String,
+    /// New key lifetime counted from now: 90m, 12h, 30d, 2w
+    #[arg(long, value_name = "DURATION", conflicts_with = "no_expiry")]
+    pub expires_in: Option<String>,
+    /// Remove the expiry; the key never expires
+    #[arg(long)]
+    pub no_expiry: bool,
+    /// Model calls allowed in flight at once, 1-9
+    #[arg(
+        long,
+        value_name = "N",
+        value_parser = clap::value_parser!(u32).range(1..=9),
+        conflicts_with = "no_concurrency_limit"
+    )]
+    pub max_concurrency: Option<u32>,
+    /// Remove the concurrency limit
+    #[arg(long)]
+    pub no_concurrency_limit: bool,
+    /// Total tokens the key may consume; consumption so far is kept
+    #[arg(
+        long,
+        value_name = "TOKENS",
+        value_parser = clap::value_parser!(u64).range(1..),
+        conflicts_with = "no_budget"
+    )]
+    pub budget_tokens: Option<u64>,
+    /// Remove the budget (and forget the consumption it tracked)
+    #[arg(long)]
+    pub no_budget: bool,
+    /// Set the consumption counted against the budget back to zero
+    #[arg(long, conflicts_with = "no_budget")]
+    pub reset_usage: bool,
 }
 
 #[derive(Debug, Subcommand)]

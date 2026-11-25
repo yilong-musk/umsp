@@ -144,6 +144,9 @@ When `"stream": true`, the gateway no longer buffers or re-serializes:
 - If the client did not provide `stream_options.include_usage`, the gateway injects
   `{"include_usage": true}` for accounting (ledger `quirks` records `injected_include_usage`); an
   explicit `false` is respected, the ledger records `usage_missing`, and tokens are not estimated.
+  Exception: for a client with a token budget the gateway overrides an explicit `false` (or a
+  non-object `stream_options`) with `{"include_usage": true}` and records `forced_include_usage`,
+  because the budget is charged from that report.
 - After 15s of upstream silence (`stream_keepalive_s`), sends a `: keep-alive` comment.
 - Upstream response header timeout 300s (`stream_header_timeout_s`), stream idle timeout 300s
   (`stream_idle_timeout_s`); streaming clients have **no** overall timeout, so long streams are not

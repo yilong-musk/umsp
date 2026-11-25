@@ -237,8 +237,11 @@ pub(super) async fn chat_handler(State(state): State<AppState>, req: Request) ->
             obj.insert("stream".to_string(), Value::Bool(false));
         }
     }
-    if stream_requested && inject_stream_include_usage(&mut prepared.payload) {
-        request_quirks.push("injected_include_usage".to_string());
+    if stream_requested {
+        let force = prepared.client.budget_tokens.is_some();
+        if let Some(quirk) = inject_stream_include_usage(&mut prepared.payload, force) {
+            request_quirks.push(quirk.to_string());
+        }
     }
 
     if stream_requested {
@@ -401,26 +404,37 @@ pub(super) async fn responses_unsupported_handler(
 
 /// Ask the upstream for a trailing usage chunk when the client did not say.
 ///
-/// Returns `true` when the request was modified. An explicit
-/// `include_usage: false` is respected (the ledger then records
-/// `usage_missing` rather than changing what the client asked for).
-pub(super) fn inject_stream_include_usage(payload: &mut Value) -> bool {
-    let Some(obj) = payload.as_object_mut() else {
-        return false;
-    };
+/// Returns the quirk to record when the request was modified. An explicit
+/// `include_usage: false` (or a non-object `stream_options`) is respected —
+/// the ledger then records `usage_missing` — unless `force` is set: a client
+/// with a token budget must not be able to switch off the usage report its
+/// budget is charged from, so its value is overridden.
+pub(super) fn inject_stream_include_usage(
+    payload: &mut Value,
+    force: bool,
+) -> Option<&'static str> {
+    let obj = payload.as_object_mut()?;
     match obj.get_mut("stream_options") {
-        Some(Value::Object(opts)) => {
-            if opts.contains_key("include_usage") {
-                return false;
+        Some(Value::Object(opts)) => match opts.get("include_usage") {
+            Some(Value::Bool(true)) => None,
+            Some(_) if !force => None,
+            Some(_) => {
+                opts.insert("include_usage".to_string(), Value::Bool(true));
+                Some("forced_include_usage")
             }
-            opts.insert("include_usage".to_string(), Value::Bool(true));
-            true
+            None => {
+                opts.insert("include_usage".to_string(), Value::Bool(true));
+                Some("injected_include_usage")
+            }
+        },
+        Some(_) if !force => None,
+        Some(_) => {
+            obj.insert("stream_options".to_string(), json!({"include_usage": true}));
+            Some("forced_include_usage")
         }
-        // A non-object `stream_options` is the client's business; leave it.
-        Some(_) => false,
         None => {
             obj.insert("stream_options".to_string(), json!({"include_usage": true}));
-            true
+            Some("injected_include_usage")
         }
     }
 }
