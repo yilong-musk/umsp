@@ -16,8 +16,6 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: deploy script
-        run: bash scripts/deploy-host-test.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
