@@ -175,8 +175,8 @@ or update any host, and the repository holds no deploy key or host address.
 Pushing an annotated tag `vX.Y.Z` (the number must equal `version` in
 `Cargo.toml`, and the commit must already be on `main`) runs CI and publishes
 `umsp-<version>-x86_64-unknown-linux-musl.tar.gz` with its `.sha256` as a GitHub
-Release. Re-run **release** from Actions with the tag as input to rebuild and
-republish an existing tag; assets are uploaded with `--clobber`.
+Release. Re-run the tag's workflow run from Actions to rebuild and republish
+it; assets are uploaded with `--clobber`.
 
 Install or upgrade from the archive:
 
@@ -201,6 +201,21 @@ ledger; those stay on the host and survive upgrades.
 
 Roll back by installing the saved binary the same way, then restarting the
 unit. Keep the backup until `/healthz` reports the expected version.
+
+### Verifying a release (optional)
+
+Every release archive is signed with [minisign](https://jedisct1.github.io/minisign/).
+The public key is committed as [`umsp.pub`](../umsp.pub); its key ID is
+`DF38540589CD1246`.
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/yilong-musk/umsp/main/umsp.pub
+minisign -Vm umsp-<version>-x86_64-unknown-linux-musl.tar.gz -p umsp.pub
+```
+
+A valid archive prints `Signature and comment signature verified`. The
+`.sha256` file remains available for tooling that does not speak minisign;
+verification is optional and changes nothing about installing the archive.
 
 ---
 

@@ -31,7 +31,8 @@ file ~/.local/bin/umsp                   # 静态链接
 ```
 
 推送带注释的 tag `vX.Y.Z`（版本号必须与 `Cargo.toml` 的 `version` 一致）会把上面的归档发布为
-GitHub Release。安装由你自己完成，仓库不持有任何主机访问权限。
+GitHub Release（minisign 签名，公钥见 [`umsp.pub`](umsp.pub)）。安装由你自己完成，
+仓库不持有任何主机访问权限。
 见 [安装发布包](docs/operations.md#installing-a-release)。
 
 ### 从源码构建
