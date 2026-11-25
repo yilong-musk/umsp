@@ -79,3 +79,7 @@ backends = [
 # key_prefix = "umsp_ab12cd34"
 # allowed_models = ["deepseek-*", "claude-*"]
 # allowed_protocols = ["chat", "responses", "messages"]
+# Optional limits (omit = unlimited); see docs/configuration.md#client-limits.
+# expires_at = "2026-12-25T02:00:00Z"   # set with --expires-in 30d
+# max_concurrency = 1                   # 1-9 model calls in flight
+# budget_tokens = 5000000               # lifetime token budget

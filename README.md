@@ -94,6 +94,10 @@ Each key can carry optional limits; unset means unlimited. Set them on
   (`--no-expiry` on `update` removes it).
 - `--max-concurrency 1` — at most N (1-9) model calls in flight; more get
   `429 concurrency_limit` (`--no-concurrency-limit` removes it).
+- `--budget-tokens 5000000` — lifetime token budget. Each call reserves its
+  output cap first and is refused with `403 budget_exhausted` when it does not
+  fit; real usage is charged afterwards (`--reset-usage` / `--no-budget` on
+  `update`).
 
 Details: [docs/configuration.md](docs/configuration.md#client-limits).
 

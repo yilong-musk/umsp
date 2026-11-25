@@ -93,6 +93,8 @@ struct Inner {
     sessions: SessionStore,
     /// Per-client in-flight model calls; process-local, survives reloads.
     concurrency: Arc<crate::limits::ConcurrencyLimiter>,
+    /// Per-client token consumption and reservations; re-read on reload.
+    budgets: Arc<crate::limits::BudgetStore>,
 }
 
 impl Clone for AppState {
@@ -155,12 +157,43 @@ impl AppState {
                 metrics: Metrics::new(),
                 sessions,
                 concurrency: Arc::default(),
+                budgets: Arc::new(crate::limits::BudgetStore::load(&state_dir)),
             }),
         })
     }
 
     pub(super) fn concurrency(&self) -> &Arc<crate::limits::ConcurrencyLimiter> {
         &self.inner.concurrency
+    }
+
+    pub(super) fn budgets(&self) -> &Arc<crate::limits::BudgetStore> {
+        &self.inner.budgets
+    }
+
+    /// Charge a finished call's real usage to its client's token budget.
+    /// Only clients with a budget are tracked, and `count_tokens` is free.
+    fn charge_budget(&self, record: &RequestRecord) {
+        let tokens = record.total_tokens();
+        if tokens == 0 || record.quirks.iter().any(|q| q == "count_tokens") {
+            return;
+        }
+        let budgeted = self
+            .cfg()
+            .client(&record.client)
+            .is_some_and(|c| c.budget_tokens.is_some());
+        if !budgeted {
+            return;
+        }
+        if self.inner.budgets.charge(&record.client, tokens).is_err() {
+            plog(
+                "error",
+                "budget_persist_failed",
+                &record.request_id,
+                Some(&record.client),
+                Some(&record.provider),
+                None,
+            );
+        }
     }
 
     pub(super) fn runtime(&self) -> Arc<Runtime> {
@@ -375,6 +408,7 @@ impl AppState {
     /// Single exit point for a finished request: one ledger row *and* one
     /// metrics observation, so `/metrics` and `umsp usage` cannot diverge.
     pub fn finish_request(&self, record: &RequestRecord) {
+        self.charge_budget(record);
         self.inner.metrics.observe(record);
         if !self.runtime().logs.enqueue(record.clone()) {
             plog(
@@ -412,6 +446,7 @@ impl AppState {
             None
         };
         let next_bindings = Arc::new(crate::bindings::BindingStore::load(&state_dir));
+        self.inner.budgets.reload(&state_dir);
         let next_cfg = Arc::new(cfg);
         let next_env = Arc::new(env);
 

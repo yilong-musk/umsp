@@ -924,6 +924,7 @@ pub fn run_key(path: &Path, cmd: KeyCmd, json: bool, no_reload: bool) -> Result<
 fn client_list(path: &Path, json: bool) -> Result<i32> {
     let cfg = crate::commands::load_config(path)?;
     let bindings = crate::bindings::BindingStore::load(&cfg.server.state_path());
+    let budgets = crate::limits::BudgetStore::load(&cfg.server.state_path());
     let now = chrono::Utc::now();
     let rows: Vec<Value> = cfg
         .clients
@@ -937,6 +938,7 @@ fn client_list(path: &Path, json: bool) -> Result<i32> {
                 "allowed_protocols": c.allowed_protocols,
                 "limits": client_limits_json(c),
                 "expired": c.is_expired(now),
+                "budget_used": c.budget_tokens.map(|_| budgets.used(&c.name)),
             })
         })
         .collect();
@@ -956,13 +958,18 @@ fn client_list(path: &Path, json: bool) -> Result<i32> {
                 .as_u64()
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "-".to_string());
+            let budget = match limits["budget_tokens"].as_u64() {
+                Some(cap) => format!("{}/{cap}", row["budget_used"].as_u64().unwrap_or(0)),
+                None => "-".to_string(),
+            };
             println!(
-                "{:<16} {:<20} bound:{:<16} expires:{:<22} conc:{:<2} models:{:<24} protocols:{}",
+                "{:<16} {:<20} bound:{:<16} expires:{:<22} conc:{:<2} budget:{:<20} models:{:<24} protocols:{}",
                 row["name"].as_str().unwrap_or("-"),
                 row["key_prefix"].as_str().unwrap_or("-"),
                 row["bound_ip"].as_str().unwrap_or("-"),
                 expires,
                 concurrency,
+                budget,
                 row["allowed_models"]
                     .as_array()
                     .map(|a| a
@@ -1039,6 +1046,9 @@ fn client_add(path: &Path, args: ClientAddArgs, json: bool, no_reload: bool) -> 
     if let Some(limit) = args.max_concurrency {
         table.insert("max_concurrency", config_edit::int_item(limit.into()));
     }
+    if let Some(budget) = args.budget_tokens {
+        table.insert("budget_tokens", config_edit::int_item(budget_item(budget)?));
+    }
     doc.ensure_table("clients").push(table);
     doc.save()?;
     let cfg = after_edit(path, no_reload)?;
@@ -1088,7 +1098,18 @@ fn client_update(path: &Path, args: ClientUpdateArgs, json: bool, no_reload: boo
     } else if args.no_concurrency_limit {
         changes.push(("max_concurrency", None));
     }
-    if changes.is_empty() {
+    if let Some(budget) = args.budget_tokens {
+        changes.push((
+            "budget_tokens",
+            Some(config_edit::int_item(budget_item(budget)?)),
+        ));
+    } else if args.no_budget {
+        changes.push(("budget_tokens", None));
+    }
+    // Lifting the budget forgets what it tracked, so a later budget starts
+    // from zero instead of inheriting old consumption.
+    let reset_usage = args.reset_usage || args.no_budget;
+    if changes.is_empty() && !reset_usage {
         return Err(UmspError::usage(
             "nothing to update; pass at least one limit flag (see `umsp client update --help`)",
         ));
@@ -1121,6 +1142,12 @@ fn client_update(path: &Path, args: ClientUpdateArgs, json: bool, no_reload: boo
         }
     }
     doc.save()?;
+    if reset_usage {
+        // Written before the reload signal, so the server re-reads it.
+        crate::limits::BudgetStore::load(&existing.server.state_path())
+            .reset(&args.name)
+            .map_err(|e| UmspError::other("BUDGET", format!("could not reset usage: {e}")))?;
+    }
     let cfg = after_edit(path, no_reload)?;
     let client = cfg
         .client(&args.name)
@@ -1139,11 +1166,17 @@ fn client_update(path: &Path, args: ClientUpdateArgs, json: bool, no_reload: boo
     )
 }
 
+/// TOML integers are i64; reject budgets that would not round-trip.
+fn budget_item(budget: u64) -> Result<i64> {
+    i64::try_from(budget).map_err(|_| UmspError::usage("--budget-tokens is too large"))
+}
+
 /// The optional per-client limits, `null` where unlimited.
 fn client_limits_json(client: &crate::config::Client) -> Value {
     json!({
         "expires_at": client.expires_at,
         "max_concurrency": client.max_concurrency,
+        "budget_tokens": client.budget_tokens,
     })
 }
 
@@ -1153,7 +1186,11 @@ fn limits_summary(limits: &Value) -> String {
         .as_u64()
         .map(|n| n.to_string())
         .unwrap_or_else(|| "unlimited".to_string());
-    format!("expires {expires}, concurrency {concurrency}")
+    let budget = limits["budget_tokens"]
+        .as_u64()
+        .map(|n| format!("{n} tokens"))
+        .unwrap_or_else(|| "none".to_string());
+    format!("expires {expires}, concurrency {concurrency}, budget {budget}")
 }
 
 fn client_remove(path: &Path, name: &str, json: bool, no_reload: bool) -> Result<i32> {
@@ -1167,6 +1204,10 @@ fn client_remove(path: &Path, name: &str, json: bool, no_reload: bool) -> Result
     crate::bindings::BindingStore::load(&cfg.server.state_path())
         .unbind(name)
         .map_err(|e| UmspError::other("BINDING", format!("could not clear device binding: {e}")))?;
+    // Nor its token consumption.
+    crate::limits::BudgetStore::load(&cfg.server.state_path())
+        .reset(name)
+        .map_err(|e| UmspError::other("BUDGET", format!("could not clear token usage: {e}")))?;
     after_edit(path, no_reload)?;
     crate::commands::emit(json, json!({"removed": name}), || {
         format!("revoked client {name}")

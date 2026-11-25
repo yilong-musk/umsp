@@ -269,6 +269,9 @@ pub struct Client {
     /// Model calls this client may have in flight at once. Absent: unlimited.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrency: Option<u32>,
+    /// Total tokens this client may consume (never resets). Absent: unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_tokens: Option<u64>,
 }
 
 impl Client {
@@ -712,6 +715,15 @@ impl Config {
                     ));
                 }
             }
+            if c.budget_tokens == Some(0) {
+                issues.push(err(
+                    "client_budget_tokens",
+                    format!(
+                        "client '{}' budget_tokens must be positive (omit it for no budget)",
+                        c.name
+                    ),
+                ));
+            }
         }
 
         if self.providers.is_empty() {
@@ -837,6 +849,10 @@ backends = [
 # key_prefix = "umsp_ab12cd34"
 # allowed_models = ["deepseek-*", "claude-*"]
 # allowed_protocols = ["chat", "responses", "messages"]
+# Optional limits (omit = unlimited); see docs/configuration.md#client-limits.
+# expires_at = "2026-12-25T02:00:00Z"   # set with --expires-in 30d
+# max_concurrency = 1                   # 1-9 model calls in flight
+# budget_tokens = 5000000               # lifetime token budget
 "#;
 
 pub const ENV_TEMPLATE: &str = r#"# umsp environment file (mode 0600) — loaded by systemd and by the umsp CLI.
@@ -1023,6 +1039,23 @@ mod tests {
         cfg.clients[0].expires_at = Some("tomorrow".into());
         assert!(cfg.clients[0].is_expired(now), "malformed must fail closed");
         assert!(cfg.validate().iter().any(|i| i.code == "client_expires_at"));
+    }
+
+    #[test]
+    fn client_budget_must_be_positive() {
+        let mut cfg = base_config();
+        cfg.clients[0].budget_tokens = Some(1);
+        assert!(
+            cfg.validate()
+                .iter()
+                .all(|i| i.code != "client_budget_tokens")
+        );
+        cfg.clients[0].budget_tokens = Some(0);
+        assert!(
+            cfg.validate()
+                .iter()
+                .any(|i| i.code == "client_budget_tokens")
+        );
     }
 
     #[test]

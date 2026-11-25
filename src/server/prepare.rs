@@ -14,6 +14,7 @@ use crate::registry;
 use crate::usage::RequestRecord;
 use crate::util;
 
+use super::admission::BudgetSlot;
 use super::error::{GatewayError, Protocol, gateway_error, messages_error};
 use super::log::{plog, plog_binding};
 use super::state::AppState;
@@ -153,6 +154,19 @@ pub(super) async fn auth_middleware(
     }
 }
 
+/// The output-token cap a request asks for, which is what a token budget
+/// reserves. Chat honours either field depending on the upstream, so the
+/// larger one counts. No cap: nothing is reserved.
+fn requested_output_cap(protocol: Protocol, payload: &Value) -> u64 {
+    let field = |key: &str| payload.get(key).and_then(Value::as_u64);
+    match protocol {
+        Protocol::Chat => field("max_completion_tokens").max(field("max_tokens")),
+        Protocol::Responses => field("max_output_tokens"),
+        Protocol::Messages => field("max_tokens"),
+    }
+    .unwrap_or(0)
+}
+
 /// A client-facing rejection from the auth layer, in the caller's protocol
 /// shape: Anthropic's envelope on `/v1/messages*`, the gateway's elsewhere.
 pub(super) fn auth_error(
@@ -218,6 +232,8 @@ pub(super) async fn prepare_request(
         .get::<ClientIp>()
         .map(|c| c.0.clone())
         .unwrap_or_else(|| "127.0.0.1".to_string());
+
+    let budget_slot = req.extensions().get::<BudgetSlot>().cloned();
 
     let cfg = state.cfg();
     let (parts, body) = req.into_parts();
@@ -375,6 +391,24 @@ pub(super) async fn prepare_request(
                 client.name
             ),
         ));
+    }
+
+    // Token budget: reserve the requested output cap. Only model-call routes
+    // carry a slot (count_tokens is free and never reserves).
+    if let (Some(budget), Some(slot)) = (client.budget_tokens, budget_slot) {
+        let amount = requested_output_cap(protocol, &payload);
+        match state.budgets().try_reserve(&client.name, budget, amount) {
+            Ok(reservation) => slot.fill(reservation),
+            Err(denied) => {
+                return Err(reject(
+                    StatusCode::FORBIDDEN,
+                    "budget_exhausted",
+                    &requested_model,
+                    bytes_in,
+                    denied.message(),
+                ));
+            }
+        }
     }
 
     Ok(Prepared {

@@ -326,6 +326,9 @@ pub struct ClientAddArgs {
     /// Model calls allowed in flight at once, 1-9 (default: unlimited)
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=9))]
     pub max_concurrency: Option<u32>,
+    /// Total tokens the key may consume, never reset (default: no budget)
+    #[arg(long, value_name = "TOKENS", value_parser = clap::value_parser!(u64).range(1..))]
+    pub budget_tokens: Option<u64>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -348,6 +351,20 @@ pub struct ClientUpdateArgs {
     /// Remove the concurrency limit
     #[arg(long)]
     pub no_concurrency_limit: bool,
+    /// Total tokens the key may consume; consumption so far is kept
+    #[arg(
+        long,
+        value_name = "TOKENS",
+        value_parser = clap::value_parser!(u64).range(1..),
+        conflicts_with = "no_budget"
+    )]
+    pub budget_tokens: Option<u64>,
+    /// Remove the budget (and forget the consumption it tracked)
+    #[arg(long)]
+    pub no_budget: bool,
+    /// Set the consumption counted against the budget back to zero
+    #[arg(long, conflicts_with = "no_budget")]
+    pub reset_usage: bool,
 }
 
 #[derive(Debug, Subcommand)]

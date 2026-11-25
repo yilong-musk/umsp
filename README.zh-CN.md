@@ -79,6 +79,7 @@ curl -s http://127.0.0.1:3460/v1/chat/completions \
 
 - `--expires-in 30d`：到期后请求被拒绝，返回 `401 key_expired`（`update` 用 `--no-expiry` 取消过期）。
 - `--max-concurrency 1`：同时进行的模型调用最多 N 个（1-9），超出返回 `429 concurrency_limit`（`--no-concurrency-limit` 取消限制）。
+- `--budget-tokens 5000000`：终身 token 预算。每次调用先预扣输出上限，放不下就返回 `403 budget_exhausted`；调用结束后按实际用量扣减（`update` 用 `--reset-usage` 清零、`--no-budget` 取消）。
 
 详见 [docs/configuration.md](docs/configuration.md#client-limits)。
 

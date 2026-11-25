@@ -174,6 +174,7 @@ allowed_models = ["deepseek-*", "claude-*"]   # glob, empty = *
 allowed_protocols = ["chat", "responses"]  # chat / responses / messages
 expires_at = "2026-12-25T02:00:00Z"        # optional; see "Client limits"
 max_concurrency = 1                        # optional, 1-9
+budget_tokens = 5000000                    # optional lifetime token budget
 ```
 
 Conventions:
@@ -290,3 +291,32 @@ umsp client update hermes --no-concurrency-limit
   next to a running stream.
 - Counts are in memory: a restart starts from zero, and a reload applies the
   new cap to the next admission without cutting running calls.
+
+### Token budget
+
+```bash
+umsp client add --name hermes --budget-tokens 5000000
+umsp client update hermes --budget-tokens 8000000   # raise; consumption kept
+umsp client update hermes --reset-usage             # consumption back to 0
+umsp client update hermes --no-budget               # lift it (forgets consumption)
+```
+
+- `budget_tokens = N` is a lifetime total of input + output tokens as reported
+  by the upstream (the ledger's `prompt_tokens + completion_tokens`). It never
+  resets on its own.
+- Before a model call the requested output cap is reserved: `max_tokens` /
+  `max_completion_tokens` (Chat, the larger one), `max_output_tokens`
+  (Responses), `max_tokens` (Messages). A call whose cap does not fit in
+  `budget - used - reserved` is refused with `403 budget_exhausted`
+  (`permission_error` on `/v1/messages`), and so is every call once nothing is
+  left. Output therefore never overruns the budget.
+- Input tokens are not reserved (the gateway has no tokenizer), and a call
+  without a cap reserves nothing: the last admitted call may overshoot the
+  budget by its own usage. After it, the key is refused.
+- When a call finishes, its real usage is charged and its reservation released
+  (when the response body is done). A call whose upstream reported no usage is
+  not charged. `count_tokens` is free.
+- Consumption is tracked only while a budget is set, starting at zero, and
+  persists in `state_dir/client-usage.json` (mode 0600). `umsp client list`
+  shows `used/budget`. `remove` and `--no-budget` forget it; `rotate` keeps it.
+- Refusals are ledger rows with `error_code = "budget_exhausted"`.

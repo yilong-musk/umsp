@@ -185,3 +185,145 @@ async fn unlimited_clients_are_not_throttled() {
     assert_eq!(response.status(), StatusCode::OK);
     drop(streaming);
 }
+
+// ---------------------------------------------------------------------------
+// Per-client limits: token budget
+// ---------------------------------------------------------------------------
+
+fn capped_chat(max_tokens: u64) -> axum::http::Request<axum::body::Body> {
+    post_body(
+        json!({
+            "model": "upstream-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": max_tokens
+        }),
+        "normal",
+    )
+}
+
+fn used_of(dir: &Path) -> u64 {
+    umsp::limits::BudgetStore::load(dir).used("tester")
+}
+
+#[tokio::test]
+async fn budget_charges_real_usage_and_then_refuses() {
+    let dir = temp_dir("limits-budget");
+    let (app, rec) = gateway_with_client(&dir, |c| c.budget_tokens = Some(65)).await;
+
+    // The fake upstream reports 10 + 20 = 30 tokens per buffered chat call.
+    // Bodies are drained: a reservation lives until its response body is done.
+    let response = app.clone().oneshot(capped_chat(10)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    body_bytes(response).await;
+    assert_eq!(used_of(&dir), 30);
+
+    // 35 left: an output cap of 36 does not fit, 35 does.
+    let response = app.clone().oneshot(capped_chat(36)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let value = body_json(response).await;
+    assert_eq!(value["error"]["code"], "budget_exhausted");
+    let message = value["error"]["message"].as_str().unwrap().to_string();
+    assert!(message.contains("35 tokens left"), "{value}");
+    let response = app.clone().oneshot(capped_chat(35)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    body_bytes(response).await;
+
+    // 5 left. Input is never reserved, so an uncapped call is still admitted
+    // and overshoots the budget by its own usage; after that nothing is.
+    assert_eq!(used_of(&dir), 60);
+    let uncapped = post_body(
+        json!({"model": "upstream-model", "messages": [{"role": "user", "content": "hi"}]}),
+        "normal",
+    );
+    let response = app.clone().oneshot(uncapped).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    body_bytes(response).await;
+    assert_eq!(used_of(&dir), 90);
+
+    let response = app.clone().oneshot(capped_chat(1)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        rec.seen.lock().unwrap().len(),
+        3,
+        "refusals never reach the upstream"
+    );
+
+    // Refusals are ledger rows with the error code.
+    let rows = wait_records(&dir, 5).await;
+    assert!(
+        rows.iter()
+            .filter(|r| r.error_code.as_deref() == Some("budget_exhausted"))
+            .count()
+            >= 2
+    );
+}
+
+#[tokio::test]
+async fn budget_counts_streams_and_skips_calls_without_usage() {
+    let dir = temp_dir("limits-budget-stream");
+    let (app, _) = gateway_with_client(&dir, |c| c.budget_tokens = Some(1000)).await;
+
+    let response = app.clone().oneshot(stream_request("sse")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    body_bytes(response).await;
+    // The stream's trailing usage chunk reports 11 + 22.
+    for _ in 0..100 {
+        if used_of(&dir) > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(used_of(&dir), 33);
+
+    // No usage reported: not charged.
+    let response = app
+        .clone()
+        .oneshot(responses_post(responses_body(false), "nousage"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    body_bytes(response).await;
+    assert_eq!(used_of(&dir), 33);
+}
+
+#[tokio::test]
+async fn budget_refusal_uses_the_messages_error_shape() {
+    let dir = temp_dir("limits-budget-messages");
+    let (app, _) = gateway_with_client(&dir, |c| c.budget_tokens = Some(10)).await;
+    let body = json!({
+        "model": "upstream-model",
+        "max_tokens": 11,
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let response = app
+        .oneshot(post_to("/v1/messages", body, "normal"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let value = body_json(response).await;
+    assert_eq!(value["type"], "error");
+    assert_eq!(value["error"]["type"], "permission_error");
+}
+
+#[tokio::test]
+async fn clients_without_a_budget_are_not_tracked() {
+    let dir = temp_dir("limits-budget-none");
+    let (app, _) = gateway_with_client(&dir, |_| {}).await;
+    let response = app.oneshot(capped_chat(10)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!dir.join(umsp::limits::USAGE_FILE).exists());
+}
+
+#[tokio::test]
+async fn an_unfinished_body_keeps_its_reservation() {
+    let dir = temp_dir("limits-budget-held");
+    let (app, _) = gateway_with_client(&dir, |c| c.budget_tokens = Some(100)).await;
+    let held = app.clone().oneshot(capped_chat(40)).await.unwrap();
+    assert_eq!(held.status(), StatusCode::OK);
+    // Charged 30, still reserving 40 until the body is done: 30 left.
+    let response = app.clone().oneshot(capped_chat(31)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    drop(held);
+    let response = app.oneshot(capped_chat(31)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}

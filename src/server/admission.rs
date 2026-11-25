@@ -1,10 +1,18 @@
-//! Per-client admission for model calls: concurrency slots.
+//! Per-client admission for model calls: concurrency slots and the token
+//! budget reservation.
 //!
 //! Runs after `auth_middleware` on the model-call routes only (chat,
 //! responses, messages). `/v1/models` and `count_tokens` are cheap metadata
 //! calls that clients fire alongside a running stream, so they are exempt.
+//!
+//! The budget reservation needs the parsed body, so `prepare_request` makes
+//! it and parks it in the [`BudgetSlot`] this layer put on the request. The
+//! layer owns the slot and the concurrency permit and hands both to the
+//! response body: they are released when the body ends or is dropped, after
+//! the call's ledger row (and budget charge) has been written.
 
 use std::pin::Pin;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 
 use axum::body::{Body, Bytes};
@@ -14,16 +22,26 @@ use axum::middleware::Next;
 use axum::response::Response;
 use http_body::{Frame, SizeHint};
 
-use crate::limits::ConcurrencyPermit;
+use crate::limits::{BudgetReservation, ConcurrencyPermit};
 use crate::util;
 
 use super::log::plog;
 use super::prepare::{AuthedClient, auth_error};
 use super::state::AppState;
 
+/// Where `prepare_request` parks a budget reservation for this call.
+#[derive(Clone, Default)]
+pub(super) struct BudgetSlot(Arc<Mutex<Option<BudgetReservation>>>);
+
+impl BudgetSlot {
+    pub(super) fn fill(&self, reservation: BudgetReservation) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(reservation);
+    }
+}
+
 pub(super) async fn admission_middleware(
     State(state): State<AppState>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
     let Some(AuthedClient(client)) = req.extensions().get::<AuthedClient>().cloned() else {
@@ -60,30 +78,47 @@ pub(super) async fn admission_middleware(
             }
         },
     };
+    let budget = client.budget_tokens.map(|_| {
+        let slot = BudgetSlot::default();
+        req.extensions_mut().insert(slot.clone());
+        slot
+    });
     let response = next.run(req).await;
-    match permit {
-        Some(permit) => hold_until_body_done(response, permit),
-        None => response,
+    if permit.is_none() && budget.is_none() {
+        return response;
     }
+    hold_until_body_done(
+        response,
+        Held {
+            _permit: permit,
+            _budget: budget,
+        },
+    )
 }
 
-/// Keep `permit` alive until the response body is finished or dropped.
-fn hold_until_body_done(response: Response, permit: ConcurrencyPermit) -> Response {
+/// Guards released together when the response body is done.
+struct Held {
+    _permit: Option<ConcurrencyPermit>,
+    _budget: Option<BudgetSlot>,
+}
+
+/// Keep `held` alive until the response body is finished or dropped.
+fn hold_until_body_done(response: Response, held: Held) -> Response {
     let (parts, body) = response.into_parts();
     Response::from_parts(
         parts,
         Body::new(GuardedBody {
             inner: body,
-            _permit: permit,
+            _held: held,
         }),
     )
 }
 
-/// A body that owns a guard; dropping the body (completion, client
-/// disconnect, or error) drops the guard.
+/// A body that owns guards; dropping the body (completion, client
+/// disconnect, or error) drops them.
 struct GuardedBody {
     inner: Body,
-    _permit: ConcurrencyPermit,
+    _held: Held,
 }
 
 impl http_body::Body for GuardedBody {
