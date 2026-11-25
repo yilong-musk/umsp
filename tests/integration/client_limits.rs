@@ -228,14 +228,20 @@ async fn budget_charges_real_usage_and_then_refuses() {
     assert_eq!(response.status(), StatusCode::OK);
     body_bytes(response).await;
 
-    // 5 left. Input is never reserved, so an uncapped call is still admitted
-    // and overshoots the budget by its own usage; after that nothing is.
+    // 5 left. An uncapped call reserves the model's default output cap
+    // (128000 here) and does not fit.
     assert_eq!(used_of(&dir), 60);
     let uncapped = post_body(
         json!({"model": "upstream-model", "messages": [{"role": "user", "content": "hi"}]}),
         "normal",
     );
     let response = app.clone().oneshot(uncapped).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    body_bytes(response).await;
+
+    // A cap of 5 fits. Input is never reserved, so the call overshoots the
+    // budget by its own usage; after that nothing is admitted.
+    let response = app.clone().oneshot(capped_chat(5)).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     body_bytes(response).await;
     assert_eq!(used_of(&dir), 90);
@@ -249,19 +255,20 @@ async fn budget_charges_real_usage_and_then_refuses() {
     );
 
     // Refusals are ledger rows with the error code.
-    let rows = wait_records(&dir, 5).await;
+    let rows = wait_records(&dir, 6).await;
     assert!(
         rows.iter()
             .filter(|r| r.error_code.as_deref() == Some("budget_exhausted"))
             .count()
-            >= 2
+            >= 3
     );
 }
 
 #[tokio::test]
 async fn budget_counts_streams_and_charges_the_reservation_without_usage() {
     let dir = temp_dir("limits-budget-stream");
-    let (app, _) = gateway_with_client(&dir, |c| c.budget_tokens = Some(1000)).await;
+    // Uncapped streams reserve the model default (128000), so leave room.
+    let (app, _) = gateway_with_client(&dir, |c| c.budget_tokens = Some(1_000_000)).await;
 
     let response = app.clone().oneshot(stream_request("sse")).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -313,9 +320,30 @@ async fn a_disconnected_stream_is_charged_its_reservation() {
 }
 
 #[tokio::test]
+async fn chat_n_multiplies_the_reservation() {
+    let dir = temp_dir("limits-budget-n");
+    let (app, rec) = gateway_with_client(&dir, |c| c.budget_tokens = Some(65)).await;
+    let request = post_body(
+        json!({
+            "model": "upstream-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 30,
+            "n": 3
+        }),
+        "normal",
+    );
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let value = body_json(response).await;
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(message.contains("up to 90 output tokens"), "{value}");
+    assert!(rec.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn budget_overrides_include_usage_false() {
     let dir = temp_dir("limits-budget-force-usage");
-    let (app, rec) = gateway_with_client(&dir, |c| c.budget_tokens = Some(1000)).await;
+    let (app, rec) = gateway_with_client(&dir, |c| c.budget_tokens = Some(1_000_000)).await;
     for stream_options in [json!({"include_usage": false}), json!("off")] {
         let request = post_body(
             json!({

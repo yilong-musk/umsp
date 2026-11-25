@@ -106,7 +106,7 @@ impl BudgetDenied {
                 requested,
                 available,
             } => format!(
-                "the requested output cap of {requested} tokens exceeds the {available} tokens left in this key's budget; lower max_tokens"
+                "this call may produce up to {requested} output tokens but this key's budget has {available} tokens left; set a lower max_tokens"
             ),
         }
     }

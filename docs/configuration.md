@@ -304,15 +304,18 @@ umsp client update hermes --no-budget               # lift it (forgets consumpti
 - `budget_tokens = N` is a lifetime total of input + output tokens as reported
   by the upstream (the ledger's `prompt_tokens + completion_tokens`). It never
   resets on its own.
-- Before a model call the requested output cap is reserved: `max_tokens` /
-  `max_completion_tokens` (Chat, the larger one), `max_output_tokens`
-  (Responses), `max_tokens` (Messages). A call whose cap does not fit in
-  `budget - used - reserved` is refused with `403 budget_exhausted`
-  (`permission_error` on `/v1/messages`), and so is every call once nothing is
-  left. Output therefore never overruns the budget.
-- Input tokens are not reserved (the gateway has no tokenizer), and a call
-  without a cap reserves nothing: the last admitted call may overshoot the
-  budget by its own usage. After it, the key is refused.
+- Before a model call the output it may produce is reserved: its cap —
+  `max_tokens` / `max_completion_tokens` (Chat, the larger one),
+  `max_output_tokens` (Responses), `max_tokens` (Messages) — times `n` on Chat.
+  A call without a cap reserves the model's `max_completion_tokens` (the
+  upstream applies its own default), and a cap above that is clamped to it.
+  A call whose reservation does not fit in `budget - used - reserved` is
+  refused with `403 budget_exhausted` (`permission_error` on `/v1/messages`),
+  and so is every call once nothing is left. Output therefore never overruns
+  the budget, as long as the model's `max_completion_tokens` is accurate.
+- Input tokens are not reserved (the gateway has no tokenizer): the last
+  admitted call may overshoot the budget by its own input. After it, the key
+  is refused.
 - When a call finishes, its real usage is charged and its reservation released
   (when the response body is done). A call that reached the upstream but has
   no reliable usage — the client disconnected mid-call, or a successful
