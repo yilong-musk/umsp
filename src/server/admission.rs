@@ -29,7 +29,7 @@ use crate::limits::{BudgetReservation, ConcurrencyPermit};
 use crate::util;
 
 use super::log::plog;
-use super::prepare::{AuthedClient, auth_error};
+use super::prepare::{AuthedClient, auth_error, log_gateway_error};
 use super::state::AppState;
 
 /// Where `prepare_request` parks a budget reservation for this call.
@@ -63,6 +63,33 @@ pub(super) async fn admission_middleware(
                     Some(&client.name),
                     None,
                     Some("concurrency_limit"),
+                );
+                // A ledger row, like every other refusal of a model call. The
+                // body is not read here, so the requested model is unknown.
+                let protocol = match req.uri().path() {
+                    "/v1/responses" => "responses",
+                    "/v1/messages" => "messages",
+                    _ => "chat",
+                };
+                let bytes_in = req
+                    .headers()
+                    .get(axum::http::header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0);
+                log_gateway_error(
+                    &state,
+                    &state.cfg(),
+                    &request_id,
+                    &client.name,
+                    protocol,
+                    "",
+                    "",
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "concurrency_limit",
+                    bytes_in,
+                    0,
+                    false,
                 );
                 let message = format!(
                     "this key allows {limit} concurrent request(s) and all are in use; retry when one finishes"

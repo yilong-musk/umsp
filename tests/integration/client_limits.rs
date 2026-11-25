@@ -122,6 +122,16 @@ async fn concurrency_limit_rejects_the_second_buffered_call() {
     // The slot is free again.
     let response = app.oneshot(chat_request("normal")).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+
+    // The refusal is a ledger row of its own.
+    let rows = wait_records(&dir, 3).await;
+    let refused: Vec<_> = rows
+        .iter()
+        .filter(|r| r.error_code.as_deref() == Some("concurrency_limit"))
+        .collect();
+    assert_eq!(refused.len(), 1, "{rows:?}");
+    assert_eq!(refused[0].status, 429);
+    assert_eq!(refused[0].protocol, "chat");
 }
 
 #[tokio::test]

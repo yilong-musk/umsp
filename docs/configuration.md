@@ -284,7 +284,9 @@ umsp client update hermes --no-concurrency-limit
 - `max_concurrency = N` caps the model calls (`/v1/chat/completions`,
   `/v1/responses`, `/v1/messages`) a key may have in flight. A call over the
   cap is rejected at once with `429 concurrency_limit` and `Retry-After: 1`
-  (`rate_limit_error` on `/v1/messages`); nothing is queued.
+  (`rate_limit_error` on `/v1/messages`); nothing is queued. Each refusal is
+  a ledger row with `error_code = "concurrency_limit"` (no model: the body is
+  not read).
 - A slot is held until the response body is fully sent or the client
   disconnects, so a stream occupies its slot for its whole life.
 - `/v1/models` and `/v1/messages/count_tokens` are exempt: agents call them
