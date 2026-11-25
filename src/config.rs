@@ -266,6 +266,9 @@ pub struct Client {
     /// RFC3339 instant from which the key is rejected. Absent: never expires.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
+    /// Model calls this client may have in flight at once. Absent: unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<u32>,
 }
 
 impl Client {
@@ -698,6 +701,17 @@ impl Config {
                     ));
                 }
             }
+            if let Some(limit) = c.max_concurrency {
+                if !crate::limits::MAX_CONCURRENCY_RANGE.contains(&limit) {
+                    issues.push(err(
+                        "client_max_concurrency",
+                        format!(
+                            "client '{}' max_concurrency must be between 1 and 9, got {limit}",
+                            c.name
+                        ),
+                    ));
+                }
+            }
         }
 
         if self.providers.is_empty() {
@@ -1009,6 +1023,27 @@ mod tests {
         cfg.clients[0].expires_at = Some("tomorrow".into());
         assert!(cfg.clients[0].is_expired(now), "malformed must fail closed");
         assert!(cfg.validate().iter().any(|i| i.code == "client_expires_at"));
+    }
+
+    #[test]
+    fn client_max_concurrency_must_be_1_to_9() {
+        let mut cfg = base_config();
+        for ok in [1, 9] {
+            cfg.clients[0].max_concurrency = Some(ok);
+            assert!(
+                cfg.validate()
+                    .iter()
+                    .all(|i| i.code != "client_max_concurrency")
+            );
+        }
+        for bad in [0, 10] {
+            cfg.clients[0].max_concurrency = Some(bad);
+            assert!(
+                cfg.validate()
+                    .iter()
+                    .any(|i| i.code == "client_max_concurrency")
+            );
+        }
     }
 
     #[test]

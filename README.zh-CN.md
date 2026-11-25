@@ -78,6 +78,7 @@ curl -s http://127.0.0.1:3460/v1/chat/completions \
 每把 key 可带可选限额，不设即不限。在 `umsp client add` 时设置，之后用 `umsp client update <名字>` 修改：
 
 - `--expires-in 30d`：到期后请求被拒绝，返回 `401 key_expired`（`update` 用 `--no-expiry` 取消过期）。
+- `--max-concurrency 1`：同时进行的模型调用最多 N 个（1-9），超出返回 `429 concurrency_limit`（`--no-concurrency-limit` 取消限制）。
 
 详见 [docs/configuration.md](docs/configuration.md#client-limits)。
 

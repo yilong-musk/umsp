@@ -91,6 +91,8 @@ struct Inner {
     catalog_refreshed_at: Mutex<Option<Instant>>,
     metrics: Metrics,
     sessions: SessionStore,
+    /// Per-client in-flight model calls; process-local, survives reloads.
+    concurrency: Arc<crate::limits::ConcurrencyLimiter>,
 }
 
 impl Clone for AppState {
@@ -152,8 +154,13 @@ impl AppState {
                 catalog_refreshed_at: Mutex::new(None),
                 metrics: Metrics::new(),
                 sessions,
+                concurrency: Arc::default(),
             }),
         })
+    }
+
+    pub(super) fn concurrency(&self) -> &Arc<crate::limits::ConcurrencyLimiter> {
+        &self.inner.concurrency
     }
 
     pub(super) fn runtime(&self) -> Arc<Runtime> {

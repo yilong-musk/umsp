@@ -92,6 +92,8 @@ Each key can carry optional limits; unset means unlimited. Set them on
 
 - `--expires-in 30d` — the key is rejected with `401 key_expired` after that
   (`--no-expiry` on `update` removes it).
+- `--max-concurrency 1` — at most N (1-9) model calls in flight; more get
+  `429 concurrency_limit` (`--no-concurrency-limit` removes it).
 
 Details: [docs/configuration.md](docs/configuration.md#client-limits).
 

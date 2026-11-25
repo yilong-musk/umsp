@@ -935,7 +935,7 @@ fn client_list(path: &Path, json: bool) -> Result<i32> {
                 "bound_ip": bindings.bound_ip(&c.name),
                 "allowed_models": if c.allowed_models.is_empty() { vec!["*".to_string()] } else { c.allowed_models.clone() },
                 "allowed_protocols": c.allowed_protocols,
-                "expires_at": c.expires_at,
+                "limits": client_limits_json(c),
                 "expired": c.is_expired(now),
             })
         })
@@ -946,17 +946,23 @@ fn client_list(path: &Path, json: bool) -> Result<i32> {
         println!("no clients configured");
     } else {
         for row in &rows {
-            let expires = match row["expires_at"].as_str() {
+            let limits = &row["limits"];
+            let expires = match limits["expires_at"].as_str() {
                 None => "never".to_string(),
                 Some(at) if row["expired"] == true => format!("{at}(expired)"),
                 Some(at) => at.to_string(),
             };
+            let concurrency = limits["max_concurrency"]
+                .as_u64()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "-".to_string());
             println!(
-                "{:<16} {:<20} bound:{:<16} expires:{:<22} models:{:<24} protocols:{}",
+                "{:<16} {:<20} bound:{:<16} expires:{:<22} conc:{:<2} models:{:<24} protocols:{}",
                 row["name"].as_str().unwrap_or("-"),
                 row["key_prefix"].as_str().unwrap_or("-"),
                 row["bound_ip"].as_str().unwrap_or("-"),
                 expires,
+                concurrency,
                 row["allowed_models"]
                     .as_array()
                     .map(|a| a
@@ -1030,9 +1036,16 @@ fn client_add(path: &Path, args: ClientAddArgs, json: bool, no_reload: bool) -> 
     if let Some(at) = &expires_at {
         table.insert("expires_at", config_edit::str_item(at));
     }
+    if let Some(limit) = args.max_concurrency {
+        table.insert("max_concurrency", config_edit::int_item(limit.into()));
+    }
     doc.ensure_table("clients").push(table);
     doc.save()?;
-    after_edit(path, no_reload)?;
+    let cfg = after_edit(path, no_reload)?;
+    let limits = cfg
+        .client(&args.name)
+        .map(client_limits_json)
+        .unwrap_or(Value::Null);
 
     let value = json!({
         "client": {
@@ -1041,16 +1054,13 @@ fn client_add(path: &Path, args: ClientAddArgs, json: bool, no_reload: bool) -> 
             "key_prefix": prefix,
             "allowed_models": models,
             "allowed_protocols": protocols,
-            "expires_at": expires_at,
+            "limits": limits,
         }
     });
     if json {
         crate::commands::emit_json(crate::server::success_json(value));
     } else {
-        println!("client {} created", args.name);
-        if let Some(at) = &expires_at {
-            println!("expires at {at}");
-        }
+        println!("client {} created ({})", args.name, limits_summary(&limits));
         println!("key (shown once, store it now): {plaintext}");
     }
     Ok(0)
@@ -1064,53 +1074,86 @@ fn client_update(path: &Path, args: ClientUpdateArgs, json: bool, no_reload: boo
             args.name
         )));
     }
-    if args.expires_in.is_none() && !args.no_expiry {
+
+    // (field, new value); `None` removes the field, i.e. lifts the limit.
+    let mut changes: Vec<(&str, Option<toml_edit::Item>)> = Vec::new();
+    if let Some(raw) = args.expires_in.as_deref() {
+        let at = util::expiry_from_now(raw)?;
+        changes.push(("expires_at", Some(config_edit::str_item(&at))));
+    } else if args.no_expiry {
+        changes.push(("expires_at", None));
+    }
+    if let Some(limit) = args.max_concurrency {
+        changes.push(("max_concurrency", Some(config_edit::int_item(limit.into()))));
+    } else if args.no_concurrency_limit {
+        changes.push(("max_concurrency", None));
+    }
+    if changes.is_empty() {
         return Err(UmspError::usage(
-            "nothing to update; pass --expires-in or --no-expiry",
+            "nothing to update; pass at least one limit flag (see `umsp client update --help`)",
         ));
     }
-    let expires_at = args
-        .expires_in
-        .as_deref()
-        .map(util::expiry_from_now)
-        .transpose()?;
 
     let mut doc = ConfigDoc::load(path)?;
-    let updated = match &expires_at {
-        Some(at) => config_edit::set_field_in_table_array(
-            &mut doc.doc,
-            "clients",
-            "name",
-            &args.name,
-            "expires_at",
-            config_edit::str_item(at),
-        ),
-        None => config_edit::remove_field_in_table_array(
-            &mut doc.doc,
-            "clients",
-            "name",
-            &args.name,
-            "expires_at",
-        ),
-    };
-    if !updated {
-        return Err(UmspError::other(
-            "UPDATE",
-            "client entry could not be updated",
-        ));
+    for (field, value) in changes {
+        let updated = match value {
+            Some(item) => config_edit::set_field_in_table_array(
+                &mut doc.doc,
+                "clients",
+                "name",
+                &args.name,
+                field,
+                item,
+            ),
+            None => config_edit::remove_field_in_table_array(
+                &mut doc.doc,
+                "clients",
+                "name",
+                &args.name,
+                field,
+            ),
+        };
+        if !updated {
+            return Err(UmspError::other(
+                "UPDATE",
+                "client entry could not be updated",
+            ));
+        }
     }
     doc.save()?;
-    after_edit(path, no_reload)?;
-
-    let name = args.name;
+    let cfg = after_edit(path, no_reload)?;
+    let client = cfg
+        .client(&args.name)
+        .ok_or_else(|| UmspError::other("UPDATE", "client entry vanished after update"))?;
+    let limits = client_limits_json(client);
     crate::commands::emit(
         json,
-        json!({"client": {"name": name, "expires_at": expires_at}}),
-        || match &expires_at {
-            Some(at) => format!("client {name} now expires at {at}"),
-            None => format!("client {name} never expires"),
+        json!({"client": {"name": client.name, "limits": limits}}),
+        || {
+            format!(
+                "updated client {}: {}",
+                client.name,
+                limits_summary(&limits)
+            )
         },
     )
+}
+
+/// The optional per-client limits, `null` where unlimited.
+fn client_limits_json(client: &crate::config::Client) -> Value {
+    json!({
+        "expires_at": client.expires_at,
+        "max_concurrency": client.max_concurrency,
+    })
+}
+
+fn limits_summary(limits: &Value) -> String {
+    let expires = limits["expires_at"].as_str().unwrap_or("never");
+    let concurrency = limits["max_concurrency"]
+        .as_u64()
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "unlimited".to_string());
+    format!("expires {expires}, concurrency {concurrency}")
 }
 
 fn client_remove(path: &Path, name: &str, json: bool, no_reload: bool) -> Result<i32> {

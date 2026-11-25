@@ -323,6 +323,9 @@ pub struct ClientAddArgs {
     /// Key lifetime counted from now: 90m, 12h, 30d, 2w (default: never expires)
     #[arg(long, value_name = "DURATION")]
     pub expires_in: Option<String>,
+    /// Model calls allowed in flight at once, 1-9 (default: unlimited)
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=9))]
+    pub max_concurrency: Option<u32>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -334,6 +337,17 @@ pub struct ClientUpdateArgs {
     /// Remove the expiry; the key never expires
     #[arg(long)]
     pub no_expiry: bool,
+    /// Model calls allowed in flight at once, 1-9
+    #[arg(
+        long,
+        value_name = "N",
+        value_parser = clap::value_parser!(u32).range(1..=9),
+        conflicts_with = "no_concurrency_limit"
+    )]
+    pub max_concurrency: Option<u32>,
+    /// Remove the concurrency limit
+    #[arg(long)]
+    pub no_concurrency_limit: bool,
 }
 
 #[derive(Debug, Subcommand)]

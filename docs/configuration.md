@@ -173,6 +173,7 @@ key_prefix = "umsp_ab12cd34"
 allowed_models = ["deepseek-*", "claude-*"]   # glob, empty = *
 allowed_protocols = ["chat", "responses"]  # chat / responses / messages
 expires_at = "2026-12-25T02:00:00Z"        # optional; see "Client limits"
+max_concurrency = 1                        # optional, 1-9
 ```
 
 Conventions:
@@ -270,3 +271,22 @@ umsp client update hermes --no-expiry             # never expires
 - A malformed `expires_at` fails `umsp check` and is treated as expired at
   runtime (fail closed).
 - `umsp client rotate` keeps the expiry; `umsp client list` shows it.
+
+### Concurrency
+
+```bash
+umsp client add --name hermes --max-concurrency 1   # 1-9
+umsp client update hermes --max-concurrency 2
+umsp client update hermes --no-concurrency-limit
+```
+
+- `max_concurrency = N` caps the model calls (`/v1/chat/completions`,
+  `/v1/responses`, `/v1/messages`) a key may have in flight. A call over the
+  cap is rejected at once with `429 concurrency_limit` and `Retry-After: 1`
+  (`rate_limit_error` on `/v1/messages`); nothing is queued.
+- A slot is held until the response body is fully sent or the client
+  disconnects, so a stream occupies its slot for its whole life.
+- `/v1/models` and `/v1/messages/count_tokens` are exempt: agents call them
+  next to a running stream.
+- Counts are in memory: a restart starts from zero, and a reload applies the
+  new cap to the next admission without cutting running calls.
