@@ -24,7 +24,11 @@ install -m 755 scripts/deploy-host.sh "${stage}/umsp-deploy"
 tar -C dist -czf "dist/${name}.tar.gz" "${name}"
 (
   cd dist
-  sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
+  else
+    shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256"
+  fi
 )
 
 echo "archive: dist/${name}.tar.gz"

@@ -6,7 +6,8 @@ DIST    := dist/umsp-$(VERSION)-x86_64-unknown-linux-musl
 
 .PHONY: all check fmt clippy test lang build install clean
 
-all: check build
+all: check
+	SKIP_CHECKS=1 ./scripts/build-musl.sh
 
 check: fmt clippy test lang
 
@@ -27,7 +28,8 @@ build:
 	./scripts/build-musl.sh
 
 install: build
-	install -Dm755 $(DIST)/$(BIN) $(PREFIX)/bin/$(BIN)
+	install -d $(PREFIX)/bin
+	install -m 755 $(DIST)/$(BIN) $(PREFIX)/bin/$(BIN)
 
 clean:
 	$(CARGO) clean

@@ -184,7 +184,7 @@ pub(super) async fn proxy_stream(
         },
         &candidates,
         |_, _| {},
-        |target, attempt_body, attempt_headers, is_probe| {
+        |target, attempt_body, attempt_headers, probe_gen| {
             let state = &state;
             let up = &up;
             let query = &query;
@@ -238,8 +238,8 @@ pub(super) async fn proxy_stream(
                         // would reset the failure window, so a provider that
                         // always dies mid-stream could never trip the circuit.
                         // A half-open probe still closes on the headers.
-                        if stream.status >= 400 || is_probe {
-                            note_circuit_result(state, &target, stream.status, is_probe);
+                        if stream.status >= 400 || probe_gen.is_some() {
+                            note_circuit_result(state, &target, stream.status, probe_gen);
                         }
                         AttemptResult::Stream(stream)
                     }

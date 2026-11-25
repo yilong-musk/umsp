@@ -17,7 +17,7 @@ pub fn run(path: &Path, cmd: UsageCmd, json: bool) -> Result<i32> {
         UsageCmd::ByClient(args) => grouped(&store, args, GroupBy::Client, json),
         UsageCmd::ByModel(args) => grouped(&store, args, GroupBy::Model, json),
         UsageCmd::ByProtocol(args) => grouped(&store, args, GroupBy::Protocol, json),
-        UsageCmd::Prune(args) => prune(&store, args, json),
+        UsageCmd::Prune(args) => prune(&store, args, cfg.server.log_retention_days, json),
     }
 }
 
@@ -171,18 +171,22 @@ fn grouped(store: &LogStore, args: UsageFilterArgs, by: GroupBy, json: bool) -> 
     Ok(0)
 }
 
-fn prune_cutoff(args: &PruneArgs) -> Result<chrono::DateTime<chrono::Utc>> {
-    // `--days N` is the same cutoff as `--before Nd`. Only whole files with a
+fn prune_cutoff(args: &PruneArgs, default_days: u32) -> Result<chrono::DateTime<chrono::Utc>> {
+    // `--days N` is the same cutoff as `--before Nd`. When neither is passed,
+    // `server.log_retention_days` provides the default. Only whole files with a
     // date stem strictly older than the cutoff date are removed, so today's
     // ledger is never touched.
-    match args.days {
-        Some(days) => Ok(chrono::Utc::now() - chrono::TimeDelta::days(i64::from(days))),
-        None => util::parse_since(&args.before),
+    if let Some(days) = args.days {
+        return Ok(chrono::Utc::now() - chrono::TimeDelta::days(i64::from(days)));
     }
+    if let Some(before) = &args.before {
+        return util::parse_since(before);
+    }
+    Ok(chrono::Utc::now() - chrono::TimeDelta::days(i64::from(default_days)))
 }
 
-fn prune(store: &LogStore, args: PruneArgs, json: bool) -> Result<i32> {
-    let cutoff = prune_cutoff(&args)?;
+fn prune(store: &LogStore, args: PruneArgs, default_days: u32, json: bool) -> Result<i32> {
+    let cutoff = prune_cutoff(&args, default_days)?;
     let removed = store
         .prune_before(cutoff)
         .map_err(|e| crate::error::UmspError::other("PRUNE", format!("prune failed: {e}")))?;
@@ -192,10 +196,13 @@ fn prune(store: &LogStore, args: PruneArgs, json: bool) -> Result<i32> {
     } else {
         removed.iter().map(|p| p.display().to_string()).collect()
     };
+    let keep_days = args
+        .days
+        .or_else(|| args.before.is_none().then_some(default_days));
     let value = json!({
         "ok": true,
         "before": cutoff.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        "keep_days": args.days,
+        "keep_days": keep_days,
         "removed": paths,
         "removed_count": paths.len(),
     });
@@ -349,10 +356,13 @@ mod tests {
         std::fs::write(store.dir().join(format!("{today}.jsonl")), "{}\n").unwrap();
         std::fs::write(store.dir().join(format!("{ancient}.jsonl")), "{}\n").unwrap();
 
-        let cutoff = prune_cutoff(&PruneArgs {
-            before: "30d".into(),
-            days: Some(30),
-        })
+        let cutoff = prune_cutoff(
+            &PruneArgs {
+                before: None,
+                days: Some(30),
+            },
+            30,
+        )
         .unwrap();
         let removed = store.prune_before(cutoff).unwrap();
         assert_eq!(removed.len(), 1, "only the 40-day-old file goes");
@@ -365,17 +375,48 @@ mod tests {
 
     #[test]
     fn prune_cutoff_accepts_before_and_days() {
-        let by_days = prune_cutoff(&PruneArgs {
-            before: "30d".into(),
-            days: Some(7),
-        })
+        let by_days = prune_cutoff(
+            &PruneArgs {
+                before: None,
+                days: Some(7),
+            },
+            30,
+        )
         .unwrap();
-        let by_before = prune_cutoff(&PruneArgs {
-            before: "7d".into(),
-            days: None,
-        })
+        let by_before = prune_cutoff(
+            &PruneArgs {
+                before: Some("7d".into()),
+                days: None,
+            },
+            30,
+        )
         .unwrap();
         let delta = (by_days - by_before).num_seconds().abs();
         assert!(delta < 5, "7 days either way, got {delta}s apart");
+    }
+
+    #[test]
+    fn prune_cutoff_falls_back_to_configured_log_retention_days() {
+        let from_config = prune_cutoff(
+            &PruneArgs {
+                before: None,
+                days: None,
+            },
+            14,
+        )
+        .unwrap();
+        let explicit = prune_cutoff(
+            &PruneArgs {
+                before: None,
+                days: Some(14),
+            },
+            30,
+        )
+        .unwrap();
+        let delta = (from_config - explicit).num_seconds().abs();
+        assert!(
+            delta < 5,
+            "default must honor config retention, got {delta}s"
+        );
     }
 }

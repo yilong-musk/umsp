@@ -363,9 +363,10 @@ pub(super) async fn health_tick_provider(
         return updated_grok_user_id;
     };
 
-    let Some(_probe_guard) = circuits.take_probe(&provider.id) else {
+    let Some(probe_guard) = circuits.take_probe(&provider.id) else {
         return updated_grok_user_id;
     };
+    let probe_gen = probe_guard.generation();
     let target = AttemptTarget {
         model,
         provider: provider.clone(),
@@ -387,7 +388,10 @@ pub(super) async fn health_tick_provider(
             if outcome.status < 400 || !upstream::status_is_retryable(outcome.status) {
                 // A client error still proves the provider is reachable
                 // and the key works: close, don't count it.
-                if circuits.close(&target.provider.id) {
+                if circuits
+                    .record_probe_success(&target.provider.id, probe_gen)
+                    .is_some()
+                {
                     plog_health(
                         "circuit_close",
                         &target.provider.id,
@@ -396,7 +400,7 @@ pub(super) async fn health_tick_provider(
                     );
                 }
             } else {
-                note_circuit_result(&state, &target, outcome.status, true);
+                note_circuit_result(&state, &target, outcome.status, Some(probe_gen));
             }
         }
         Err(err) => {

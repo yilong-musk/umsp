@@ -78,6 +78,14 @@ pub struct ProbeGuard {
     generation: u64,
 }
 
+impl ProbeGuard {
+    /// Generation of this probe grant. Pass to [`CircuitBreaker::record_probe_success`]
+    /// so a stale or non-probe response cannot close an unrelated open circuit.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
 impl std::fmt::Debug for ProbeGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProbeGuard")
@@ -304,20 +312,48 @@ impl CircuitBreaker {
         granted.map(|generation| self.probe_guard(provider, generation))
     }
 
-    /// Record a successful attempt. Returns the previous state when this closed
-    /// a circuit (callers log `circuit_close`).
+    /// Record a successful non-probe attempt.
+    ///
+    /// Resets the sliding failure counter when the circuit is `closed`. Late
+    /// responses from requests admitted before the circuit opened are ignored
+    /// so they cannot prematurely close an `open` or `half_open` circuit.
     pub fn record_success(&self, provider: &str) -> Option<CircuitState> {
         self.with(provider, |circuit| {
-            let previous = circuit.state;
-            circuit.state = CircuitState::Closed;
-            circuit.failures = 0;
-            circuit.window_start = None;
-            circuit.opened_at = None;
-            circuit.opened_at_wall = None;
-            circuit.open_for = Duration::ZERO;
-            circuit.reason = None;
-            circuit.clear_probe();
-            (previous != CircuitState::Closed).then_some(previous)
+            if circuit.state == CircuitState::Closed {
+                circuit.failures = 0;
+                circuit.window_start = None;
+            }
+            None
+        })
+    }
+
+    /// Record a successful half-open probe for the holder of `generation`.
+    ///
+    /// Closes the circuit only when it is `half_open` and `generation` still
+    /// matches the active probe slot (preventing a stale probe whose slot was
+    /// reclaimed after the backstop from closing a newer cycle). Returns
+    /// `Some(CircuitState::HalfOpen)` when this closed the circuit.
+    pub fn record_probe_success(&self, provider: &str, generation: u64) -> Option<CircuitState> {
+        self.with(provider, |circuit| match circuit.state {
+            CircuitState::Closed => {
+                circuit.failures = 0;
+                circuit.window_start = None;
+                None
+            }
+            CircuitState::HalfOpen
+                if circuit.probe_in_flight && circuit.probe_generation == generation =>
+            {
+                circuit.state = CircuitState::Closed;
+                circuit.failures = 0;
+                circuit.window_start = None;
+                circuit.opened_at = None;
+                circuit.opened_at_wall = None;
+                circuit.open_for = Duration::ZERO;
+                circuit.reason = None;
+                circuit.clear_probe();
+                Some(CircuitState::HalfOpen)
+            }
+            CircuitState::Open | CircuitState::HalfOpen => None,
         })
     }
 
@@ -458,10 +494,57 @@ mod tests {
         let guard = probe(&breaker, "od").expect("probe granted");
         // The probe slot is taken: a second concurrent request must not pass.
         assert!(matches!(breaker.admit("od"), Admission::Reject));
-        assert_eq!(breaker.record_success("od"), Some(CircuitState::HalfOpen));
+        assert_eq!(
+            breaker.record_probe_success("od", guard.generation()),
+            Some(CircuitState::HalfOpen)
+        );
         drop(guard);
         assert_eq!(breaker.view("od").state, CircuitState::Closed);
         assert!(matches!(breaker.admit("od"), Admission::Allow));
+    }
+
+    #[tokio::test]
+    async fn late_non_probe_success_cannot_close_open_or_half_open_circuit() {
+        let breaker = CircuitBreaker::new(fast());
+        breaker.force_open("od", "http_500", Duration::from_millis(60));
+        // A slow request admitted before the circuit opened finishes late.
+        assert_eq!(breaker.record_success("od"), None);
+        assert_eq!(breaker.view("od").state, CircuitState::Open);
+
+        // Once cooldown elapses and a probe is running, a late non-probe
+        // success still must not close the circuit out from under the probe.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let guard = probe(&breaker, "od").expect("probe granted");
+        assert_eq!(breaker.record_success("od"), None);
+        assert_eq!(breaker.view("od").state, CircuitState::HalfOpen);
+        assert_eq!(
+            breaker.record_probe_success("od", guard.generation()),
+            Some(CircuitState::HalfOpen)
+        );
+        assert_eq!(breaker.view("od").state, CircuitState::Closed);
+    }
+
+    #[tokio::test]
+    async fn stale_probe_success_cannot_close_reclaimed_probe() {
+        let cfg = CircuitConfig {
+            probe_stale_after: Duration::from_millis(20),
+            ..fast()
+        };
+        let breaker = CircuitBreaker::new(cfg);
+        breaker.force_open("od", "http_500", Duration::from_millis(40));
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let old = probe(&breaker, "od").expect("first probe");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let new = probe(&breaker, "od").expect("reclaimed probe");
+        // The older probe finishing late carries an outdated generation.
+        assert_eq!(breaker.record_probe_success("od", old.generation()), None);
+        assert_eq!(breaker.view("od").state, CircuitState::HalfOpen);
+        // The current probe's generation still closes the circuit.
+        assert_eq!(
+            breaker.record_probe_success("od", new.generation()),
+            Some(CircuitState::HalfOpen)
+        );
+        assert_eq!(breaker.view("od").state, CircuitState::Closed);
     }
 
     #[tokio::test]
