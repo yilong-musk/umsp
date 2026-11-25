@@ -434,3 +434,66 @@ async fn od_count_tokens_never_reaches_the_upstream() {
         "OD count_tokens must not be forwarded"
     );
 }
+
+#[tokio::test]
+async fn responses_translated_to_deepseek_chat_applies_chat_quirks() {
+    let dir = temp_dir("ds-translated-quirks");
+    let (upstream, rec) = start_upstream().await;
+    let mut cfg = config(&dir, upstream.clone(), 52_428_800);
+    add_deepseek(&mut cfg, &upstream);
+    // Restrict DeepSeek to `chat` only so a `/v1/responses` call forces
+    // translation (`responses -> chat`), after which DeepSeek Chat quirks must
+    // still run on the translated body.
+    cfg.providers
+        .iter_mut()
+        .find(|p| p.id == "deepseek")
+        .expect("deepseek provider")
+        .protocols = vec!["chat".to_string()];
+    let state = umsp::server::AppState::new(cfg, env_file(&dir)).unwrap();
+    let app = umsp::server::build_router(state);
+
+    let body = json!({
+        "model": "deepseek-flash",
+        "input": [
+            {"type": "message", "role": "user", "content": "run f"},
+            {"type": "function_call", "call_id": "call_1", "name": "f", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
+        ],
+        "tools": [{"type": "function", "name": "f", "parameters": {"type": "object"}}]
+    });
+    let response = app
+        .oneshot(post_to("/v1/responses", body, "normal"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = rec.last();
+    assert_eq!(seen["model"], "deepseek-flash");
+    // Post-translation DeepSeek quirks: user_id injected and assistant turn
+    // with tools gets a non-empty reasoning_content placeholder.
+    let user_id = seen["user_id"]
+        .as_str()
+        .expect("user_id must be injected after translation");
+    assert!(user_id.starts_with("umsp-"), "got {user_id}");
+    assert_eq!(seen["messages"][1]["role"], "assistant");
+    assert_eq!(seen["messages"][1]["reasoning_content"], " ");
+
+    let record = wait_until(
+        &dir,
+        |r| r.protocol == "responses",
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    .expect("translated responses ledger row");
+    assert!(
+        record
+            .quirks
+            .contains(&"translated:responses->chat".to_string())
+    );
+    assert!(record.quirks.contains(&"injected_user_id".to_string()));
+    assert!(
+        record
+            .quirks
+            .contains(&"filled_reasoning_placeholder".to_string())
+    );
+}

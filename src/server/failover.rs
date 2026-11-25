@@ -4,9 +4,9 @@ use std::future::Future;
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
 
+use crate::adapter::{self, PaymentFailurePolicy};
 use crate::circuit::Admission;
 use crate::config::{Config, Model, Provider};
-use crate::quirks;
 use crate::route::PinDrop;
 use crate::upstream;
 use crate::usage::RequestRecord;
@@ -144,7 +144,8 @@ pub(super) fn attempt_candidates(
 }
 
 /// Body for one attempt. Passthrough keeps the client JSON and only rewrites
-/// `model` plus provider quirks. A protocol mismatch is translated first.
+/// `model` plus provider adapter patches. A protocol mismatch is translated
+/// first, then runs through the same adapter patch hook.
 pub(super) fn prepare_attempt(
     base: &Value,
     target: &AttemptTarget,
@@ -175,27 +176,11 @@ pub(super) fn prepare_attempt(
     if let Some(obj) = body.as_object_mut() {
         obj.insert("model".to_string(), Value::String(target.upstream.clone()));
     }
-    if target.upstream_protocol == "chat" {
-        match target.provider.quirks.as_deref() {
-            Some("opendesign") => notes.extend(quirks::apply_request_quirks(&mut body)),
-            Some("deepseek") => {
-                notes.extend(quirks::apply_deepseek_request_quirks(
-                    &mut body,
-                    client_name,
-                ));
-            }
-            _ => {}
-        }
-    }
-    if target.provider.vendor.as_deref() == Some("chatgpt")
-        && target.upstream_protocol == "responses"
-    {
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert("store".to_string(), Value::Bool(false));
-            obj.insert("stream".to_string(), Value::Bool(true));
-            notes.push("chatgpt_plan_stream".to_string());
-        }
-    }
+    notes.extend(adapter::for_provider(&target.provider).patch_request(
+        &mut body,
+        &target.upstream_protocol,
+        client_name,
+    ));
     Ok((body, notes))
 }
 
@@ -235,7 +220,7 @@ pub(super) fn headers_for_attempt(
 }
 
 /// Body for one attempt: `model` is rewritten to the backend's upstream id and
-/// the target provider's request quirks are applied. Returns the applied quirk
+/// the target provider's adapter patches are applied. Returns the applied quirk
 /// tags for the ledger.
 pub(super) fn attempt_payload(
     base: &Value,
@@ -247,26 +232,10 @@ pub(super) fn attempt_payload(
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("model".to_string(), Value::String(target.upstream.clone()));
     }
-    let mut applied = Vec::new();
     // Quirks are provider behaviour, so they run per attempt: two backends of
     // the same model may need different patches.
-    if protocol == "chat" {
-        match target.provider.quirks.as_deref() {
-            Some("opendesign") => applied.extend(quirks::apply_request_quirks(&mut payload)),
-            Some("deepseek") => applied.extend(quirks::apply_deepseek_request_quirks(
-                &mut payload,
-                client_name,
-            )),
-            _ => {}
-        }
-    }
-    if target.provider.vendor.as_deref() == Some("chatgpt") && protocol == "responses" {
-        if let Some(obj) = payload.as_object_mut() {
-            obj.insert("store".to_string(), Value::Bool(false));
-            obj.insert("stream".to_string(), Value::Bool(true));
-            applied.push("chatgpt_plan_stream".to_string());
-        }
-    }
+    let applied =
+        adapter::for_provider(&target.provider).patch_request(&mut payload, protocol, client_name);
     (payload, applied)
 }
 
@@ -311,11 +280,13 @@ pub(super) fn note_circuit_result(
             }
         }
         402 => {
-            let deepseek = target.provider.quirks.as_deref() == Some("deepseek");
-            let (reason, cooldown) = if deepseek {
-                ("insufficient_balance", config.ds_balance_cooldown)
-            } else {
-                ("payment_required", config.auth_cooldown)
+            let (reason, cooldown) = match adapter::for_provider(&target.provider)
+                .payment_failure_policy()
+            {
+                PaymentFailurePolicy::InsufficientBalance => {
+                    ("insufficient_balance", config.ds_balance_cooldown)
+                }
+                PaymentFailurePolicy::PaymentRequired => ("payment_required", config.auth_cooldown),
             };
             if circuits.force_open(&target.provider.id, reason, cooldown) {
                 plog_health(
