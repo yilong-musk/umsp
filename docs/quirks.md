@@ -16,6 +16,7 @@ This file records the behavior of OpenDesign (provider id `open-design`, called 
 | non-boolean `stream` (`"yes"`/`1`/`null`) | request | normalized to `false` before forwarding (OD originally returned 400 `invalid_request_error` outright) | Implemented in M1 |
 | upstream stream ends without sending `[DONE]` | streaming | append one `data: [DONE]`; not repeated if already sent | Implemented in M1 |
 | client sets `stream_options.include_usage: false` | streaming | not injected; OD may still return usage on its own, ledger it if present, record `usage_missing` if not | Implemented in M1 |
+| client with a token budget sets `stream_options.include_usage: false` | streaming | overridden to `true` so the budget can be charged; ledger records `forced_include_usage` | Implemented |
 
 ## Chat Completions (official DeepSeek)
 

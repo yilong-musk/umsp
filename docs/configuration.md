@@ -316,6 +316,9 @@ umsp client update hermes --no-budget               # lift it (forgets consumpti
 - When a call finishes, its real usage is charged and its reservation released
   (when the response body is done). A call whose upstream reported no usage is
   not charged. `count_tokens` is free.
+- A budgeted client cannot switch the usage report off: on a Chat stream an
+  explicit `stream_options.include_usage: false` is overridden to `true`
+  (ledger quirk `forced_include_usage`).
 - Consumption is tracked only while a budget is set, starting at zero, and
   persists in `state_dir/client-usage.json` (mode 0600). `umsp client list`
   shows `used/budget`. `remove` and `--no-budget` forget it; `rotate` keeps it.

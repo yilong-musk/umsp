@@ -287,6 +287,33 @@ async fn budget_counts_streams_and_skips_calls_without_usage() {
 }
 
 #[tokio::test]
+async fn budget_overrides_include_usage_false() {
+    let dir = temp_dir("limits-budget-force-usage");
+    let (app, rec) = gateway_with_client(&dir, |c| c.budget_tokens = Some(1000)).await;
+    for stream_options in [json!({"include_usage": false}), json!("off")] {
+        let request = post_body(
+            json!({
+                "model": "upstream-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": true,
+                "stream_options": stream_options
+            }),
+            "sse",
+        );
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        body_bytes(response).await;
+        assert_eq!(rec.last()["stream_options"]["include_usage"], true);
+    }
+    let rows = wait_records(&dir, 2).await;
+    assert!(
+        rows.iter()
+            .all(|r| r.quirks.iter().any(|q| q == "forced_include_usage")),
+        "{rows:?}"
+    );
+}
+
+#[tokio::test]
 async fn budget_refusal_uses_the_messages_error_shape() {
     let dir = temp_dir("limits-budget-messages");
     let (app, _) = gateway_with_client(&dir, |c| c.budget_tokens = Some(10)).await;
