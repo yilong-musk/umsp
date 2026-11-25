@@ -20,7 +20,6 @@ install -m 755 "$binary" "${stage}/umsp"
 install -m 644 config.example.toml "${stage}/config.example.toml"
 install -m 644 deploy/umsp.service "${stage}/umsp.service"
 install -m 644 README.md "${stage}/README.md"
-install -m 755 scripts/deploy-host.sh "${stage}/umsp-deploy"
 tar -C dist -czf "dist/${name}.tar.gz" "${name}"
 (
   cd dist

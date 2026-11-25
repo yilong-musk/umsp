@@ -167,57 +167,40 @@ when serve is running (skipped = not running, not counted as failure).
 
 ---
 
-## GitHub release deploy
+## Installing a release
 
-Pushing an annotated tag `vX.Y.Z` is the production deploy. `X.Y.Z` must equal
-`version` in `Cargo.toml` (no pre-release suffix), and the tagged commit must
-already be on `main`.
+Releases are build artifacts only. Publishing a tag does not contact, configure,
+or update any host, and the repository holds no deploy key or host address.
 
-[`.github/workflows/release.yml`](../.github/workflows/release.yml) then:
+Pushing an annotated tag `vX.Y.Z` (the number must equal `version` in
+`Cargo.toml`, and the commit must already be on `main`) runs CI and publishes
+`umsp-<version>-x86_64-unknown-linux-musl.tar.gz` with its `.sha256` as a GitHub
+Release. Re-run **release** from Actions with the tag as input to rebuild and
+republish an existing tag; assets are uploaded with `--clobber`.
 
-1. Runs fmt, clippy, tests, the English-only check, and `cargo deny`.
-2. Builds `umsp-<version>-x86_64-unknown-linux-musl.tar.gz` and publishes it
-   as a GitHub Release.
-3. Opens SSH and runs exactly `deploy vX.Y.Z`.
-
-The deploy key is forced to `~/.local/bin/umsp-deploy` (`scripts/deploy-host.sh`).
-That command can only download a `vX.Y.Z` release of this repository. It checks
-the checksum and the archive member list, requires a static binary whose
-`umsp version --json` matches the tag, then swaps `~/.local/bin/umsp`. The user
-unit is replaced only when `deploy/umsp.service` changed. Config, the env file,
-`sessions/`, and the ledger are never written. If `GET /healthz` does not report
-the tag's version with a small `uptime_s`, the previous binary and unit are put
-back and the service is restarted again.
-
-An unchanged checksum with a healthy `/healthz` does not restart the process.
-Redeploy a tag that is already published from Actions → **release** → **Run
-workflow** (input `vX.Y.Z`). That path downloads the existing asset; it does
-not rebuild.
-
-Prepare a host once:
+Install or upgrade from the archive:
 
 ```bash
-install -m 0755 scripts/deploy-host.sh ~/.local/bin/umsp-deploy
+version=0.2.2
+base="https://github.com/yilong-musk/umsp/releases/download/v${version}"
+name="umsp-${version}-x86_64-unknown-linux-musl"
+curl -fLO "$base/${name}.tar.gz"
+curl -fLO "$base/${name}.tar.gz.sha256"
+sha256sum -c "${name}.tar.gz.sha256"
+tar -xzf "${name}.tar.gz"
+"./${name}/umsp" version            # must print the tag's version
+cp -a ~/.local/bin/umsp ~/.local/bin/umsp.bak
+install -Dm755 "${name}/umsp" ~/.local/bin/umsp
+systemctl --user restart umsp        # only if you run the unit
+curl -fsS http://127.0.0.1:3460/healthz
 ```
 
-Add one `authorized_keys` line (the key cannot open a shell):
+The archive contains `umsp`, `config.example.toml`, `umsp.service`, and
+`README.md`. It never contains configuration, credentials, sessions, or the
+ledger; those stay on the host and survive upgrades.
 
-```text
-restrict,command="/home/ubuntu/.local/bin/umsp-deploy" ssh-ed25519 AAAA... umsp-deploy
-```
-
-Repository secrets, set on the host's terms: `DEPLOY_HOST`, `DEPLOY_USER`,
-`DEPLOY_SSH_KEY` (the matching private key), `DEPLOY_KNOWN_HOSTS` (one
-`ssh-keyscan` line for that host).
-
-Roll back the last swap by hand:
-
-```bash
-install -m 0755 ~/.local/bin/umsp.bak ~/.local/bin/umsp
-install -m 0644 ~/.config/systemd/user/umsp.service.bak ~/.config/systemd/user/umsp.service
-systemctl --user daemon-reload
-systemctl --user restart umsp
-```
+Roll back by installing the saved binary the same way, then restarting the
+unit. Keep the backup until `/healthz` reports the expected version.
 
 ---
 
