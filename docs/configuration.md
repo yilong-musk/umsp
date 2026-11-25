@@ -326,6 +326,12 @@ umsp client update hermes --no-budget               # lift it (forgets consumpti
   explicit `stream_options.include_usage: false` is overridden to `true`
   (ledger quirk `forced_include_usage`).
 - Consumption is tracked only while a budget is set, starting at zero, and
-  persists in `state_dir/client-usage.json` (mode 0600). `umsp client list`
-  shows `used/budget`. `remove` and `--no-budget` forget it; `rotate` keeps it.
+  persists in `state_dir/client-usage.json` (mode 0600); the server and the
+  CLI serialize their updates with an `flock` on `client-usage.json.lock`.
+  `umsp client list` shows `used/budget`. `remove` and `--no-budget` forget
+  it; `rotate` keeps it.
+- `--reset-usage` rewrites the file at once, but a running server keeps
+  admitting from its in-memory total until the reload that follows the edit
+  (or its next charge for that key). With `--no-reload`, send the server
+  `SIGHUP` yourself.
 - Refusals are ledger rows with `error_code = "budget_exhausted"`.

@@ -21,8 +21,14 @@
 //! Consumption persists in `{state_dir}/client-usage.json`. Every charge
 //! re-reads the file and adds to the value on disk, so a CLI reset written
 //! while the server runs is never overwritten by a stale in-memory total.
+//! Each read-modify-write holds an exclusive `flock` on
+//! `client-usage.json.lock`, which the CLI takes too, so a charge and a reset
+//! from another process cannot interleave. File I/O runs under its own lock,
+//! never under the one admission checks take, so a slow disk does not stall
+//! reservations.
 
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -115,6 +121,9 @@ impl BudgetDenied {
 #[derive(Debug)]
 pub struct BudgetStore {
     inner: Mutex<BudgetInner>,
+    /// Serializes this process's file read-modify-writes. Taken before
+    /// `inner` when both are needed, and `inner` is never held across I/O.
+    io: Mutex<()>,
 }
 
 #[derive(Debug)]
@@ -141,6 +150,7 @@ impl BudgetStore {
                 reserved: HashMap::new(),
                 pending: HashMap::new(),
             }),
+            io: Mutex::new(()),
         }
     }
 
@@ -148,7 +158,11 @@ impl BudgetStore {
     /// are kept: their calls are still running.
     pub fn reload(&self, state_dir: &Path) {
         let path = state_dir.join(USAGE_FILE);
-        let used = read_usage(&path);
+        let _io = self.io_lock();
+        let used = {
+            let _file = UsageFileLock::acquire(&path);
+            read_usage(&path)
+        };
         let mut inner = self.lock();
         inner.path = path;
         if let Some(used) = used {
@@ -211,25 +225,49 @@ impl BudgetStore {
     /// in-memory total is updated even when the write fails, so admission
     /// stays strict for the life of the process.
     pub fn charge(&self, client: &str, tokens: u64) -> std::io::Result<u64> {
-        let mut inner = self.lock();
-        let mut map = read_usage(&inner.path).unwrap_or_else(|| inner.used.clone());
-        let total = map.get(client).copied().unwrap_or(0).saturating_add(tokens);
-        map.insert(client.to_string(), total);
-        let written = write_usage(&inner.path, &map);
-        inner.used = map;
-        written.map(|()| total)
+        self.read_modify_write(|map| {
+            let total = map.get(client).copied().unwrap_or(0).saturating_add(tokens);
+            map.insert(client.to_string(), total);
+            (true, total)
+        })
     }
 
     /// Forget `client`'s consumption. `Ok(false)` means nothing was recorded.
     pub fn reset(&self, client: &str) -> std::io::Result<bool> {
-        let mut inner = self.lock();
-        let mut map = read_usage(&inner.path).unwrap_or_else(|| inner.used.clone());
-        let had = map.remove(client).is_some();
-        if had {
-            write_usage(&inner.path, &map)?;
-        }
-        inner.used = map;
-        Ok(had)
+        self.read_modify_write(|map| {
+            let had = map.remove(client).is_some();
+            (had, had)
+        })
+    }
+
+    /// Apply `edit` to the consumption on disk (falling back to memory when
+    /// the file is corrupt), write it back when `edit` says it changed, and
+    /// adopt the result in memory. The admission lock is only taken to copy
+    /// the state in and out, never across the file I/O.
+    fn read_modify_write<T>(
+        &self,
+        edit: impl FnOnce(&mut HashMap<String, u64>) -> (bool, T),
+    ) -> std::io::Result<T> {
+        let _io = self.io_lock();
+        let (path, snapshot) = {
+            let inner = self.lock();
+            (inner.path.clone(), inner.used.clone())
+        };
+        let file_lock = UsageFileLock::acquire(&path);
+        let mut map = read_usage(&path).unwrap_or(snapshot);
+        let (changed, out) = edit(&mut map);
+        let written = match (&file_lock, changed) {
+            (_, false) => Ok(()),
+            (Err(err), true) => Err(std::io::Error::new(err.kind(), err.to_string())),
+            (Ok(_), true) => write_usage(&path, &map),
+        };
+        drop(file_lock);
+        self.lock().used = map;
+        written.map(|()| out)
+    }
+
+    fn io_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.io.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, BudgetInner> {
@@ -253,6 +291,42 @@ impl Drop for BudgetReservation {
             *reserved = reserved.saturating_sub(self.amount);
             if *reserved == 0 {
                 inner.reserved.remove(&self.client);
+            }
+        }
+    }
+}
+
+/// Exclusive advisory lock on `client-usage.json.lock`, shared by the server
+/// and the CLI; released on drop.
+struct UsageFileLock {
+    _file: File,
+}
+
+impl UsageFileLock {
+    fn acquire(usage_path: &Path) -> std::io::Result<Self> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        if let Some(dir) = usage_path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let mut lock_path = usage_path.as_os_str().to_owned();
+        lock_path.push(".lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(PathBuf::from(lock_path))?;
+        loop {
+            // SAFETY: `file` owns a valid descriptor for the duration of the call.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return Ok(Self { _file: file });
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                return Err(err);
             }
         }
     }
@@ -369,6 +443,29 @@ mod tests {
         server.charge("c", 7).unwrap();
         assert_eq!(server.used("c"), 7);
         assert_eq!(BudgetStore::load(&dir).used("c"), 7);
+    }
+
+    #[test]
+    fn charges_from_two_stores_on_one_file_add_up() {
+        // Two processes (server and CLI) share the file through the lock.
+        let dir = usage_dir("two-stores");
+        let a = Arc::new(BudgetStore::load(&dir));
+        let b = Arc::new(BudgetStore::load(&dir));
+        let threads: Vec<_> = [a, b]
+            .into_iter()
+            .map(|store| {
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        store.charge("c", 1).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(BudgetStore::load(&dir).used("c"), 100);
+        assert!(dir.join("client-usage.json.lock").exists());
     }
 
     #[test]
