@@ -170,18 +170,36 @@ impl AppState {
         &self.inner.budgets
     }
 
-    /// Charge a finished call's real usage to its client's token budget.
-    /// Only clients with a budget are tracked, and `count_tokens` is free.
+    /// Charge a finished call to its client's token budget. Only clients
+    /// with a budget are tracked, and `count_tokens` is free.
+    ///
+    /// A call that reached the upstream but whose usage is missing or
+    /// incomplete — the client disconnected, or a successful upstream
+    /// reported none — is charged at least what it reserved: the upstream
+    /// has usually billed it, and otherwise disconnecting just before the
+    /// final usage frame would make every call free.
     fn charge_budget(&self, record: &RequestRecord) {
-        let tokens = record.total_tokens();
-        if tokens == 0 || record.quirks.iter().any(|q| q == "count_tokens") {
+        if record.quirks.iter().any(|q| q == "count_tokens") {
             return;
         }
+        let held = self.inner.budgets.settle(&record.request_id);
         let budgeted = self
             .cfg()
             .client(&record.client)
             .is_some_and(|c| c.budget_tokens.is_some());
         if !budgeted {
+            return;
+        }
+        let reported = record.total_tokens();
+        let reached_upstream = !record.provider.is_empty();
+        let usage_unreliable = record.client_disconnected
+            || (reported == 0 && record.upstream_status.is_some_and(|s| s < 400));
+        let tokens = if reached_upstream && usage_unreliable {
+            reported.max(held)
+        } else {
+            reported
+        };
+        if tokens == 0 {
             return;
         }
         if self.inner.budgets.charge(&record.client, tokens).is_err() {

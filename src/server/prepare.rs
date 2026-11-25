@@ -397,7 +397,10 @@ pub(super) async fn prepare_request(
     // carry a slot (count_tokens is free and never reserves).
     if let (Some(budget), Some(slot)) = (client.budget_tokens, budget_slot) {
         let amount = requested_output_cap(protocol, &payload);
-        match state.budgets().try_reserve(&client.name, budget, amount) {
+        match state
+            .budgets()
+            .try_reserve(&client.name, budget, amount, &request_id)
+        {
             Ok(reservation) => slot.fill(reservation),
             Err(denied) => {
                 return Err(reject(

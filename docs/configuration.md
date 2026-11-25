@@ -314,8 +314,11 @@ umsp client update hermes --no-budget               # lift it (forgets consumpti
   without a cap reserves nothing: the last admitted call may overshoot the
   budget by its own usage. After it, the key is refused.
 - When a call finishes, its real usage is charged and its reservation released
-  (when the response body is done). A call whose upstream reported no usage is
-  not charged. `count_tokens` is free.
+  (when the response body is done). A call that reached the upstream but has
+  no reliable usage — the client disconnected mid-call, or a successful
+  upstream reported none — is charged at least its reservation, so walking
+  away before the final usage frame is not free. Calls refused before or by
+  the upstream (4xx/5xx) are not charged. `count_tokens` is free.
 - A budgeted client cannot switch the usage report off: on a Chat stream an
   explicit `stream_options.include_usage: false` is overridden to `true`
   (ledger quirk `forced_include_usage`).

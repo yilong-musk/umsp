@@ -13,8 +13,10 @@
 //! in `budget - used - reserved` is refused, so output never overruns the
 //! budget. Input tokens are not reserved (the gateway has no tokenizer): the
 //! last admitted call may overshoot by its own input. When the call finishes
-//! its real usage is charged and the reservation released; a call without
-//! reported usage is not charged.
+//! its real usage is charged and the reservation released. A call that
+//! reached the upstream but reported no usage (the client disconnected, or
+//! the upstream omitted it) is charged its reservation instead, so walking
+//! away before the final usage frame is not free.
 //!
 //! Consumption persists in `{state_dir}/client-usage.json`. Every charge
 //! re-reads the file and adds to the value on disk, so a CLI reset written
@@ -23,6 +25,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 /// Accepted range for `max_concurrency`.
 pub const MAX_CONCURRENCY_RANGE: std::ops::RangeInclusive<u32> = 1..=9;
@@ -79,6 +82,11 @@ impl Drop for ConcurrencyPermit {
 
 pub const USAGE_FILE: &str = "client-usage.json";
 
+/// How long a reservation amount waits for its call's ledger row before it
+/// is forgotten. Every admitted call writes a row, so this only bounds memory
+/// if one is ever lost.
+const PENDING_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Why a reservation was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BudgetDenied {
@@ -114,6 +122,10 @@ struct BudgetInner {
     path: PathBuf,
     used: HashMap<String, u64>,
     reserved: HashMap<String, u64>,
+    /// Reserved amount per request id, kept until `settle` so a call whose
+    /// usage never arrives can still be charged what it reserved — even when
+    /// its response body (and so the reservation) is dropped first.
+    pending: HashMap<String, (u64, Instant)>,
 }
 
 impl BudgetStore {
@@ -127,6 +139,7 @@ impl BudgetStore {
                 path,
                 used,
                 reserved: HashMap::new(),
+                pending: HashMap::new(),
             }),
         }
     }
@@ -148,14 +161,15 @@ impl BudgetStore {
         self.lock().used.get(client).copied().unwrap_or(0)
     }
 
-    /// Reserve `amount` output tokens against `budget`. The check and the
-    /// reservation happen under one lock, so concurrent calls cannot
-    /// overbook.
+    /// Reserve `amount` output tokens against `budget` for call
+    /// `request_id`. The check and the reservation happen under one lock, so
+    /// concurrent calls cannot overbook.
     pub fn try_reserve(
         self: &Arc<Self>,
         client: &str,
         budget: u64,
         amount: u64,
+        request_id: &str,
     ) -> Result<BudgetReservation, BudgetDenied> {
         let mut inner = self.lock();
         let used = inner.used.get(client).copied().unwrap_or(0);
@@ -172,11 +186,25 @@ impl BudgetStore {
             });
         }
         *inner.reserved.entry(client.to_string()).or_insert(0) += amount;
+        let now = Instant::now();
+        inner
+            .pending
+            .retain(|_, (_, at)| now.duration_since(*at) < PENDING_TTL);
+        inner.pending.insert(request_id.to_string(), (amount, now));
         Ok(BudgetReservation {
             store: Arc::clone(self),
             client: client.to_string(),
             amount,
         })
+    }
+
+    /// The amount call `request_id` reserved (0 if none), forgotten from
+    /// here on. Called once per finished call, when its ledger row is written.
+    pub fn settle(&self, request_id: &str) -> u64 {
+        self.lock()
+            .pending
+            .remove(request_id)
+            .map_or(0, |(amount, _)| amount)
     }
 
     /// Add `tokens` to `client`'s consumption on disk and in memory. The
@@ -276,17 +304,17 @@ mod tests {
     #[test]
     fn reservations_never_overbook_the_output_budget() {
         let store = Arc::new(BudgetStore::load(&usage_dir("overbook")));
-        let a = store.try_reserve("c", 100, 60).expect("fits");
+        let a = store.try_reserve("c", 100, 60, "r").expect("fits");
         assert_eq!(
-            store.try_reserve("c", 100, 50).unwrap_err(),
+            store.try_reserve("c", 100, 50, "r").unwrap_err(),
             BudgetDenied::Insufficient {
                 requested: 50,
                 available: 40
             }
         );
-        let b = store.try_reserve("c", 100, 40).expect("exactly fits");
+        let b = store.try_reserve("c", 100, 40, "r").expect("exactly fits");
         assert_eq!(
-            store.try_reserve("c", 100, 0).unwrap_err(),
+            store.try_reserve("c", 100, 0, "r").unwrap_err(),
             BudgetDenied::Exhausted {
                 used: 0,
                 budget: 100
@@ -295,7 +323,17 @@ mod tests {
         );
         drop(a);
         drop(b);
-        assert!(store.try_reserve("c", 100, 100).is_ok());
+        assert!(store.try_reserve("c", 100, 100, "r").is_ok());
+    }
+
+    #[test]
+    fn settle_returns_the_reservation_even_after_it_is_dropped() {
+        let store = Arc::new(BudgetStore::load(&usage_dir("settle")));
+        let r = store.try_reserve("c", 100, 40, "req-1").unwrap();
+        drop(r);
+        assert_eq!(store.settle("req-1"), 40);
+        assert_eq!(store.settle("req-1"), 0, "settled once");
+        assert_eq!(store.settle("unknown"), 0);
     }
 
     #[test]
@@ -303,14 +341,14 @@ mod tests {
         let dir = usage_dir("charge");
         let store = Arc::new(BudgetStore::load(&dir));
         {
-            let _r = store.try_reserve("c", 100, 10).unwrap();
+            let _r = store.try_reserve("c", 100, 10, "r").unwrap();
             assert_eq!(store.charge("c", 70).unwrap(), 70);
         }
         assert_eq!(store.used("c"), 70);
         // Input may overshoot: the last admitted call is charged in full.
         store.charge("c", 45).unwrap();
         assert_eq!(
-            store.try_reserve("c", 100, 0).unwrap_err(),
+            store.try_reserve("c", 100, 0, "r").unwrap_err(),
             BudgetDenied::Exhausted {
                 used: 115,
                 budget: 100
@@ -337,9 +375,9 @@ mod tests {
     fn reload_keeps_in_flight_reservations() {
         let dir = usage_dir("reload");
         let store = Arc::new(BudgetStore::load(&dir));
-        let _r = store.try_reserve("c", 100, 80).unwrap();
+        let _r = store.try_reserve("c", 100, 80, "r").unwrap();
         store.reload(&dir);
-        assert!(store.try_reserve("c", 100, 30).is_err());
+        assert!(store.try_reserve("c", 100, 30, "r").is_err());
     }
 
     #[test]

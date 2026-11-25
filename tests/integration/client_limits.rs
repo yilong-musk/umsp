@@ -259,7 +259,7 @@ async fn budget_charges_real_usage_and_then_refuses() {
 }
 
 #[tokio::test]
-async fn budget_counts_streams_and_skips_calls_without_usage() {
+async fn budget_counts_streams_and_charges_the_reservation_without_usage() {
     let dir = temp_dir("limits-budget-stream");
     let (app, _) = gateway_with_client(&dir, |c| c.budget_tokens = Some(1000)).await;
 
@@ -267,15 +267,10 @@ async fn budget_counts_streams_and_skips_calls_without_usage() {
     assert_eq!(response.status(), StatusCode::OK);
     body_bytes(response).await;
     // The stream's trailing usage chunk reports 11 + 22.
-    for _ in 0..100 {
-        if used_of(&dir) > 0 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    assert_eq!(used_of(&dir), 33);
+    wait_used(&dir, 33).await;
 
-    // No usage reported: not charged.
+    // No usage reported by a successful upstream: the reservation
+    // (max_output_tokens = 64) is charged instead.
     let response = app
         .clone()
         .oneshot(responses_post(responses_body(false), "nousage"))
@@ -283,7 +278,38 @@ async fn budget_counts_streams_and_skips_calls_without_usage() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     body_bytes(response).await;
-    assert_eq!(used_of(&dir), 33);
+    assert_eq!(used_of(&dir), 33 + 64);
+}
+
+/// Poll the usage file until it reaches `want` (stream rows land after the body).
+async fn wait_used(dir: &Path, want: u64) {
+    for _ in 0..200 {
+        if used_of(dir) >= want {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(used_of(dir), want);
+}
+
+#[tokio::test]
+async fn a_disconnected_stream_is_charged_its_reservation() {
+    let dir = temp_dir("limits-budget-disconnect");
+    let (app, _) = gateway_with_client(&dir, |c| c.budget_tokens = Some(1000)).await;
+    let request = post_body(
+        json!({
+            "model": "upstream-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true,
+            "max_tokens": 40
+        }),
+        "sse-slow",
+    );
+    let streaming = app.oneshot(request).await.unwrap();
+    assert_eq!(streaming.status(), StatusCode::OK);
+    // The client walks away before the usage frame arrives.
+    drop(streaming);
+    wait_used(&dir, 40).await;
 }
 
 #[tokio::test]

@@ -8,8 +8,11 @@
 //! The budget reservation needs the parsed body, so `prepare_request` makes
 //! it and parks it in the [`BudgetSlot`] this layer put on the request. The
 //! layer owns the slot and the concurrency permit and hands both to the
-//! response body: they are released when the body ends or is dropped, after
-//! the call's ledger row (and budget charge) has been written.
+//! response body: they are released when the body ends or is dropped. On a
+//! normal finish that is after the call's ledger row (and budget charge) has
+//! been written; when the client disconnects the body can go first, and the
+//! budget store's per-request record of the reservation is what the late
+//! ledger row is charged from.
 
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
