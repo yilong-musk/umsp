@@ -4,7 +4,7 @@
 [![Rust](https://img.shields.io/badge/Rust-1.85+-000000?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-[English](README.md) | 简体中文 | [繁體中文](README.zh-TW.md) | [日本語](README.ja.md) | [한국어](README.ko.md) | [Español](README.es.md) | [Français](README.fr.md) | [Deutsch](README.de.md) | [Português](README.pt.md) | [Русский](README.ru.md)
+[Deutsch](README.de.md) | [English](README.md) | [Español](README.es.md) | [Français](README.fr.md) | [日本語](README.ja.md) | [한국어](README.ko.md) | [Português](README.pt.md) | [Русский](README.ru.md) | 简体中文 | [繁體中文](README.zh-TW.md)
 
 **单二进制、只监听回环地址**的 AI 网关：一个端口同时提供 OpenAI Chat Completions、OpenAI
 Responses 和 Anthropic Messages；上游支持同一协议就原样转发，不支持就做协议翻译。没有 UI、
@@ -223,7 +223,7 @@ make check          # fmt + clippy -D warnings + 测试 + 英文检查
 ./scripts/build-musl.sh
 ```
 
-仓库正文只允许英文（`AGENTS.md`）。本页的其它译文：`README.zh-TW.md`、`README.ja.md`、`README.ko.md`、`README.es.md`、`README.fr.md`、`README.de.md`、`README.pt.md`、`README.ru.md`。`docs/internal/` 里的
+仓库正文只允许英文（`AGENTS.md`）。本页的其它译文：`README.de.md`、`README.es.md`、`README.fr.md`、`README.ja.md`、`README.ko.md`、`README.pt.md`、`README.ru.md`、`README.zh-TW.md`。`docs/internal/` 里的
 里程碑验收快照是历史记录，不代表当前行为。
 
 ## License
