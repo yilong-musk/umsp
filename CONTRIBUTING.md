@@ -5,7 +5,9 @@ Thanks for taking the time to contribute.
 ## Before you start
 
 - Read [`AGENTS.md`](AGENTS.md). All authored text must be English;
-  `README.zh-CN.md` is the only localized file in the repository.
+  localized copies are `README.zh-CN.md`, `README.zh-TW.md`, `README.ja.md`,
+  `README.ko.md`, `README.es.md`, `README.fr.md`, `README.de.md`,
+  `README.pt.md` and `README.ru.md`.
 - Rust 1.85 or newer (edition 2024).
 - For a behaviour change, open an issue first so the design can be discussed
   before code is written.
@@ -35,5 +37,5 @@ A bug fix should include a test that fails before the fix and passes after it.
 - One logical change per pull request; describe the motivation and how you
   verified it (commands and real output).
 - Update `README.md` and the relevant `docs/` page in the same pull request.
-  Keep `README.zh-CN.md` in sync when the English meaning changes.
+  Keep every `README.<tag>.md` in sync when the English meaning changes.
 - Never include secrets, API keys or key hashes.

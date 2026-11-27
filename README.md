@@ -4,7 +4,7 @@
 [![Rust](https://img.shields.io/badge/Rust-1.85+-000000?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-English | [Chinese (Simplified)](README.zh-CN.md)
+English | [Chinese (Simplified)](README.zh-CN.md) | [Chinese (Traditional)](README.zh-TW.md) | [Japanese](README.ja.md) | [Korean](README.ko.md) | [Spanish](README.es.md) | [French](README.fr.md) | [German](README.de.md) | [Portuguese](README.pt.md) | [Russian](README.ru.md)
 
 A **single-binary, loopback-only** AI gateway. It exposes OpenAI Chat Completions, OpenAI Responses,
 and Anthropic Messages on one port, then forwards each request to an upstream that speaks the same
@@ -68,7 +68,7 @@ curl -s http://127.0.0.1:3460/v1/chat/completions \
   -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"Reply with only: OK"}]}' | jq
 ```
 
-`Authorization: Bearer *** is equivalent to `x-api-key`.
+`Authorization: Bearer ***` is equivalent to `x-api-key`.
 
 ### Device binding (one key, one device)
 
@@ -259,7 +259,7 @@ make check          # fmt + clippy -D warnings + tests + English-only langcheck
 ./scripts/build-musl.sh
 ```
 
-The repository is English-only (`AGENTS.md`); `README.zh-CN.md` is the only translated document.
+The repository is English-only (`AGENTS.md`). Translations of this page: `README.zh-CN.md`, `README.zh-TW.md`, `README.ja.md`, `README.ko.md`, `README.es.md`, `README.fr.md`, `README.de.md`, `README.pt.md`, `README.ru.md`.
 Historical milestone snapshots live in `docs/internal/` and are not current behavior.
 
 ## License
