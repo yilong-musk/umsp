@@ -4,7 +4,7 @@
 [![Rust](https://img.shields.io/badge/Rust-1.85+-000000?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-English | [Chinese (Simplified)](README.zh-CN.md) | [Chinese (Traditional)](README.zh-TW.md) | [Japanese](README.ja.md) | [Korean](README.ko.md) | [Spanish](README.es.md) | [French](README.fr.md) | [German](README.de.md) | [Portuguese](README.pt.md) | [Russian](README.ru.md)
+[German](README.de.md) | English | [Spanish](README.es.md) | [French](README.fr.md) | [Japanese](README.ja.md) | [Korean](README.ko.md) | [Portuguese](README.pt.md) | [Russian](README.ru.md) | [Chinese (Simplified)](README.zh-CN.md) | [Chinese (Traditional)](README.zh-TW.md)
 
 A **single-binary, loopback-only** AI gateway. It exposes OpenAI Chat Completions, OpenAI Responses,
 and Anthropic Messages on one port, then forwards each request to an upstream that speaks the same
@@ -259,7 +259,7 @@ make check          # fmt + clippy -D warnings + tests + English-only langcheck
 ./scripts/build-musl.sh
 ```
 
-The repository is English-only (`AGENTS.md`). Translations of this page: `README.zh-CN.md`, `README.zh-TW.md`, `README.ja.md`, `README.ko.md`, `README.es.md`, `README.fr.md`, `README.de.md`, `README.pt.md`, `README.ru.md`.
+The repository is English-only (`AGENTS.md`). Translations of this page: `README.de.md`, `README.es.md`, `README.fr.md`, `README.ja.md`, `README.ko.md`, `README.pt.md`, `README.ru.md`, `README.zh-CN.md`, `README.zh-TW.md`.
 Historical milestone snapshots live in `docs/internal/` and are not current behavior.
 
 ## License

@@ -4,7 +4,7 @@
 [![Rust](https://img.shields.io/badge/Rust-1.85+-000000?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-[English](README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [日本語](README.ja.md) | 한국어 | [Español](README.es.md) | [Français](README.fr.md) | [Deutsch](README.de.md) | [Português](README.pt.md) | [Русский](README.ru.md)
+[Deutsch](README.de.md) | [English](README.md) | [Español](README.es.md) | [Français](README.fr.md) | [日本語](README.ja.md) | 한국어 | [Português](README.pt.md) | [Русский](README.ru.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md)
 
 **단일 바이너리, 루프백만** 듣는 AI 게이트웨이입니다. 한 포트에서 OpenAI Chat Completions, OpenAI Responses, Anthropic Messages를 열고, 각 요청을 같은 프로토콜을 말하는 업스트림으로 넘깁니다. 업스트림이 말하지 못하면 번역합니다. UI, 데이터베이스, Redis, Docker는 없습니다.
 

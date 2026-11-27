@@ -4,7 +4,7 @@
 [![Rust](https://img.shields.io/badge/Rust-1.85+-000000?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-[English](README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [日本語](README.ja.md) | [한국어](README.ko.md) | [Español](README.es.md) | [Français](README.fr.md) | [Deutsch](README.de.md) | [Português](README.pt.md) | Русский
+[Deutsch](README.de.md) | [English](README.md) | [Español](README.es.md) | [Français](README.fr.md) | [日本語](README.ja.md) | [한국어](README.ko.md) | [Português](README.pt.md) | Русский | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md)
 
 Шлюз ИИ: **один бинарник, только loopback**. На одном порту отдаёт OpenAI Chat Completions, OpenAI Responses и Anthropic Messages и пересылает каждый запрос upstream, который говорит тем же протоколом, — или переводит, если бэкенд не умеет. Без интерфейса, базы, Redis и Docker.
 
